@@ -51,7 +51,7 @@ jobs:
       - name: Install pinned Gitleaks and scan complete Git history
         run: |
           set -eu
-          go install github.com/gitleaks/gitleaks/v8@v8.24.2
+          go install github.com/zricethezav/gitleaks/v8@v8.24.2
           "$(go env GOPATH)/bin/gitleaks" detect \
             --source . \
             --redact \
