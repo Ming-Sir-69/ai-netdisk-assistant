@@ -55,5 +55,5 @@ jobs:
           "$(go env GOPATH)/bin/gitleaks" detect \
             --source . \
             --redact \
-            --config-path .gitleaks.toml \
+            --config .gitleaks.toml \
             --log-opts='--all'

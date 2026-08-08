@@ -96,6 +96,8 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assertIn('.venv/bin/python "$cli" --help', ci)
         self.assertIn("github.com/zricethezav/gitleaks/v8@v8.24.2", ci)
         self.assertNotIn("github.com/gitleaks/gitleaks/v8", ci)
+        self.assertIn("--config .gitleaks.toml", ci)
+        self.assertNotIn("--config-path", ci)
         self.assertIn('"status": ..., "checks": ..., "next_steps": [...]', cli_contract)
         self.assertIn("error.details.completed", cli_contract)
         self.assertIn("data.cleanup", cli_contract)
