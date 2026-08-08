@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""panlib-search - 搜索影视资源（包装 seedhub-cli）"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# 允许从任意位置运行
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import (
+    NOT_FOUND, NETWORK, PARSE, emit_error, emit_success, log, run_seedhub
+)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="搜索影视资源 (seedhub)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  panlib-search --keyword "永无止境"
+  panlib-search --keyword "Breaking Bad" --type tv --limit 5
+        """,
+    )
+    parser.add_argument("--keyword", "-k", required=True, help="搜索关键词")
+    parser.add_argument(
+        "--type",
+        "-t",
+        choices=["all", "movie", "tv", "anime"],
+        default="all",
+        help="资源类型 (默认: all)",
+    )
+    parser.add_argument("--limit", "-n", type=int, default=10, help="最大结果数 (默认: 10)")
+    parser.add_argument(
+        "--fixture-dir",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+    args = parser.parse_args()
+
+    if not args.quiet:
+        log(f"搜索: {args.keyword} (type={args.type})")
+
+    seedhub_args = [
+        "search", args.keyword, "--limit", str(args.limit), "--resource-type", args.type,
+    ]
+    if args.fixture_dir is not None:
+        seedhub_args.extend(["--fixture-dir", args.fixture_dir])
+    result = run_seedhub(
+        seedhub_args,
+        timeout=60,
+    )
+
+    if result is None:
+        emit_error(NETWORK, "seedhub 搜索失败（网络/解析错误）")
+    if isinstance(result, dict) and "__error__" in result:
+        error = result.get("__error__")
+        message = error.get("message", "seedhub 搜索解析失败") if isinstance(error, dict) else "seedhub 搜索解析失败"
+        if isinstance(error, dict) and error.get("code") == "NETWORK":
+            emit_error(NETWORK, "seedhub 搜索网络失败")
+        emit_error(PARSE, "seedhub 搜索解析失败", details={"reason": message})
+    if not isinstance(result, list):
+        emit_error(PARSE, "seedhub 搜索输出格式错误")
+    if not result:
+        emit_success({"results": [], "keyword": args.keyword},
+                     meta={"count": 0, "note": "无匹配结果"})
+
+    emit_success(
+        {"results": result, "keyword": args.keyword, "type": args.type},
+        meta={"count": len(result)},
+    )
+
+
+if __name__ == "__main__":
+    main()

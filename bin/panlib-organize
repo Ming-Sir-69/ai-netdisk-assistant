@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Plan-first, fail-fast organizer for files already in bdpan.
+
+Planning performs only read operations.  Every write (mkdir, mv, rename and
+optional empty-source removal) is explicit, prevalidated and executed in the
+order represented by the returned plan.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import (  # noqa: E402
+    AUTH,
+    INVALID_ARG,
+    NETWORK,
+    NOT_FOUND,
+    PERMISSION,
+    emit_error,
+    emit_success,
+    is_within_cloud_base,
+    load_settings,
+    redact_text,
+    run_bdpan,
+    safe_cloud_join,
+    validate_cloud_path,
+)
+from naming import (  # noqa: E402
+    build_episode_filename,
+    build_folder_name,
+    build_movie_filename,
+    build_season_filename,
+    parse_episodes,
+    reject_collisions,
+    sanitize,
+    validate_imdb_id,
+    validate_quality,
+    validate_year,
+)
+
+
+MEDIA_EXTENSIONS = {"mkv", "mp4", "ts", "avi", "iso"}
+_NOT_FOUND_RE = re.compile(r"(?:not[ -]?found|does not exist|no such|errno\s*=?\s*2)", re.I)
+_CONFLICT_RE = re.compile(
+    r"(?:conflict|already exists|duplicate|clobber|appeared|not a directory)", re.I
+)
+
+
+class OperationFailure(RuntimeError):
+    def __init__(self, action: dict, message: str, completed: list[dict]):
+        super().__init__(message)
+        self.action = action
+        self.completed = completed
+
+
+def _error_code(message: str) -> str:
+    lowered = message.lower()
+    if _CONFLICT_RE.search(lowered):
+        return INVALID_ARG
+    if "auth" in lowered or "oauth" in lowered or "401" in lowered:
+        return AUTH
+    if "permission" in lowered or "scope" in lowered or "403" in lowered:
+        return PERMISSION
+    return NETWORK
+
+
+def _looks_missing(message: str) -> bool:
+    return bool(_NOT_FOUND_RE.search(message))
+
+
+def list_dir(path: str, depth: int = 2, *, settings=None) -> list[dict]:
+    """List one cloud directory; errors are surfaced instead of as empty lists."""
+
+    resolved = settings or load_settings()
+    code, out, err = run_bdpan(
+        ["ls", path, "--json"], timeout=60, settings=resolved
+    )
+    if code != 0:
+        message = err.strip() or out.strip() or "bdpan ls failed"
+        if "not a directory" in message.lower():
+            raise ValueError(message)
+        raise RuntimeError(message)
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
+    if not isinstance(result, list):
+        raise RuntimeError("bdpan ls returned a non-list result")
+    return [item for item in result if isinstance(item, dict)]
+
+
+def _list_target(path: str, settings) -> tuple[list[dict], bool]:
+    """Return ``(entries, exists)`` while distinguishing missing from errors."""
+
+    code, out, err = run_bdpan(
+        ["ls", path, "--json"], timeout=60, settings=settings
+    )
+    if code != 0:
+        message = err.strip() or out.strip() or "bdpan ls failed"
+        if "not a directory" in message.lower():
+            raise ValueError(message)
+        if _looks_missing(message):
+            return [], False
+        raise RuntimeError(message)
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
+    if not isinstance(result, list):
+        raise RuntimeError("bdpan ls returned a non-list result")
+    return [item for item in result if isinstance(item, dict)], True
+
+
+def find_source_files(
+    source_dir: str, depth: int = 2, *, settings=None
+) -> list[dict]:
+    """Discover video files recursively up to ``depth`` directory levels."""
+
+    resolved = settings or load_settings()
+    if depth <= 0:
+        raise ValueError("depth must be a positive integer")
+    queue: list[tuple[str, int]] = [(source_dir, 1)]
+    files: list[dict] = []
+    while queue:
+        current, level = queue.pop(0)
+        items = list_dir(current, depth=depth, settings=resolved)
+        for item in items:
+            filename = item.get("server_filename") or item.get("name")
+            if not isinstance(filename, str) or not filename:
+                continue
+            if item.get("isdir"):
+                if level < depth:
+                    queue.append((safe_cloud_join(current, filename), level + 1))
+                continue
+            suffix = PurePosixPath(filename).suffix.lower().lstrip(".")
+            if suffix not in MEDIA_EXTENSIONS:
+                continue
+            full_path = safe_cloud_join(current, filename)
+            files.append(
+                {
+                    "filename": PurePosixPath(filename).name,
+                    "path": full_path,
+                    "ext": suffix,
+                    "fs_id": item.get("fs_id"),
+                    "size": item.get("size", 0),
+                }
+            )
+    return files
+
+
+def validate_arguments(args: argparse.Namespace) -> None:
+    """Validate deterministic media fields before any cloud query."""
+
+    sanitize(args.title_en)
+    if not validate_imdb_id(args.imdb_id):
+        raise ValueError("imdb_id must match tt followed by 7-8 digits")
+    expected_target_leaf = build_folder_name(args.title_en, args.imdb_id)
+    if PurePosixPath(str(args.target_dir)).name != expected_target_leaf:
+        raise ValueError(
+            f"target-dir leaf must be the deterministic folder name: {expected_target_leaf}"
+        )
+    if not validate_quality(args.quality):
+        raise ValueError(f"unsupported quality: {args.quality}")
+    if args.mode == "movie" and not validate_year(args.year):
+        raise ValueError("movie mode requires a four-digit year")
+    if args.mode in {"tv", "season"} and args.season <= 0:
+        raise ValueError("season must be a positive integer")
+    if args.mode == "tv" and args.episode <= 0:
+        raise ValueError("episode must be a positive integer")
+    if args.depth <= 0 or args.depth > 8:
+        raise ValueError("depth must be between 1 and 8")
+
+
+def _new_name(args: argparse.Namespace, source: dict) -> str:
+    if args.mode == "movie":
+        return build_movie_filename(args.title_en, args.year, args.quality, source["ext"])
+    if args.mode == "season":
+        return build_season_filename(
+            args.title_en, args.season, args.imdb_id, args.quality, source["ext"]
+        )
+    episodes = parse_episodes(source["filename"])
+    if not episodes:
+        raise ValueError(f"could not parse season/episode from {source['filename']!r}")
+    if len(episodes) != 1:
+        raise ValueError(
+            f"source contains multiple episodes; split before organizing: {source['filename']!r}"
+        )
+    season, episode = episodes[0]
+    return build_episode_filename(
+        args.title_en, season, episode, args.imdb_id, args.quality, source["ext"]
+    )
+
+
+def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, list[dict]]:
+    source_dir = validate_cloud_path(args.source_dir, settings.bdpan_base)
+    target_dir = validate_cloud_path(args.target_dir, settings.bdpan_base)
+    if source_dir == target_dir:
+        raise ValueError("source-dir and target-dir must be different")
+    if not is_within_cloud_base(source_dir, settings.bdpan_base) or not is_within_cloud_base(
+        target_dir, settings.bdpan_base
+    ):
+        raise ValueError("source and target must stay inside BDPAN_BASE")
+
+    sources = find_source_files(source_dir, args.depth, settings=settings)
+    if not sources:
+        raise FileNotFoundError(f"source directory has no video files: {source_dir}")
+
+    target_entries, target_exists = _list_target(target_dir, settings)
+    names: list[str] = []
+    for source in sources:
+        names.append(_new_name(args, source))
+    reject_collisions(names)
+
+    source_names = [source["filename"] for source in sources]
+    try:
+        reject_collisions(source_names)
+    except ValueError as exc:
+        raise ValueError(f"source basename collision: {exc}") from exc
+    existing_names = {
+        str(item.get("server_filename"))
+        for item in target_entries
+        if item.get("server_filename")
+    }
+    source_names = [source["filename"] for source in sources]
+    source_collision = existing_names.intersection(source_names)
+    if source_collision:
+        raise ValueError(
+            "target already contains source basename(s): "
+            + ", ".join(sorted(source_collision))
+        )
+    collision = existing_names.intersection(names)
+    if collision:
+        raise ValueError(
+            "target already contains planned filename(s): " + ", ".join(sorted(collision))
+        )
+
+    actions: list[dict] = []
+    if not target_exists:
+        actions.append({"action": "mkdir", "path": target_dir})
+    for source, new_name in zip(sources, names):
+        destination_path = safe_cloud_join(target_dir, source["filename"])
+        actions.append(
+            {
+                "action": "mv",
+                "from": source["path"],
+                "to": target_dir,
+                "old_name": source["filename"],
+                "new_name": new_name,
+            }
+        )
+        actions.append(
+            {
+                "action": "rename",
+                "from": destination_path,
+                "new_name": new_name,
+                "old_name": source["filename"],
+            }
+        )
+    if args.remove_empty_source:
+        actions.extend(
+            [
+                {"action": "verify-empty", "path": source_dir},
+                {"action": "rm", "path": source_dir},
+            ]
+        )
+    return actions, target_exists, sources
+
+
+def _run_mutation(action: dict, settings) -> None:
+    kind = action["action"]
+    if kind == "mkdir":
+        argv = ["mkdir", action["path"]]
+    elif kind == "mv":
+        argv = ["mv", action["from"], action["to"]]
+    elif kind == "rename":
+        argv = ["rename", action["from"], action["new_name"]]
+    elif kind == "rm":
+        argv = ["rm", "-f", action["path"]]
+    else:
+        return
+    code, out, err = run_bdpan(argv, timeout=120, settings=settings)
+    if code != 0:
+        raise RuntimeError(err.strip() or out.strip() or f"bdpan {kind} failed")
+
+
+def _fresh_target_entries(target_dir: str, settings) -> list[dict]:
+    entries, exists = _list_target(target_dir, settings)
+    if not exists:
+        raise ValueError("destination conflict: target directory disappeared")
+    return entries
+
+
+def _check_destination(action: dict, target_dir: str, settings) -> None:
+    entries = _fresh_target_entries(target_dir, settings)
+    names = [str(item.get("server_filename")) for item in entries]
+    if action["action"] == "mv":
+        for candidate in (action["old_name"], action["new_name"]):
+            if candidate in names:
+                raise ValueError(f"destination conflict: {candidate}")
+        return
+    if action["action"] == "rename":
+        old_name = action["old_name"]
+        new_name = action["new_name"]
+        old_entries = [item for item in entries if item.get("server_filename") == old_name]
+        if len(old_entries) != 1:
+            raise ValueError(f"destination conflict: expected one source basename {old_name}")
+        if new_name != old_name and new_name in names:
+            raise ValueError(f"destination conflict: {new_name}")
+
+
+def _execute(
+    actions: list[dict],
+    source_dir: str,
+    target_dir: str,
+    remove_empty: bool,
+    settings,
+) -> dict:
+    completed: list[dict] = []
+    for action in actions:
+        if action["action"] in {"verify-empty", "rm"}:
+            continue
+        try:
+            if action["action"] == "mkdir":
+                entries, exists = _list_target(target_dir, settings)
+                if exists:
+                    raise ValueError("destination conflict: target appeared before mkdir")
+            elif action["action"] in {"mv", "rename"}:
+                _check_destination(action, target_dir, settings)
+            _run_mutation(action, settings)
+        except Exception as exc:
+            raise OperationFailure(action, redact_text(exc), completed) from exc
+        completed.append(action)
+
+    cleanup: dict = {"requested": remove_empty, "verified_empty": False, "removed": False}
+    if remove_empty:
+        try:
+            remaining = list_dir(source_dir, settings=settings)
+        except Exception as exc:
+            raise OperationFailure(
+                {"action": "verify-empty", "path": source_dir},
+                redact_text(exc),
+                completed,
+            ) from exc
+        cleanup["verified_empty"] = not remaining
+        if not remaining:
+            rm_action = {"action": "rm", "path": source_dir}
+            try:
+                _run_mutation(rm_action, settings)
+            except Exception as exc:
+                raise OperationFailure(rm_action, redact_text(exc), completed) from exc
+            completed.append(rm_action)
+            cleanup["removed"] = True
+        else:
+            cleanup["reason"] = "source directory is not empty"
+    return {"completed": completed, "cleanup": cleanup}
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="把转存后的源文件整理成规范命名（默认只生成计划）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--source-dir", "-s", required=True, help="转存后的源目录")
+    parser.add_argument("--target-dir", "-t", required=True, help="整理后的目标目录")
+    parser.add_argument("--title-en", required=True, help="英文名/中文名")
+    parser.add_argument("--imdb-id", required=True, help="IMDB ID")
+    parser.add_argument("--year", default="", help="年份")
+    parser.add_argument("--quality", required=True, help="清晰度（1080p/2160p 等）")
+    parser.add_argument("--mode", choices=["movie", "tv", "season"], default="movie")
+    parser.add_argument("--season", type=int, default=1, help="季（tv/season 模式）")
+    parser.add_argument("--episode", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--depth", type=int, default=2, help="源目录递归深度（1-8）")
+    parser.add_argument("--execute", action="store_true", help="确认后执行云盘写操作")
+    parser.add_argument("--remove-empty-source", action="store_true", help="确认源目录为空后移除")
+    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    try:
+        validate_arguments(args)
+        settings = load_settings()
+        # Path validation happens before the first read-capable bdpan call.
+        validate_cloud_path(args.source_dir, settings.bdpan_base)
+        validate_cloud_path(args.target_dir, settings.bdpan_base)
+        actions, target_exists, sources = _build_plan(args, settings)
+    except FileNotFoundError as exc:
+        emit_error(NOT_FOUND, str(exc))
+    except (TypeError, ValueError) as exc:
+        emit_error(INVALID_ARG, str(exc))
+    except Exception as exc:
+        message = redact_text(exc)
+        emit_error(NOT_FOUND if _looks_missing(message) else _error_code(message), message)
+
+    execute = bool(args.execute and not args.dry_run)
+    data = {
+        "source_dir": validate_cloud_path(args.source_dir, settings.bdpan_base),
+        "target_dir": validate_cloud_path(args.target_dir, settings.bdpan_base),
+        "actions": actions,
+        "execute_required": True,
+        "executed": execute,
+        "source_count": len(sources),
+    }
+    if not execute:
+        emit_success(data, meta={"mode": "plan-only", "target_exists": target_exists})
+
+    try:
+        result = _execute(
+            actions,
+            data["source_dir"],
+            data["target_dir"],
+            args.remove_empty_source,
+            settings,
+        )
+    except OperationFailure as exc:
+        emit_error(
+            _error_code(str(exc)),
+            str(exc),
+            {"failed_action": exc.action, "completed": exc.completed},
+        )
+    emit_success(
+        {**data, **result},
+        meta={"mode": "executed", "target_exists": target_exists},
+    )
+
+
+if __name__ == "__main__":
+    main()

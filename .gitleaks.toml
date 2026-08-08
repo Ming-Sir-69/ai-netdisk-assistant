@@ -1,0 +1,18 @@
+title = "AI 网盘助手 privacy gate"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Reserved documentation and test placeholders only; real credentials remain blocked."
+regexes = [
+  '''@users\.noreply\.github\.com''',
+  '''@[A-Za-z0-9.-]+\.example\.(com|invalid|org)''',
+  '''https://pan\.baidu\.example/s/fake-share-90001''',
+  '''https://pan\.baidu\.com/s/(1xxx|1abcde)''',
+  '''https://pan\.baidu\.com/s/(fake|placeholder)-[A-Za-z0-9_-]+''',
+  '''A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6''',
+  '''tok_1234567890ABCDEFGHIJKL''',
+  '''Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4''',
+  '''Xx9Yy8Zz7Aa6Bb5Cc4Dd3Ee2Ff1Gg0Hh''',
+]

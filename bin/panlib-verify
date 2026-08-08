@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""panlib-verify - 验证百度网盘分享链接有效性（HTTP HEAD）"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+import httpx
+from common import (
+    INVALID_ARG, NETWORK, NOT_FOUND, emit_error, emit_success, log
+)
+
+
+_SHARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+_PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{4}$")
+_REDIRECT_PATH_RE = re.compile(
+    r"^/(?:s/[A-Za-z0-9_-]{6,64}|share/init|wap/init)$"
+)
+
+
+def validate_share_url(value: str) -> str:
+    """Accept only canonical HTTPS shares on Baidu's official host."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("url must be a canonical HTTPS Baidu share URL")
+    raw = value.strip()
+    parsed = urlsplit(raw)
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != "pan.baidu.com"
+        or parsed.port is not None
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise ValueError("url must use the official HTTPS Baidu share host")
+    match = re.fullmatch(r"/s/([^/]+)", parsed.path)
+    if not match or not _SHARE_ID_RE.fullmatch(match.group(1)):
+        raise ValueError("url share id is invalid")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - {"pwd"} or any(len(values) != 1 for values in query.values()):
+        raise ValueError("url query may contain only one pwd value")
+    if "pwd" in query and not _PASSWORD_RE.fullmatch(query["pwd"][0]):
+        raise ValueError("url pwd must be four alphanumeric characters")
+    return raw
+
+
+def _validate_redirect_url(value: str) -> str:
+    """Keep redirects on HTTPS pan.baidu.com and away from credential URLs."""
+
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != "pan.baidu.com"
+        or parsed.port is not None
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or not _REDIRECT_PATH_RE.fullmatch(parsed.path)
+    ):
+        raise ValueError("redirect left the official Baidu share boundary")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if parsed.path.startswith("/s/"):
+        if set(query) - {"pwd"} or any(len(values) != 1 for values in query.values()):
+            raise ValueError("share redirect query may contain only one pwd value")
+        if "pwd" in query and not _PASSWORD_RE.fullmatch(query["pwd"][0]):
+            raise ValueError("share redirect pwd is invalid")
+    else:
+        if set(query) != {"surl"} or len(query["surl"]) != 1:
+            raise ValueError("share init redirect requires one surl value")
+        if not _SHARE_ID_RE.fullmatch(query["surl"][0]):
+            raise ValueError("share init redirect surl is invalid")
+    return value
+
+
+def verify_link(url: str, timeout: int = 10) -> dict:
+    """HTTP HEAD 验证链接有效性."""
+    log("验证分享链接")
+    try:
+        current = url
+        for _ in range(6):
+            resp = httpx.head(
+                current,
+                timeout=timeout,
+                follow_redirects=False,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if 300 <= resp.status_code < 400 and not resp.headers.get("location"):
+                return {
+                    "valid": False,
+                    "status_code": 0,
+                    "transport_error": "RedirectMissingLocation",
+                }
+            if not 300 <= resp.status_code < 400:
+                break
+            current = _validate_redirect_url(urljoin(current, resp.headers["location"]))
+        else:
+            return {
+                "valid": False,
+                "status_code": 0,
+                "transport_error": "TooManyRedirects",
+            }
+        return {
+            "valid": resp.status_code == 200,
+            "status_code": resp.status_code,
+        }
+    except ValueError:
+        return {
+            "valid": False,
+            "status_code": 0,
+            "validation_error": True,
+        }
+    except httpx.HTTPError as e:
+        return {
+            "valid": False,
+            "status_code": 0,
+            "transport_error": type(e).__name__,
+        }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="验证百度网盘分享链接有效性",
+    )
+    parser.add_argument(
+        "--url",
+        "-u",
+        required=True,
+        help="canonical 百度分享 URL（Agent 调用不携带提取码）",
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+    args = parser.parse_args()
+
+    try:
+        url = validate_share_url(args.url)
+    except ValueError as exc:
+        emit_error(INVALID_ARG, str(exc))
+
+    result = verify_link(url)
+
+    if result.get("validation_error"):
+        emit_error(INVALID_ARG, "分享链接跳转离开百度官方安全边界")
+
+    if result.get("transport_error"):
+        emit_error(
+            NETWORK,
+            "链接验证网络失败",
+            details={
+                "status_code": 0,
+                "error_type": result["transport_error"],
+            },
+        )
+
+    if result["valid"]:
+        emit_success(
+            {
+                "valid": True,
+                "status_code": result["status_code"],
+            }
+        )
+    else:
+        status_code = result["status_code"]
+        emit_error(
+            NOT_FOUND,
+            f"链接失效: HTTP {status_code}",
+            details={
+                "valid": False,
+                "status_code": status_code,
+            },
+        )
+
+
+if __name__ == "__main__":
+    main()

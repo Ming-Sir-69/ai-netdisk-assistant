@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""panlib-extract - 从 seedhub 详情页解析百度网盘分享链接"""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import (
+    NETWORK, NOT_FOUND, PARSE, emit_error, emit_success, log, run_seedhub
+)
+
+
+def parse_quality_from_desc(desc: str) -> str:
+    """从 desc 文本提取清晰度标识."""
+    desc_lower = desc.lower()
+    if "2160p" in desc_lower or "4k" in desc_lower or "uhd" in desc_lower:
+        return "2160p"
+    if "1080p.remux" in desc_lower or "1080p原盘" in desc:
+        return "1080p.REMUX"
+    if "1080p.bluray" in desc_lower or "1080p蓝光" in desc:
+        return "1080p.BluRay"
+    if "1080p" in desc_lower:
+        return "1080p"
+    if "720p" in desc_lower:
+        return "720p"
+    if "web-dl" in desc_lower or "webdl" in desc_lower:
+        return "WEB-DL"
+    return "unknown"
+
+
+def detect_resource_type(quality: str, desc: str) -> str:
+    """从 desc/quality 推断资源类型（movie / tv / anime / doc）."""
+    desc_lower = desc.lower()
+    if "剧集" in desc or "season" in desc_lower or "s0" in desc_lower or "s1" in desc_lower:
+        return "tv"
+    if "动漫" in desc or "anime" in desc_lower:
+        return "anime"
+    if "纪录" in desc or "documentary" in desc_lower:
+        return "doc"
+    return "movie"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="解析 seedhub 资源页拿到百度网盘分享链接",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  panlib-extract --resource-id 74569
+  panlib-extract --resource-id 416 --limit 5
+        """,
+    )
+    parser.add_argument("--resource-id", "-r", required=True, help="seedhub 资源 ID")
+    parser.add_argument("--limit", "-n", type=int, default=10, help="解析的链接数 (默认: 10)")
+    parser.add_argument(
+        "--fixture-dir",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+    args = parser.parse_args()
+
+    if not args.quiet:
+        log(f"提取资源链接: id={args.resource_id}")
+
+    seedhub_args = ["links", args.resource_id, "--limit", str(args.limit)]
+    if args.fixture_dir is not None:
+        seedhub_args.extend(["--fixture-dir", args.fixture_dir])
+    data = run_seedhub(
+        seedhub_args,
+        timeout=90,
+    )
+
+    if data is None:
+        emit_error(NETWORK, f"获取资源 {args.resource_id} 失败")
+    if isinstance(data, dict) and "__error__" in data:
+        error = data.get("__error__")
+        message = error.get("message", "seedhub 详情解析失败") if isinstance(error, dict) else "seedhub 详情解析失败"
+        if isinstance(error, dict) and error.get("code") == "NETWORK":
+            emit_error(NETWORK, "seedhub 详情网络失败")
+        emit_error(PARSE, "seedhub 详情解析失败", details={"reason": message})
+    if not isinstance(data, dict) or "baidu_resolved" not in data:
+        emit_error(PARSE, "seedhub 详情输出格式错误")
+
+    # 提取百度网盘已解析的链接
+    baidu_resolved = data.get("baidu_resolved", [])
+    if not baidu_resolved:
+        emit_success(
+            {"links": [], "title": data.get("title", "")},
+            meta={"note": "该资源无百度网盘分享链接", "resource_id": args.resource_id},
+        )
+
+    links = []
+    for item in baidu_resolved:
+        url = item.get("url", "")
+        pwd = item.get("pwd", "")
+        desc = item.get("desc", "")
+        quality = parse_quality_from_desc(desc)
+        rtype = detect_resource_type(quality, desc)
+        links.append({
+            "url": url,
+            "password": pwd,
+            "desc": desc[:80],
+            "quality": quality,
+            "resource_type": rtype,
+        })
+
+    emit_success(
+        {
+            "title": data.get("title", ""),
+            "resource_id": args.resource_id,
+            "links": links,
+        },
+        meta={"count": len(links)},
+    )
+
+
+if __name__ == "__main__":
+    main()

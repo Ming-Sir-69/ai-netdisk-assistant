@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""Plan-first wrapper around ``bdpan transfer``.
+
+The command deliberately keeps transfer and later organization separate.  A
+normal invocation only prints the exact directory passed to bdpan; ``--execute``
+is required before the transfer subprocess can be started.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import (  # noqa: E402
+    AUTH,
+    INVALID_ARG,
+    NETWORK,
+    NOT_FOUND,
+    PARSE,
+    PERMISSION,
+    emit_error,
+    emit_success,
+    load_settings,
+    redact_text,
+    run_bdpan,
+    run_subprocess,
+    safe_cloud_join,
+)
+from naming import build_folder_name, sanitize, validate_imdb_id, validate_year  # noqa: E402
+
+
+TYPE_DIR = {
+    "movie": "Movies",
+    "tv": "TV shows",
+    "doc": "Documentary",
+    "anime": "动漫",
+    "webdrama": "网剧",
+}
+_SHARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+_PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{4}$")
+_SHARE_URL_RE = re.compile(
+    r"https://pan\.baidu\.(?:com|example)/s/[A-Za-z0-9_-]{6,64}(?:\?[^\s\"']*)?",
+    re.IGNORECASE,
+)
+_RESOURCE_ID_RE = re.compile(r"^[0-9]{1,32}$")
+_SHARE_REF_RE = re.compile(r"^[0-9a-f]{64}$")
+_CODE_IN_TEXT_RE = re.compile(
+    r"(?i)((?:提取码|密码|pwd|code)\s*[:：=]?\s*)[A-Za-z0-9]{4}"
+)
+
+
+class _ResourceResolutionError(RuntimeError):
+    """A stable, non-sensitive failure while resolving a SeedHub resource."""
+
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+def _safe_candidate_description(value: object) -> str:
+    """Keep candidate metadata useful without returning a share code or URL."""
+
+    text = _safe_external_text(value)
+    text = _CODE_IN_TEXT_RE.sub(r"\1[REDACTED]", text)
+    return text[:120]
+
+
+def _candidate_metadata(index: int, item: object) -> dict:
+    if not isinstance(item, dict):
+        return {
+            "index": index,
+            "description": "[REDACTED]",
+            "quality": "unknown",
+            "resource_type": "unknown",
+            "has_password": False,
+        }
+    return {
+        "index": index,
+        "description": _safe_candidate_description(item.get("desc", "")),
+        "quality": _safe_candidate_description(item.get("quality", "unknown")),
+        "resource_type": _safe_candidate_description(item.get("resource_type", "unknown")),
+        "has_password": bool(item.get("password")),
+    }
+
+
+def _share_ref(resource_id: str, link_index: int, url: str, _password: str) -> str:
+    """Return a public plan fingerprint without encoding the extraction code."""
+
+    bare_url = urlsplit(url)._replace(query="").geturl()
+    payload = "\0".join(("v1", resource_id, str(link_index), bare_url)).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _quality_from_description(value: object) -> str:
+    description = str(value or "")
+    lowered = description.lower()
+    if "2160p" in lowered or "4k" in lowered or "uhd" in lowered:
+        return "2160p"
+    if "1080p.remux" in lowered or "1080p原盘" in description:
+        return "1080p.REMUX"
+    if "1080p.bluray" in lowered or "1080p蓝光" in description:
+        return "1080p.BluRay"
+    if "1080p" in lowered:
+        return "1080p"
+    if "720p" in lowered:
+        return "720p"
+    if "web-dl" in lowered or "webdl" in lowered:
+        return "WEB-DL"
+    return "unknown"
+
+
+def _resource_type_from_description(value: object) -> str:
+    description = str(value or "")
+    lowered = description.lower()
+    if "剧集" in description or "season" in lowered or "s0" in lowered or "s1" in lowered:
+        return "tv"
+    if "动漫" in description or "anime" in lowered:
+        return "anime"
+    if "纪录" in description or "documentary" in lowered:
+        return "doc"
+    return "movie"
+
+
+def _seedhub_links(
+    resource_id: str,
+    settings,
+    *,
+    fixture_dir: str | None = None,
+) -> list[dict]:
+    """Resolve a SeedHub resource in-process without forwarding secrets."""
+
+    command = [
+        str(settings.venv_python),
+        str(settings.seedhub_cli),
+        "links",
+        resource_id,
+        "--limit",
+        "20",
+    ]
+    if fixture_dir is not None:
+        command.extend(["--fixture-dir", fixture_dir])
+    command.append("--json")
+    code, stdout, _stderr = run_subprocess(
+        command,
+        timeout=max(settings.network_timeout, 90),
+    )
+    parsed: object = None
+    if stdout.strip():
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed = None
+    if code != 0:
+        if isinstance(parsed, dict) and isinstance(parsed.get("__error__"), dict):
+            error_code = parsed["__error__"].get("code")
+            if error_code == NETWORK:
+                raise _ResourceResolutionError(NETWORK, "SeedHub resource request failed")
+            raise _ResourceResolutionError(PARSE, "SeedHub resource response could not be parsed")
+        raise _ResourceResolutionError(NETWORK, "SeedHub resource request failed")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("baidu_resolved"), list):
+        raise _ResourceResolutionError(PARSE, "SeedHub resource response has an invalid shape")
+    links: list[dict] = []
+    for item in parsed["baidu_resolved"]:
+        if not isinstance(item, dict):
+            continue
+        description = item.get("desc", "")
+        links.append(
+            {
+                "url": item.get("url", ""),
+                "password": item.get("pwd", ""),
+                "desc": str(description)[:80],
+                "quality": _quality_from_description(description),
+                "resource_type": _resource_type_from_description(description),
+            }
+        )
+    return links
+
+
+def _resolve_resource(
+    resource_id: str,
+    link_index: int | None,
+    settings,
+    *,
+    fixture_dir: str | None = None,
+) -> dict:
+    """Resolve one candidate and retain its URL/code only in this process."""
+
+    if not _RESOURCE_ID_RE.fullmatch(resource_id):
+        raise _ResourceResolutionError(INVALID_ARG, "resource_id must be numeric")
+    links = _seedhub_links(resource_id, settings, fixture_dir=fixture_dir)
+    metadata = [_candidate_metadata(index, item) for index, item in enumerate(links)]
+    if not links:
+        raise _ResourceResolutionError(
+            NOT_FOUND,
+            "SeedHub resource has no Baidu share candidates",
+            {"resource_id": resource_id, "candidates": []},
+        )
+    if link_index is None:
+        if len(links) != 1:
+            raise _ResourceResolutionError(
+                INVALID_ARG,
+                "multiple Baidu share candidates require --link-index",
+                {"resource_id": resource_id, "candidates": metadata},
+            )
+        selected_index = 0
+    else:
+        selected_index = link_index
+        if selected_index < 0 or selected_index >= len(links):
+            raise _ResourceResolutionError(
+                INVALID_ARG,
+                "link-index is outside the available candidate range",
+                {"resource_id": resource_id, "candidates": metadata},
+            )
+
+    selected = links[selected_index]
+    raw_url = selected.get("url")
+    password = selected.get("password", "")
+    if not isinstance(raw_url, str) or not isinstance(password, str):
+        raise _ResourceResolutionError(PARSE, "SeedHub candidate has invalid share metadata")
+    try:
+        url = _validate_share_url(raw_url, allow_fixture=fixture_dir is not None)
+        effective_password = _validate_password(password)
+    except ValueError as exc:
+        raise _ResourceResolutionError(PARSE, "SeedHub candidate has invalid share metadata") from exc
+    return {
+        "url": url,
+        "password": effective_password,
+        "link_index": selected_index,
+        "share_ref": _share_ref(resource_id, selected_index, url, effective_password),
+        "resource_id": resource_id,
+    }
+
+
+def _safe_external_text(value: object, secrets: tuple[str, ...] = ()) -> str:
+    """Redact credentials and complete share URLs from external output."""
+
+    redacted = redact_text(value)
+    redacted = _SHARE_URL_RE.sub("https://pan.baidu.com/s/[REDACTED]", redacted)
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def _validate_share_url(value: str, *, allow_fixture: bool = False) -> str:
+    """Accept only canonical HTTPS Baidu share URLs without fragments."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("url must be a non-empty HTTPS Baidu share URL")
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("url must be a valid HTTPS Baidu share URL") from exc
+    allowed_hosts = {"pan.baidu.com"}
+    if allow_fixture:
+        allowed_hosts.add("pan.baidu.example")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname is None
+        or parsed.hostname.lower() not in allowed_hosts
+        or port is not None
+    ):
+        raise ValueError("url must use https://pan.baidu.com/s/<share-id>")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("url must not contain credentials or a fragment")
+    match = re.fullmatch(r"/s/([^/]+)", parsed.path)
+    if not match or not _SHARE_ID_RE.fullmatch(match.group(1)):
+        raise ValueError("url share id is invalid")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - {"pwd"} or any(len(values) != 1 for values in query.values()):
+        raise ValueError("url query may contain only one pwd value")
+    if "pwd" in query and not _PASSWORD_RE.fullmatch(query["pwd"][0]):
+        raise ValueError("url pwd must be four alphanumeric characters")
+    return raw
+
+
+def _validate_password(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("password must be four alphanumeric characters")
+    if value and not _PASSWORD_RE.fullmatch(value):
+        raise ValueError("password must be four alphanumeric characters")
+    return value
+
+
+def _transfer_argv(url: str, password: str, destination: str) -> list[str]:
+    """Use bdpan's dedicated ``-p`` input instead of embedding a pwd query."""
+
+    parsed = urlsplit(url)
+    embedded = parse_qs(parsed.query, keep_blank_values=True).get("pwd", [""])[0]
+    bare_url = parsed._replace(query="").geturl()
+    effective_password = password or embedded
+    argv = ["transfer", bare_url]
+    if effective_password:
+        argv.extend(["-p", effective_password])
+    argv.extend(["-d", destination])
+    return argv
+
+
+def _list_dest(path: str, settings) -> list[dict]:
+    code, out, err = run_bdpan(
+        ["ls", path, "--json"], timeout=60, settings=settings
+    )
+    if code != 0:
+        raise RuntimeError(err.strip() or out.strip() or "bdpan ls failed")
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
+    if not isinstance(result, list):
+        raise RuntimeError("bdpan ls returned a non-list result")
+    return [item for item in result if isinstance(item, dict)]
+
+
+def _error_code(message: str) -> str:
+    lowered = message.lower()
+    if "conflict" in lowered or "already exists" in lowered or "clobber" in lowered:
+        return INVALID_ARG
+    if "auth" in lowered or "oauth" in lowered or "401" in lowered:
+        return AUTH
+    if "permission" in lowered or "scope" in lowered or "403" in lowered:
+        return PERMISSION
+    return NETWORK
+
+
+def _entry_key(item: dict) -> tuple[object, ...]:
+    """Return a stable enough read-only identity for pre/post list comparison."""
+
+    if item.get("fs_id") is not None:
+        return ("fs_id", item.get("fs_id"))
+    return (
+        "name",
+        item.get("server_filename") or item.get("name"),
+        bool(item.get("isdir")),
+    )
+
+
+def _entry_name(item: dict) -> object:
+    return item.get("server_filename") or item.get("name")
+
+
+def _post_transfer_result(before: list[dict], destination: str, settings) -> dict:
+    """Describe what appeared after transfer without guessing a source path."""
+
+    base = {_entry_key(item) for item in before}
+    after = _list_dest(destination, settings)
+    created = [item for item in after if _entry_key(item) not in base]
+    entries: list[dict] = []
+    invalid_created = False
+    for item in created:
+        name = item.get("server_filename") or item.get("name")
+        isdir = item.get("isdir")
+        if not isinstance(name, str) or not name or not isinstance(isdir, bool):
+            invalid_created = True
+            continue
+        try:
+            path = safe_cloud_join(destination, name)
+        except (TypeError, ValueError):
+            invalid_created = True
+            continue
+        entries.append({"name": name, "isdir": isdir, "path": path})
+    if invalid_created:
+        return {
+            "status": "ambiguous",
+            "transferred_entries": entries,
+            "source_dir": None,
+            "organize_ready": False,
+            "reason": "one or more new destination entries had invalid metadata",
+        }
+    if len(entries) == 1:
+        entry = entries[0]
+        return {
+            "status": "verified",
+            "transferred_entries": entries,
+            "source_dir": entry["path"] if entry["isdir"] else None,
+            "organize_ready": bool(entry["isdir"]),
+            "reason": "one new directory" if entry["isdir"] else "new entry is not a directory",
+        }
+    if not entries:
+        return {
+            "status": "unverified",
+            "transferred_entries": [],
+            "source_dir": None,
+            "organize_ready": False,
+            "reason": "transfer completed but no new destination entry was observable",
+        }
+    return {
+        "status": "ambiguous",
+        "transferred_entries": entries,
+        "source_dir": None,
+        "organize_ready": False,
+        "reason": "multiple new destination entries require an explicit user choice",
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="按 SeedHub 资源 ID 转存百度网盘资源（默认只生成计划）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--url", "-u", help="人工兼容路径：百度网盘分享链接")
+    source.add_argument("--resource-id", "-r", help="SeedHub 资源 ID")
+    parser.add_argument(
+        "--password",
+        "-p",
+        default="",
+        help="人工 --url 兼容路径的提取码（Agent 不使用）",
+    )
+    parser.add_argument(
+        "--link-index",
+        type=int,
+        default=None,
+        help="SeedHub 多候选链接的 0 起始索引",
+    )
+    parser.add_argument(
+        "--share-ref",
+        default="",
+        help="resource-id 计划返回的稳定交接引用（执行时必填）",
+    )
+    parser.add_argument("--type", "-t", choices=list(TYPE_DIR), required=True, help="资源类型")
+    parser.add_argument("--title-en", required=True, help="英文名/中文名")
+    parser.add_argument("--imdb-id", required=True, help="IMDB ID (ttXXX)")
+    parser.add_argument("--year", default="", help="年份")
+    parser.add_argument("--quality", default="", help="清晰度（仅作为上游元数据）")
+    parser.add_argument("--execute", action="store_true", help="确认后执行 bdpan transfer")
+    parser.add_argument(
+        "--fixture-dir",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # Keep the removed flag on the machine-readable error boundary rather than
+    # letting argparse silently accept a dangerous legacy behavior.
+    if any(item == "--auto-organize" or item.startswith("--auto-organize=") for item in raw_argv):
+        emit_error(INVALID_ARG, "--auto-organize is no longer supported; run panlib-organize separately")
+    args = _parser().parse_args(raw_argv)
+
+    try:
+        if args.link_index is not None and args.link_index < 0:
+            raise ValueError("link-index must be zero or greater")
+        if args.share_ref and not _SHARE_REF_RE.fullmatch(args.share_ref):
+            raise ValueError("share-ref must be a 64-character lowercase hexadecimal value")
+        sanitize(args.title_en)
+        if not validate_imdb_id(args.imdb_id):
+            raise ValueError("imdb_id must match tt followed by 7-8 digits")
+        if args.year and not validate_year(args.year):
+            raise ValueError("year must be a four-digit value between 1800 and 2199")
+        # Build the expected source folder only as a collision key.  The
+        # transfer output intentionally does not claim that folder exists.
+        expected_folder = build_folder_name(args.title_en, args.imdb_id)
+        settings = load_settings()
+        destination = safe_cloud_join(
+            settings.bdpan_base, settings.bdpan_lib, TYPE_DIR[args.type]
+        )
+
+        if args.resource_id is not None:
+            if args.password:
+                raise ValueError("password is only valid with the manual --url path")
+            if args.execute and not args.share_ref:
+                raise ValueError("resource-id execution requires share_ref from the plan")
+            resolved = _resolve_resource(
+                args.resource_id,
+                args.link_index,
+                settings,
+                fixture_dir=args.fixture_dir,
+            )
+            if args.share_ref and args.share_ref != resolved["share_ref"]:
+                emit_error(
+                    INVALID_ARG,
+                    "selected SeedHub share changed since the plan; create a new plan",
+                )
+            url = resolved["url"]
+            effective_password = resolved["password"]
+            selected_link_index = resolved["link_index"]
+            share_ref = resolved["share_ref"]
+            resource_id = resolved["resource_id"]
+        else:
+            if args.link_index is not None:
+                raise ValueError("link-index is only valid with --resource-id")
+            if args.share_ref:
+                raise ValueError("share-ref is only valid with --resource-id")
+            url = _validate_share_url(args.url)
+            password = _validate_password(args.password)
+            embedded_password = parse_qs(
+                urlsplit(url).query, keep_blank_values=True
+            ).get("pwd", [""])[0]
+            effective_password = password or embedded_password
+            selected_link_index = None
+            share_ref = ""
+            resource_id = ""
+    except _ResourceResolutionError as exc:
+        emit_error(exc.code, exc.message, exc.details)
+    except (TypeError, ValueError) as exc:
+        emit_error(INVALID_ARG, str(exc))
+    except Exception as exc:
+        emit_error(INVALID_ARG, redact_text(exc))
+
+    action = {
+        "action": "transfer",
+        "source": "seedhub-resource" if resource_id else "baidu-share",
+        "has_password": bool(effective_password),
+        "dest_dir": destination,
+    }
+    if resource_id:
+        action.update(
+            {
+                "resource_id": resource_id,
+                "link_index": selected_link_index,
+                "share_ref": share_ref,
+            }
+        )
+    plan = [action]
+    if not args.execute:
+        emit_success(
+            {
+                "plan": plan,
+                "dest_dir": destination,
+                "title_en": args.title_en,
+                "imdb_id": args.imdb_id,
+                **(
+                    {
+                        "resource_id": resource_id,
+                        "link_index": selected_link_index,
+                        "share_ref": share_ref,
+                    }
+                    if resource_id
+                    else {}
+                ),
+                "execute_required": True,
+            },
+            meta={"mode": "plan-only"},
+        )
+
+    try:
+        existing = _list_dest(destination, settings)
+        if any(_entry_name(item) == expected_folder for item in existing):
+            emit_error(
+                INVALID_ARG,
+                "target folder already exists; refusing unknown same-name overwrite",
+                {"target": safe_cloud_join(destination, expected_folder)},
+            )
+        # Re-read immediately before the write to narrow the TOCTOU window.
+        before_transfer = _list_dest(destination, settings)
+        if any(_entry_name(item) == expected_folder for item in before_transfer):
+            emit_error(
+                INVALID_ARG,
+                "destination conflict appeared before transfer; refusing overwrite",
+                {"target": safe_cloud_join(destination, expected_folder)},
+            )
+        transfer_argv = _transfer_argv(url, effective_password, destination)
+        code, out, err = run_bdpan(
+            transfer_argv,
+            timeout=settings.bdpan_timeout,
+            settings=settings,
+        )
+        if code != 0:
+            raise RuntimeError(err.strip() or out.strip() or "bdpan transfer failed")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        message = _safe_external_text(exc, (effective_password,))
+        emit_error(_error_code(message), message)
+
+    try:
+        postcondition = _post_transfer_result(before_transfer, destination, settings)
+    except Exception:
+        # The transfer has already succeeded.  Never turn a failed read-back
+        # into a generic failure that a model might retry and duplicate.
+        postcondition = {
+            "status": "unverified",
+            "transferred_entries": [],
+            "source_dir": None,
+            "organize_ready": False,
+            "reason": "transfer completed but destination verification failed",
+        }
+
+    emit_success(
+        {
+            "plan": plan,
+            "dest_dir": destination,
+            "title_en": args.title_en,
+            "imdb_id": args.imdb_id,
+            **(
+                {
+                    "resource_id": resource_id,
+                    "link_index": selected_link_index,
+                    "share_ref": share_ref,
+                }
+                if resource_id
+                else {}
+            ),
+            "executed": True,
+            "source_dir": postcondition["source_dir"],
+            "organize_ready": postcondition["organize_ready"],
+            "postcondition": {
+                key: value
+                for key, value in postcondition.items()
+                if key not in {"source_dir", "organize_ready"}
+            },
+            "bdpan_output": _safe_external_text(out, (effective_password,)).strip()[:500],
+        },
+        meta={"mode": "executed"},
+    )
+
+
+if __name__ == "__main__":
+    main()

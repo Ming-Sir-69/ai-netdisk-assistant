@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+if [ -n "${OPEN_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$OPEN_LOG"
+fi

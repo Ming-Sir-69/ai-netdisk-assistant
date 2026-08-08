@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the complete Git history
+        uses: actions/checkout@v4
+        with:
+          # The release gate includes a full-history Gitleaks scan.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Create project virtual environment
+        run: python -m venv .venv
+
+      - name: Install pinned dependencies and verify integrity
+        run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install --requirement requirements.txt
+          .venv/bin/python -m pip check
+
+      - name: Compile project Python
+        run: .venv/bin/python -m compileall -q panlib bin vendor/seedhub-cli
+
+      - name: Run the complete test suite
+        run: .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Check every CLI help path
+        run: |
+          set -eu
+          ./bin/panlib-doctor --help >/dev/null
+          for cli in bin/panlib-extract bin/panlib-imdb bin/panlib-organize bin/panlib-search bin/panlib-transfer bin/panlib-verify; do
+            .venv/bin/python "$cli" --help >/dev/null
+          done
+
+      - name: Run the whole-tree privacy guard
+        run: ./scripts/privacy-guard --whole-tree
+
+      - name: Install pinned Gitleaks and scan complete Git history
+        run: |
+          set -eu
+          go install github.com/gitleaks/gitleaks/v8@v8.24.2
+          "$(go env GOPATH)/bin/gitleaks" detect \
+            --source . \
+            --redact \
+            --config-path .gitleaks.toml \
+            --log-opts='--all'

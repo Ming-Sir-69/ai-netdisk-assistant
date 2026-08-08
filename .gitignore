@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Logs
+*.log
+logs/
+*.out
+*.trace
+*.pid
+*.sock
+
+# Test and runtime output
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+runtime/
+
+# Cache / runtime
+.cache/
+.runtime/
+tmp/
+.superpowers/
+
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+.envrc
+.aws/
+.config/
+.netrc
+.npmrc
+.pypirc
+*.credentials
+*.credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*token*.json
+*secret*.json
+*cookie*.json
+*bduss*.json
+
+# Local databases and exported archives
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+
+# Local test data / fixtures with real resources
+tests/fixtures/*.bin
+tests/.cache/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local-only upstream material not distributed by this workflow
+/vendor/seedhub-cli/.gitignore
+/vendor/seedhub-cli/README.md
+/vendor/seedhub-cli/SKILL.md
+/vendor/seedhub-cli/requirements.txt

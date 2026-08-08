@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Deterministic bdpan fake for CLI contract tests.
+
+The fake is intentionally file-backed: every invocation appends argv to a log,
+and successful mutations update a JSON state file.  Tests can inject a single
+operation failure with ``BDPAN_FAKE_FAIL=mv:1`` (the first ``mv`` call).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import PurePosixPath
+
+
+def _path(value: object) -> str:
+    return str(PurePosixPath(str(value)))
+
+
+def _load(path: str, default: object) -> object:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _save(path: str, value: object) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+
+
+def _log(argv: list[str]) -> None:
+    path = os.environ.get("BDPAN_FAKE_LOG")
+    if not path:
+        return
+    previous = _load(path, [])
+    if not isinstance(previous, list):
+        previous = []
+    previous.append(argv)
+    _save(path, previous)
+
+
+def _failure_requested(command: str, count: int) -> bool:
+    raw = os.environ.get("BDPAN_FAKE_FAIL", "")
+    for item in raw.split(","):
+        if not item:
+            continue
+        name, _, occurrence = item.partition(":")
+        if name != command:
+            continue
+        if not occurrence:
+            return True
+        try:
+            return int(occurrence) == count
+        except ValueError:
+            return True
+    return False
+
+
+def _state() -> tuple[dict, str | None]:
+    path = os.environ.get("BDPAN_FAKE_STATE")
+    if not path:
+        return {"directories": [], "entries": {}}, None
+    state = _load(path, {"directories": [], "entries": {}})
+    if not isinstance(state, dict):
+        state = {"directories": [], "entries": {}}
+    state.setdefault("directories", [])
+    state.setdefault("entries", {})
+    return state, path
+
+
+def _entry_name(entry: dict) -> str:
+    return str(entry.get("server_filename", entry.get("name", "")))
+
+
+def _find_entry(state: dict, full_path: str) -> tuple[str, dict] | None:
+    path = PurePosixPath(full_path)
+    parent = str(path.parent)
+    for entry in state["entries"].get(parent, []):
+        if _entry_name(entry) == path.name:
+            return parent, entry
+    return None
+
+
+def _main(argv: list[str]) -> int:
+    command = argv[0] if argv else ""
+    log = _load(os.environ.get("BDPAN_FAKE_LOG", ""), [])
+    count = sum(1 for item in log if isinstance(item, list) and item and item[0] == command) + 1
+    ls_count = sum(1 for item in log if isinstance(item, list) and item and item[0] == "ls")
+    if command == "ls":
+        ls_count += 1
+    _log(argv)
+    if _failure_requested(command, count):
+        sys.stderr.write(f"fake failure: {command} #{count} argv={argv!r}\n")
+        return 23
+
+    state, state_path = _state()
+    inject_before = os.environ.get("BDPAN_FAKE_INJECT_BEFORE", "")
+    inject_dir = os.environ.get("BDPAN_FAKE_INJECT_DIR", "")
+    inject_name = os.environ.get("BDPAN_FAKE_INJECT_NAME", "")
+    if command == inject_before and inject_dir and inject_name:
+        inject_dir = _path(inject_dir)
+        state["entries"].setdefault(inject_dir, [])
+        if not any(_entry_name(item) == inject_name for item in state["entries"][inject_dir]):
+            state["entries"][inject_dir].append(
+                {"server_filename": inject_name, "isdir": False}
+            )
+        if state_path:
+            _save(state_path, state)
+    if command == "ls":
+        path = _path(argv[1]) if len(argv) > 1 else ""
+        missing = {_path(item) for item in state.get("missing", [])}
+        if path in missing or (
+            path not in state["entries"] and path not in {_path(item) for item in state["directories"]}
+        ):
+            found = _find_entry(state, path)
+            if found is not None and found[1].get("isdir"):
+                sys.stdout.write("[]")
+                return 0
+            if found is not None:
+                sys.stderr.write(f"not a directory: {path}\n")
+                return 20
+            sys.stderr.write(f"not found: {path}\n")
+            return 3
+        sys.stdout.write(json.dumps(state["entries"].get(path, []), ensure_ascii=False))
+        trigger = os.environ.get("BDPAN_FAKE_INJECT_AFTER_LS", "")
+        try:
+            should_inject = int(trigger) == ls_count
+        except ValueError:
+            should_inject = False
+        inject_dir = os.environ.get("BDPAN_FAKE_INJECT_DIR", "")
+        inject_name = os.environ.get("BDPAN_FAKE_INJECT_NAME", "")
+        if should_inject and inject_dir and inject_name:
+            inject_dir = _path(inject_dir)
+            state["entries"].setdefault(inject_dir, [])
+            if not any(_entry_name(item) == inject_name for item in state["entries"][inject_dir]):
+                state["entries"][inject_dir].append(
+                    {"server_filename": inject_name, "isdir": False}
+                )
+            if inject_dir not in state["directories"]:
+                state["directories"].append(inject_dir)
+            if state_path:
+                _save(state_path, state)
+        return 0
+
+    if command == "mkdir":
+        path = _path(argv[1])
+        if path in state["directories"] or _find_entry(state, path) is not None:
+            sys.stderr.write(f"already exists: {path}\n")
+            return 17
+        if path not in state["directories"]:
+            state["directories"].append(path)
+        state["entries"].setdefault(path, [])
+    elif command == "transfer":
+        destination = argv[argv.index("-d") + 1] if "-d" in argv else ""
+        transfer_name = os.environ.get("BDPAN_FAKE_TRANSFER_NAME", "")
+        if transfer_name and any(
+            _entry_name(item) == transfer_name for item in state["entries"].get(destination, [])
+        ):
+            sys.stderr.write(f"destination conflict: {transfer_name}\n")
+            return 17
+        state["directories"].append(destination) if destination not in state["directories"] else None
+        state["entries"].setdefault(destination, [])
+        if transfer_name:
+            transferred_path = _path(str(PurePosixPath(destination) / transfer_name))
+            state["entries"][destination].append(
+                {"server_filename": transfer_name, "isdir": True}
+            )
+            if transferred_path not in state["directories"]:
+                state["directories"].append(transferred_path)
+            state["entries"].setdefault(transferred_path, [])
+        sys.stdout.write(json.dumps({"dest_dir": destination, "transferred": True}))
+    elif command == "mv":
+        source, destination = _path(argv[1]), _path(argv[2])
+        found = _find_entry(state, source)
+        if found is None:
+            sys.stderr.write(f"not found: {source}\n")
+            return 3
+        if destination not in state["directories"] and destination not in state["entries"]:
+            sys.stderr.write(f"not a directory: {destination}\n")
+            return 20
+        source_name = PurePosixPath(source).name
+        if any(_entry_name(item) == source_name for item in state["entries"].get(destination, [])):
+            sys.stderr.write(f"destination conflict: {source_name}\n")
+            return 17
+        parent, entry = found
+        state["entries"][parent].remove(entry)
+        state["entries"].setdefault(destination, []).append(dict(entry))
+    elif command == "rename":
+        source, new_name = _path(argv[1]), str(argv[2])
+        found = _find_entry(state, source)
+        if found is None:
+            sys.stderr.write(f"not found: {source}\n")
+            return 3
+        parent, entry = found
+        if any(
+            candidate is not entry and _entry_name(candidate) == new_name
+            for candidate in state["entries"].get(parent, [])
+        ):
+            sys.stderr.write(f"destination conflict: {new_name}\n")
+            return 17
+        entry["server_filename"] = new_name
+    elif command == "rm":
+        target = _path(argv[-1])
+        if state["entries"].get(target):
+            sys.stderr.write(f"directory not empty: {target}\n")
+            return 4
+        state["entries"].pop(target, None)
+        state["directories"] = [item for item in state["directories"] if item != target]
+    else:
+        sys.stderr.write(f"unsupported fake command: {command}\n")
+        return 64
+
+    if state_path:
+        _save(state_path, state)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

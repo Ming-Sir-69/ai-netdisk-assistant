@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Deterministic privacy gate for staged blobs, the work tree, and history.
+
+The guard deliberately reports only a finding class and a relative path.  It
+never prints the matched line or value, so a failed commit cannot echo the
+credential that caused the block.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+
+MAX_BINARY_BYTES = 1_048_576
+MAX_TEXT_BYTES = 5 * 1_048_576
+
+_PLACEHOLDER_HOME_NAMES = frozenset(
+    {
+        "alice",
+        "bob",
+        "example",
+        "example-user",
+        "test",
+        "tester",
+        "tmp",
+        "user",
+        "username",
+        "your-name",
+        "yourname",
+    }
+)
+_PLACEHOLDER_EMAIL_DOMAINS = frozenset(
+    {
+        "example.com",
+        "example.invalid",
+        "example.org",
+        "localhost",
+        "users.noreply.github.com",
+    }
+)
+_URL_AUTHORITY_DOMAINS = frozenset({"pan.baidu.com", "localhost", "127.0.0.1"})
+_PLACEHOLDER_VALUES = frozenset(
+    {
+        "<redacted>",
+        "[redacted]",
+        "changeme",
+        "example",
+        "example-token",
+        "fixture",
+        "placeholder",
+        "redacted",
+        "test",
+        "test-token",
+        "token",
+        "your-token",
+    }
+)
+
+_PERSONAL_PATH_RE = re.compile(r"(?<![A-Za-z0-9])/(Users|Volumes)/([^/\s]+)/")
+_EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9.-])")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?im)\b(?P<label>bduss|cookie|authorization|api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|client[_-]?secret|secret|password|passwd|private[_-]?key)\b"
+    r"[ \t]*(?:=|:)[ \t]*(?P<value>[^\r\n]+)"
+)
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:[A-Z]+ )?(?:ENCRYPTED )?PRIVATE KEY-----"
+)
+_BAIDU_SHARE_RE = re.compile(
+    r"https?://pan\.baidu\.com/(?:s|share/link)/([A-Za-z0-9_-]{10,})"
+    r"(?:\?[^\s\"'<>]*)?",
+    re.IGNORECASE,
+)
+_FORCED_CREDENTIAL_NAME_RE = re.compile(
+    r"(?:credential|credentials|secret|token|cookie|bduss|oauth|auth)(?:[._-]|$)", re.IGNORECASE
+)
+_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".cache",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "node_modules",
+    }
+)
+
+
+@dataclass(frozen=True, order=True)
+class Finding:
+    category: str
+    path: str
+
+
+def _git(root: Path, *args: str, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run Git without exposing its stderr to a caller-facing finding."""
+
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _repo_root() -> Path:
+    configured = os.environ.get("PANLIB_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    result = _git(Path.cwd(), "rev-parse", "--show-toplevel")
+    if result.returncode != 0:
+        raise RuntimeError("not a Git repository")
+    return Path(os.fsdecode(result.stdout).strip()).resolve()
+
+
+def _display_path(root: Path, path: Path | str) -> str:
+    candidate = Path(path)
+    try:
+        return candidate.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return candidate.as_posix()
+
+
+def _placeholder_value(value: str) -> bool:
+    normalized = value.strip().strip("\"'`;,.)]").lower()
+    if normalized in _PLACEHOLDER_VALUES:
+        return True
+    return normalized.startswith("<redacted") or normalized.startswith("[redacted")
+
+
+def _personal_path_findings(text: str, path: str) -> Iterator[Finding]:
+    for match in _PERSONAL_PATH_RE.finditer(text):
+        home_name = match.group(2).lower()
+        if home_name not in _PLACEHOLDER_HOME_NAMES:
+            yield Finding("personal-path", path)
+            return
+
+
+def _email_findings(text: str, path: str) -> Iterator[Finding]:
+    for match in _EMAIL_RE.finditer(text):
+        domain = match.group(1).lower()
+        prefix = text[max(0, match.start() - 8) : match.start()].lower()
+        if prefix.endswith("://") and domain in _URL_AUTHORITY_DOMAINS:
+            continue
+        if domain not in _PLACEHOLDER_EMAIL_DOMAINS:
+            yield Finding("personal-email", path)
+            return
+
+
+def _credential_findings(text: str, path: str) -> Iterator[Finding]:
+    for match in _SECRET_ASSIGNMENT_RE.finditer(text):
+        raw_value = match.group("value").strip().strip("\"'`;,)")
+        # Header schemes are labels, not the credential itself.
+        raw_value = re.sub(r"^(?:bearer|basic|digest)\s+", "", raw_value, flags=re.IGNORECASE)
+        candidate = raw_value.split()[0] if raw_value else ""
+        if len(candidate) < 16 or _placeholder_value(candidate):
+            continue
+        if candidate.startswith(("+", "_")) or any(char in candidate for char in "(){}[]\\\"'"):
+            continue
+        if match.group("label").lower() == "authorization" and "=" in candidate:
+            continue
+        # Require a token-looking value, avoiding prose such as
+        # ``Authorization: see the documentation``.
+        if not re.search(r"[A-Za-z0-9]", candidate):
+            continue
+        yield Finding("credential", path)
+        return
+
+
+def _content_findings(text: str, path: str) -> Iterator[Finding]:
+    yield from _personal_path_findings(text, path)
+    yield from _email_findings(text, path)
+    yield from _credential_findings(text, path)
+    if _PRIVATE_KEY_RE.search(text):
+        yield Finding("private-key", path)
+    for match in _BAIDU_SHARE_RE.finditer(text):
+        share_id = match.group(1).lower()
+        if share_id.startswith(("fake-", "placeholder-")):
+            continue
+        yield Finding("baidu-share", path)
+        break
+
+
+def _forced_credential_file(path: str) -> bool:
+    name = Path(path).name.lower()
+    if name == ".env.example":
+        return False
+    if name in {".env", ".envrc", ".netrc", ".npmrc", ".pypirc", "credentials", "token", "secret", "cookies"}:
+        return True
+    if name.endswith((".pem", ".key", ".p12", ".pfx")):
+        return True
+    return bool(_FORCED_CREDENTIAL_NAME_RE.search(name))
+
+
+def _looks_binary(data: bytes) -> bool:
+    sample = data[:8192]
+    if b"\x00" in sample:
+        return True
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _scan_blob(path: str, data: bytes) -> set[Finding]:
+    findings: set[Finding] = set()
+    if _forced_credential_file(path):
+        findings.add(Finding("forced-credential-file", path))
+    binary = _looks_binary(data)
+    if binary and len(data) > MAX_BINARY_BYTES:
+        findings.add(Finding("large-binary", path))
+    elif not binary and len(data) > MAX_TEXT_BYTES:
+        findings.add(Finding("large-file", path))
+    if binary:
+        return findings
+    text = data.decode("utf-8", errors="replace")
+    findings.update(_content_findings(text, path))
+    return findings
+
+
+def _staged_paths(root: Path) -> list[str]:
+    result = _git(root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR")
+    if result.returncode != 0:
+        raise RuntimeError("cannot inspect staged files")
+    return [os.fsdecode(item) for item in result.stdout.split(b"\x00") if item]
+
+
+def _staged_findings(root: Path) -> set[Finding]:
+    findings: set[Finding] = set()
+    for path in _staged_paths(root):
+        oid_result = _git(root, "rev-parse", "--verify", f":{path}")
+        if oid_result.returncode != 0:
+            continue
+        oid = os.fsdecode(oid_result.stdout).strip()
+        blob = _git(root, "cat-file", "blob", oid)
+        if blob.returncode != 0:
+            continue
+        findings.update(_scan_blob(path, blob.stdout))
+    return findings
+
+
+def _walk_paths(root: Path) -> Iterator[Path]:
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        dirs[:] = sorted(directory for directory in dirs if directory not in _SKIP_DIRS)
+        for filename in sorted(files):
+            candidate = Path(current) / filename
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            yield candidate
+
+
+def _whole_tree_findings(root: Path) -> set[Finding]:
+    findings: set[Finding] = set()
+    for candidate in _walk_paths(root):
+        relative = _display_path(root, candidate)
+        try:
+            size = candidate.stat().st_size
+            if size > MAX_TEXT_BYTES:
+                with candidate.open("rb") as handle:
+                    sample = handle.read(8192)
+                if _looks_binary(sample):
+                    findings.add(Finding("large-binary", relative))
+                else:
+                    findings.add(Finding("large-file", relative))
+                if _forced_credential_file(relative):
+                    findings.add(Finding("forced-credential-file", relative))
+                continue
+            data = candidate.read_bytes()
+        except OSError:
+            findings.add(Finding("unreadable-file", relative))
+            continue
+        findings.update(_scan_blob(relative, data))
+    return findings
+
+
+def _history_metadata_findings(root: Path) -> set[Finding]:
+    findings: set[Finding] = set()
+    result = _git(root, "log", "--all", "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00")
+    if result.returncode != 0:
+        raise RuntimeError("cannot inspect history metadata")
+    fields = result.stdout.split(b"\x00")
+    for offset in range(0, len(fields) - 4, 5):
+        commit = os.fsdecode(fields[offset]).strip()
+        if not commit:
+            continue
+        for email in (os.fsdecode(fields[offset + 2]), os.fsdecode(fields[offset + 4])):
+            match = _EMAIL_RE.search(email)
+            if match and match.group(1).lower() not in _PLACEHOLDER_EMAIL_DOMAINS:
+                findings.add(Finding("personal-email", f"history:{commit[:12]}:metadata"))
+    return findings
+
+
+def _history_findings(root: Path) -> set[Finding]:
+    findings = _history_metadata_findings(root)
+    objects = _git(root, "rev-list", "--objects", "--all")
+    if objects.returncode != 0:
+        raise RuntimeError("cannot enumerate history blobs")
+    seen: set[str] = set()
+    for line in objects.stdout.splitlines():
+        try:
+            oid_bytes, path_bytes = line.split(b" ", 1)
+        except ValueError:
+            continue
+        oid = os.fsdecode(oid_bytes)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        kind = _git(root, "cat-file", "-t", oid)
+        if kind.returncode != 0 or os.fsdecode(kind.stdout).strip() != "blob":
+            continue
+        blob = _git(root, "cat-file", "blob", oid)
+        if blob.returncode != 0:
+            continue
+        path = os.fsdecode(path_bytes)
+        findings.update(_scan_blob(path, blob.stdout))
+    return findings
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="scan staged blobs or the whole repository for privacy leaks")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--staged", "--staged-only", action="store_true", help="scan staged blobs (default)")
+    modes.add_argument("--whole-tree", action="store_true", help="scan tracked and untracked files")
+    modes.add_argument("--history", action="store_true", help="scan Git history and commit metadata")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv or sys.argv[1:])
+    try:
+        root = _repo_root()
+        if args.whole_tree:
+            findings = _whole_tree_findings(root)
+            mode = "whole-tree"
+        elif args.history:
+            findings = _history_findings(root)
+            mode = "history"
+        else:
+            findings = _staged_findings(root)
+            mode = "staged"
+    except (OSError, RuntimeError):
+        print("privacy-guard: unable to inspect repository", file=sys.stderr)
+        return 2
+
+    ordered = sorted(findings)
+    if ordered:
+        print(f"privacy-guard: blocked {len(ordered)} finding(s) in {mode} scan", file=sys.stderr)
+        for finding in ordered:
+            print(f"privacy-guard: {finding.category} {finding.path}", file=sys.stderr)
+        return 1
+    print(f"privacy-guard: {mode} scan passed", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

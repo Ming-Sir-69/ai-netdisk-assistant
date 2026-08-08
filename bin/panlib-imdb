@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""panlib-imdb - IMDB ID 解析器（已知表 + 格式验证）
+
+外部 IMDB/豆瓣 API 被反爬拦截，本 CLI 改为「已知表 + 验证 + AI 询问」模式：
+- 优先用 --imdb-id 参数（AI 已知的 ID）
+- 回退查内置已知表
+- 都没有 → 返回 NOT_FOUND，由 AI 询问用户
+
+扩展已知表：在 IMDB_KNOWN 字典里添加条目。
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import INVALID_ARG, NOT_FOUND, emit_error, emit_success
+
+
+# 内置已知 IMDb 表（初始公开样例）
+IMDB_KNOWN: dict[str, dict] = {
+    # 中文名 → 详情
+    "永无止境": {
+        "imdb_id": "tt1219289",
+        "title_en": "Limitless",
+        "year": "2011",
+        "douban_id": "2129138",
+    },
+    "史密斯夫妇": {
+        "imdb_id": "tt0356910",
+        "title_en": "Mr. & Mrs. Smith",
+        "year": "2005",
+        "douban_id": "1309199",
+    },
+    "土拨鼠之日": {
+        "imdb_id": "tt0107048",
+        "title_en": "Groundhog Day",
+        "year": "1993",
+        "douban_id": "1293010",
+    },
+    "玩具总动员5": {
+        "imdb_id": "tt29355505",
+        "title_en": "Toy Story 5",
+        "year": "2026",
+        "douban_id": "36599707",
+    },
+    "玩具总动员": {
+        "imdb_id": "tt0114709",
+        "title_en": "Toy Story",
+        "year": "1995",
+        "douban_id": "1291572",
+    },
+    # 英文名 → 详情（同一资源）
+    "Limitless": {
+        "imdb_id": "tt1219289",
+        "title_en": "Limitless",
+        "year": "2011",
+        "douban_id": "2129138",
+    },
+    "Mr. & Mrs. Smith": {
+        "imdb_id": "tt0356910",
+        "title_en": "Mr. & Mrs. Smith",
+        "year": "2005",
+        "douban_id": "1309199",
+    },
+    "Groundhog Day": {
+        "imdb_id": "tt0107048",
+        "title_en": "Groundhog Day",
+        "year": "1993",
+        "douban_id": "1293010",
+    },
+    "Toy Story 5": {
+        "imdb_id": "tt29355505",
+        "title_en": "Toy Story 5",
+        "year": "2026",
+        "douban_id": "36599707",
+    },
+}
+
+
+def validate_imdb_id(imdb_id: str) -> bool:
+    """验证 IMDB ID 格式: tt + 7-8 位数字."""
+    return bool(re.match(r'^tt\d{7,8}$', imdb_id.strip()))
+
+
+def lookup_known(title: str) -> dict | None:
+    """查内置已知表."""
+    title_clean = title.strip()
+    if title_clean in IMDB_KNOWN:
+        return IMDB_KNOWN[title_clean]
+    # 模糊匹配：忽略大小写
+    title_lower = title_clean.lower()
+    for key, value in IMDB_KNOWN.items():
+        if key.lower() == title_lower:
+            return value
+    return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="IMDB ID 解析器（已知表 + 验证）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  panlib-imdb --imdb-id tt1219289
+  panlib-imdb --title "永无止境"
+        """,
+    )
+    parser.add_argument("--imdb-id", help="已知 IMDB ID (ttXXX) — 优先使用")
+    parser.add_argument("--title", "-t", help="影视名称，查内置已知表")
+    parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+    args = parser.parse_args()
+
+    # 路径 1: 直接验证已知 ID
+    if args.imdb_id:
+        imdb_id = args.imdb_id.strip()
+        if not validate_imdb_id(imdb_id):
+            emit_error(INVALID_ARG, f"IMDB ID 格式错误: {imdb_id}",
+                       {"expected": "tt + 7-8 位数字", "got": imdb_id})
+        emit_success({"imdb_id": imdb_id},
+                     meta={"source": "user-provided", "validated": True})
+        return
+
+    # 路径 2: 查内置已知表
+    if args.title:
+        result = lookup_known(args.title)
+        if result:
+            emit_success(result, meta={"source": "known-table", "query": args.title})
+            return
+        emit_error(
+            NOT_FOUND,
+            f"内置已知表无 '{args.title}'，请用 --imdb-id 显式提供",
+            details={"hint": "AI 应询问用户 IMDB ID，或检查拼写"},
+        )
+        return
+
+    # 都没给
+    emit_error(INVALID_ARG, "必须提供 --imdb-id 或 --title")
+
+
+if __name__ == "__main__":
+    main()
