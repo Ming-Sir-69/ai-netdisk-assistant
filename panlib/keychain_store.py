@@ -74,10 +74,14 @@ class MacOSKeychain:
         return "macos-keychain"
 
     def _ensure_available(self) -> None:
-        if sys.platform != "darwin":
-            raise CredentialUnavailable("macOS Keychain is required")
         executable = str(self.security)
-        if not (Path(executable).is_file() or shutil.which(executable)):
+        uses_native_default = executable == "/usr/bin/security"
+        if sys.platform != "darwin" and uses_native_default:
+            raise CredentialUnavailable("macOS Keychain is required")
+        # A custom executable is an explicit compatibility/test seam. A custom
+        # runner is already the process boundary under test, so it does not
+        # require the macOS binary to exist on the host running the test.
+        if self.runner is subprocess.run and not (Path(executable).is_file() or shutil.which(executable)):
             raise CredentialUnavailable("macOS security command is unavailable")
 
     def _invoke(
@@ -162,7 +166,7 @@ class MacOSKeychain:
             raise CredentialError("macOS Keychain delete failed")
 
     def status(self) -> CredentialStatus:
-        if sys.platform != "darwin":
+        if sys.platform != "darwin" and str(self.security) == "/usr/bin/security":
             return CredentialStatus(self.backend, False, False, "macos_required")
         try:
             raw = self.get()

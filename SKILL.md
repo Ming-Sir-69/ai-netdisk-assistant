@@ -24,6 +24,8 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 - 百度网盘转存与影视文件整理。
 - macOS 上通过官方百度网盘 MCP 读取全盘目录、搜索和读取元数据；旧资源仅能通过
   `panlib-library archive` 以 `file_move` 归档到指定目录，人工审核后再手动删除。
+- 可替换凭证接口默认使用 macOS Keychain；其他系统只能显式接入受控
+  `external-command` 安全代理，不提供明文文件回退。
 
 当前不支持：整盘盘点、定期任务、其他网盘写入、磁力下载、实时豆瓣/OMDb 查询。对“整理我的网盘”这类宽泛请求，先请用户给出影视关键词或精确 `source_dir`，不扫描整盘，不直接拼接网盘命令。
 
@@ -36,7 +38,7 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 5. 缺少 bdpan：展示并打开 `https://github.com/baidu-netdisk/bdpan-storage` 或官方 `skills/baidu-drive/scripts/install.sh` 页，停止等待用户安装。不静默下载或执行外部安装器。
 6. 未授权：运行 `./scripts/login.sh`。用户自行阅读提示、在百度官方页登录、将 32 位授权码粘贴到终端并回车。Agent 不索要授权码。
 7. 运行 `./bin/panlib-doctor`。仅顶层 `status=ready` 可继续；其他状态按 `next_steps` 停止或交给用户。
-8. 在 macOS 上运行 `.venv/bin/python bin/panlib-library auth-status`。已有有效授权时继续，且不得再次打开浏览器。仅当 Keychain 未配置或过期时，给用户 `scripts/authorize_mcp_macos.py` 的绝对路径和唯一命令，让用户在自己可见的终端手动运行；完整回调只粘贴到脚本的隐藏输入，不发送给 Agent。授权后非交互检查由 Agent 执行。
+8. 运行 `.venv/bin/python bin/panlib-library auth-status`。macOS 已有有效授权（保存在 Keychain）时继续，且不得再次打开浏览器。仅当 Keychain 未配置或过期时，给用户 `scripts/authorize_mcp_macos.py` 的绝对路径和唯一命令，让用户在自己可见的终端手动运行；完整回调只粘贴到脚本的隐藏输入，不发送给 Agent。其他系统只有在用户已配置 `external-command` 安全代理时继续；仓库不创建明文凭证文件。授权后非交互检查由 Agent 执行。
 
 ## 业务状态机
 
@@ -47,7 +49,7 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 3. `.venv/bin/python bin/panlib-imdb --title "<title>"`；本地表无结果就请用户提供 `tt...`，然后用 `--imdb-id`验证。
 4. 用 `.venv/bin/python bin/panlib-transfer --resource-id <id> ...` 生成转存计划，**不加** `--execute`。transfer 在自己的进程内解析链接，不把 URL/提取码返回给 Agent。
    resource-id 路径会在计划生成前通过官方 `bdpan transfer list --json` 做只读探测；只有 `share_probe.status=valid` 才继续返回计划。过期分享返回 `NOT_FOUND/share_status=expired`，网络、认证、权限或未知响应为 `share_status=unverified` 并停止。
-5. 多个百度候选由 transfer 的 `preset-quality-v1` 固定策略自动排序，依次比较分辨率、片源、HDR、音轨、字幕和大小，完全相同才按资源站原始顺序稳定选择。Agent 不询问用户；只有用户明确覆盖时才传 `--link-index <index>`。计划必须回传 `selection.strategy` 和候选数。
+5. 多个百度候选由 transfer 的 `preset-quality-v1` 固定策略自动排序，依次比较分辨率、片源、HDR、音轨、字幕和大小，完全相同才按资源站原始顺序稳定选择。Agent 不询问用户；只有用户明确覆盖时才传 `--link-index <index>`。计划必须回传 `selection.strategy`、候选数和脱敏的 `selection.selected`，其中不得包含 URL 或提取码。
 6. `NOT_FOUND`、`NETWORK`、`PARSE` 或任何其他非零退出：停止并报告，可请用户选择另一资源；不自动进入写操作。
 
 ### B. 转存：计划 → 第一次确认 → 执行

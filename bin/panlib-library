@@ -25,10 +25,10 @@ from common import (  # noqa: E402
     emit_error,
     emit_success,
 )
-from keychain_store import (  # noqa: E402
+from secure_provider import (  # noqa: E402
     CredentialError,
     CredentialUnavailable,
-    MacOSKeychain,
+    secure_provider_from_environment,
 )
 from mcp_client import (  # noqa: E402
     MCPBridge,
@@ -48,8 +48,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="百度官方 MCP 全盘资源读取与安全归档")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("auth-status", help="只读检查 macOS Keychain 授权状态")
-    store = sub.add_parser("auth-store", help="从 stdin 写入 macOS Keychain；不回显凭证")
+    sub.add_parser("auth-status", help="只读检查当前安全凭证后端状态")
+    store = sub.add_parser("auth-store", help="从 stdin 写入当前安全凭证后端；不回显凭证")
     store.add_argument("--stdin", action="store_true", default=True, help=argparse.SUPPRESS)
 
     list_cmd = sub.add_parser("list", help="读取一个绝对云端目录")
@@ -80,8 +80,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _keychain_status() -> dict:
-    keychain = MacOSKeychain.from_environment()
-    status = keychain.status()
+    status = secure_provider_from_environment().status()
     return {
         "backend": status.backend,
         "available": status.available,
@@ -106,10 +105,11 @@ def main(argv: list[str] | None = None) -> None:
             token = sys.stdin.read().strip()
             if not token:
                 raise ValueError("credential stdin is empty")
-            MacOSKeychain.from_environment().set(token)
+            provider = secure_provider_from_environment()
+            provider.set(token)
             emit_success(
-                {"backend": "macos-keychain", "stored": True},
-                {"command": "panlib-library auth-store", "mode": "write-keychain-only"},
+                {"backend": getattr(provider, "backend", "unknown"), "stored": True},
+                {"command": "panlib-library auth-store", "mode": "write-secure-provider-only"},
             )
 
         bridge = MCPBridge.from_environment()

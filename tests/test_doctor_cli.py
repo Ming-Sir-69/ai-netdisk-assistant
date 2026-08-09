@@ -280,6 +280,14 @@ esac
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "workspace with spaces"
             root.mkdir()
+            _executable(root / "uname", "#!/bin/sh\nprintf 'Darwin\\n'\n")
+            fake_security = root / "security"
+            _executable(
+                fake_security,
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = find-generic-password ]; then exit 0; fi\n"
+                "exit 64\n",
+            )
             fake = self._fake_bdpan(root)
             bundled_bridge = root / "bin" / "panlib-mcp-bridge"
             bundled_bridge.parent.mkdir(parents=True)
@@ -291,12 +299,20 @@ esac
             env["BDPAN_BIN"] = str(fake)
             env["PANLIB_NETWORK_SKIP"] = "0"
             env["PANLIB_REQUIRED_MODULES"] = "json"
+            env["PANLIB_KEYCHAIN_SECURITY"] = str(fake_security)
             result = self.run_doctor(env)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "ready")
-            self.assertTrue(all(item["status"] in {"ready", "skipped"} for item in payload["checks"].values()))
+            self.assertTrue(
+                all(item["status"] in {"ready", "skipped", "configured"} for item in payload["checks"].values())
+            )
+            self.assertEqual(payload["checks"]["mcp"]["status"], "configured")
+            self.assertEqual(
+                payload["checks"]["mcp"]["credential"]["status"],
+                "present_unverified",
+            )
             self.assertEqual(payload["checks"]["mcp"]["bridge"]["status"], "configured")
             self.assertNotIn("PANLIB_MCP_COMMAND", " ".join(payload["next_steps"]))
             calls = (root / "bdpan.log").read_text(encoding="utf-8")
@@ -304,6 +320,42 @@ esac
             self.assertIn("--help", calls)
             self.assertIn("whoami", calls)
             self.assertNotIn("doctor", calls)
+
+    def test_external_credential_backend_is_inspected_without_running_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = self._fake_bdpan(root)
+            bundled_bridge = root / "bin" / "panlib-mcp-bridge"
+            bundled_bridge.parent.mkdir(parents=True)
+            _executable(bundled_bridge, "#!/bin/sh\nexit 0\n")
+            helper_marker = root / "helper-called"
+            helper = root / "credential-helper"
+            _executable(
+                helper,
+                f"#!/bin/sh\nprintf called > '{helper_marker}'\nexit 9\n",
+            )
+            env = self.base_env(root)
+            env.update(
+                {
+                    "PANLIB_ROOT": str(root),
+                    "BDPAN_BIN": str(fake),
+                    "PANLIB_REQUIRED_MODULES": "json",
+                    "PANLIB_CREDENTIAL_BACKEND": "external-command",
+                    "PANLIB_CREDENTIAL_COMMAND": str(helper),
+                }
+            )
+
+            result = self.run_doctor(env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            mcp = payload["checks"]["mcp"]
+            self.assertEqual(mcp["credential"]["backend"], "external-command")
+            self.assertEqual(mcp["credential"]["status"], "configured")
+            self.assertEqual(mcp["full_drive_read"]["status"], "configured")
+            self.assertEqual(mcp["full_drive_move"]["status"], "configured")
+            self.assertFalse(helper_marker.exists(), "doctor must not invoke credential helper")
+            self.assertNotIn("仅支持 macOS Keychain", " ".join(payload["next_steps"]))
 
     def test_hung_bdpan_is_bounded_and_has_structured_guidance(self):
         with tempfile.TemporaryDirectory() as tmp:

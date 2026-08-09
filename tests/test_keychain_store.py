@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from panlib.keychain_store import (
@@ -13,6 +15,19 @@ from panlib.keychain_store import (
 
 
 class MacOSKeychainTests(unittest.TestCase):
+    def test_explicit_security_compatible_executable_is_allowed_on_non_macos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            security = Path(tmp) / "security-compatible"
+            security.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            security.chmod(0o700)
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, "secret-access-token\n", "")
+
+            keychain = MacOSKeychain(security=security, runner=runner)
+            with mock.patch("panlib.keychain_store.sys.platform", "linux"):
+                self.assertEqual(keychain.get(), "secret-access-token")
+
     def test_store_never_puts_secret_in_security_argv(self):
         calls: list[tuple[list[str], str | None]] = []
 

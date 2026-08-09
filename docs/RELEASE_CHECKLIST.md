@@ -20,6 +20,8 @@
 - [ ] organize sidecar 验收通过：SUP 简繁字幕分别得到 `.zh-Hans`/`.zh-Hant`，电影海报得到 `poster.jpg`；`--remove-empty-source` 返回 `INVALID_ARG` 且不调用 rm。
 - [ ] macOS `panlib-library` 的 Keychain 读取、官方 SDK bridge、list/search/meta 只读测试通过；
       `archive` 只发 `file_move(async=0,ondup=fail)`，plan_ref、写前重检和写后验收测试通过。
+- [ ] 可替换凭证接口测试通过：`external-command` 仅接受绝对可执行路径、`shell=False`、
+      JSON stdin/stdout、超时和大小限制；doctor 不启动 helper；不提供明文文件回退。
 - [ ] `scripts/authorize_mcp_macos.py` 在已有有效授权时不打开浏览器；缺失/过期时只接受隐藏的官方完整回调，Keychain 临时假值写入、读回与清理冒烟通过。
 
 ## 隐私与 Git

@@ -315,6 +315,7 @@ def _resolve_resource(
         "selection": {
             "strategy": selection_strategy,
             "candidate_count": len(metadata),
+            "selected": metadata[selected_index],
         },
     }
 

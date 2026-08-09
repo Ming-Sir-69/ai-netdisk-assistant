@@ -24,9 +24,12 @@ Agent 应在同一个目录完成下载、环境检查和授权引导，不创�
   `.zh-Hans`/`.zh-Hant`，电影目录中的 `poster.jpg` 作为海报旁车文件。
 - macOS 上通过官方百度 MCP 读取全盘目录、搜索和元数据；旧资源只通过
   `panlib-library archive` 的 `file_move` 归档，人工审核后再手动删除。
+- 提供可替换凭证接口：默认使用 macOS Keychain；其他系统可显式接入受控的
+  `external-command` 安全凭证代理。
 
-当前只支持百度网盘写入，资源索引也只接入 SeedHub。MCP 凭证本轮仅支持 macOS
-Keychain；不实现 Windows/Linux 后端。它不是通用网盘客户端，也不支持磁力链接下载。
+当前只支持百度网盘写入，资源索引也只接入 SeedHub。仓库内置并实机验收的凭证后端仍是
+macOS Keychain；Windows/Linux 需要用户提供自己的安全凭证代理，本项目不捆绑系统实现，
+也不提供明文文件回退。它不是通用网盘客户端，也不支持磁力链接下载。
 
 ## 安装与初始化
 
@@ -38,6 +41,9 @@ Keychain；不实现 Windows/Linux 后端。它不是通用网盘客户端，也
 4. 如果缺少 `bdpan`，打开[百度官方 bdpan-storage 项目](https://github.com/baidu-netdisk/bdpan-storage)或[官方安装脚本页面](https://github.com/baidu-netdisk/bdpan-storage/blob/main/skills/baidu-drive/scripts/install.sh)，等用户确认后再继续。不静默下载或执行外部安装器。
 5. 运行 `./scripts/login.sh`。脚本会尝试打开百度官方授权页；用户在浏览器登录，将 32 位授权码粘贴到终端并回车。授权码通过 stdin 提交，不出现在命令行。
 6. 运行 `.venv/bin/python bin/panlib-library auth-status`。若 macOS Keychain 已有有效授权，不打开浏览器；只有状态为缺失或过期时，Agent 才给出绝对路径，由用户在自己可见的终端手动运行 `.venv/bin/python scripts/authorize_mcp_macos.py`，并在隐藏输入提示中粘贴完整官方回调 URL。回调、Token 不发送给 Agent。
+   非 macOS 主机必须显式设置 `PANLIB_CREDENTIAL_BACKEND=external-command` 和绝对可执行的
+   `PANLIB_CREDENTIAL_COMMAND`；该 helper 通过受限 JSON stdin/stdout 协议读写系统安全存储，
+   不经 shell，Token 不进入 argv。仓库不提供明文凭证文件兼容路径。
 7. 运行 `./bin/panlib-doctor`。只有顶层 `status=ready` 才进入业务流程。
 
 resource-id 的转存计划会先在 wrapper 内调用官方 `bdpan transfer list --json`
@@ -75,7 +81,7 @@ cd ai-netdisk-assistant
    organize 会把视频旁的 `.ass/.srt/.ssa/.sub/.sup/.vtt/.idx` 一并搬入目标目录；
    文件名含简体/繁体标记时分别规范为 `.zh-Hans`/`.zh-Hant`，电影 `.jpg` 海报统一为 `poster.jpg`。
 
-3. **MCP 归档**：macOS 先运行 `./bin/panlib-library auth-status`，再用
+3. **MCP 归档**：先运行 `./bin/panlib-library auth-status` 确认当前安全凭证后端，再用
    `archive` 生成 plan-only。计划只包含官方 `file_move(async=0,ondup=fail)`，并绑定
    `plan_ref`；确认后使用相同参数加 `--execute --plan-ref`。写前重检源/目标，写后
    验收源消失且目标唯一存在。CLI 不提供任何 delete；归档内容由用户人工审核后再手动删除。
@@ -97,10 +103,11 @@ cd ai-netdisk-assistant
 
 ## 验证状态
 
-- 151 项核心与集成测试已通过，包含受控 bdpan fake、离线 SeedHub fixture、OAuth/Keychain 交互、官方 MCP SDK 契约、文档契约和隐私门禁。
+- 161 项核心与集成测试已通过，包含受控 bdpan fake、离线 SeedHub fixture、OAuth/Keychain 交互、可替换凭证接口、官方 MCP SDK 契约、文档契约和隐私门禁。
 - 2026-08-09 在发布候选目录运行 `PANLIB_NETWORK_SKIP=1 ./bin/panlib-doctor`，顶层状态为 `ready`；该检查不读取账号正文。
 - **macOS 单片真实链路验收通过**：2026-08-09 使用《云中漫步》完成官方 MCP 旧资源识别、SeedHub 搜索、百度分享只读验证、转存、规范整理和 MCP 归档写后验收。最终目录包含规范命名的视频、简繁 SUP 字幕和 `poster.jpg`；旧版资源与未纳入片库的截图只移动到待人工审核区，没有调用 delete。
-- 该证据只覆盖一个受控电影样本及当时的外部服务状态，不代表 SeedHub/百度永久可达，也不代表整盘自动扫描已实现。Windows/Linux 凭证后端仍未实现、未测试。
+- **可替换凭证接口后的单片真实链路验收通过**：同日使用《遇见你之前》再次完成 SeedHub 搜索、固定规则自动选取 4K 候选、转存、规范整理与两项 MCP 归档。最终目录包含规范命名的 2160p 视频和简体字幕；旧版资源与 Apps 空源仅移动到待人工审核区，没有调用 delete。一次旧计划因目标状态变化被 `plan_ref` 拒绝，重新只读生成计划后成功，证明漂移保护有效。
+- 这些证据只覆盖两个受控电影样本及当时的外部服务状态，不代表 SeedHub/百度永久可达，也不代表无界整盘自动扫描已实现。`external-command` 接口经过自动化契约测试，但 Windows/Linux 安全存储实现和实机跨平台验收仍未提供。
 
 ## 隐私与开源门禁
 
@@ -119,6 +126,7 @@ cd ai-netdisk-assistant
 - SeedHub 网页结构变化时会返回 `PARSE`，不猜测新结构。
 - SeedHub 解析优先使用 `.direct-pan`、`panLink` 和 `window.location` 直链；QR 回退需要 Pillow/zxing-cpp，且只读取受限同源图片（2 MiB、16 MP 上限）。
 - 真实 bdpan 没有由本项目控制的原子 no-clobber；我们通过重检和停止规则缩小风险。
+- 跨平台凭证只定义 `external-command` 安全代理协议；仓库未捆绑 Windows Credential Manager、Linux Secret Service 等实现，且不提供明文文件回退。
 - 后续方向：定期自动整理、批量处理效率、更多网盘、磁力链接与下载速率优化、更多资源库。
 
 ## 开发与许可

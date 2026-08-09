@@ -110,10 +110,13 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assertIn("不会调用 `rm`", cli_contract)
         self.assertNotIn("data.cleanup", cli_contract)
         self.assertIn("preset-quality-v1", cli_contract)
+        self.assertIn("selection.selected", cli_contract)
         self.assertNotIn("多候选返回 `INVALID_ARG`", cli_contract)
         for document in (self.read("README.md"), self.read("SKILL.md")):
             self.assertIn("scripts/authorize_mcp_macos.py", document)
             self.assertIn("已有有效授权", document)
+            self.assertIn("external-command", document)
+            self.assertIn("不提供明文文件回退", document)
 
     def test_license_and_third_party_attribution_are_exact(self):
         license_lines = self.read("LICENSE").splitlines()
@@ -146,6 +149,9 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assertIn("macOS 单片真实链路验收通过", readme)
         self.assertIn("《云中漫步》", readme)
         self.assertIn("MCP 归档写后验收", readme)
+        self.assertIn("《遇见你之前》", readme)
+        self.assertIn("可替换凭证接口", readme)
+        self.assertIn("161 项核心与集成测试已通过", readme)
         self.assertRegex(readme, r"(?s)转存.*plan-only.*--execute")
 
 

@@ -16,13 +16,16 @@ panlib/ 配置、路径、命名、脱敏与进程边界
 vendor/seedhub-cli（只读网络/直链与受限 QR 解析） | bdpan（wrapper 内只读探测与外部网盘能力）
 ```
 
-## macOS 官方 MCP 边界
+## 官方 MCP 与可替换凭证边界
 
-`panlib-library` 是与既有 transfer/organize 并列的 macOS-only 全盘能力入口。它通过
+`panlib-library` 是与既有 transfer/organize 并列的全盘能力入口。它通过
 内置 `bin/panlib-mcp-bridge` 调用官方 Python MCP SDK（SSE `ClientSession`），不要求
-默认设置 `PANLIB_MCP_COMMAND`。bridge 从 macOS Keychain
+默认设置 `PANLIB_MCP_COMMAND`。默认 provider 从 macOS Keychain
 `ai-netdisk-manager.baidu-mcp.oauth` 读取 JSON 授权载荷，Token 只存在进程内存，不进入
-argv、日志或 JSON 输出；本轮不实现 Windows/Linux 凭证后端。
+argv、日志或 JSON 输出。可替换 provider 只允许一个绝对可执行的 `external-command`
+安全代理，以受限 JSON stdin/stdout、无 shell、超时和大小限制工作；不提供明文文件回退。
+仓库不捆绑 Windows/Linux 系统安全存储实现，因此跨平台能力只完成接口契约和自动化测试，
+不声称实机验收。
 
 `list`、`search`、`meta` 只读；`archive` 仅调用官方 `file_move`，参数固定为
 `async=0`、`ondup=fail`、`filelist=[{path,dest,newname}]`。归档默认 plan-first，执行前

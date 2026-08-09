@@ -11,11 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
 
 from baidu_mcp import BaiduMCPClient, BaiduMCPError  # noqa: E402
 from common import redact_text  # noqa: E402
-from keychain_store import (  # noqa: E402
+from secure_provider import (  # noqa: E402
     CredentialError,
     CredentialExpired,
     CredentialUnavailable,
-    MacOSKeychain,
+    secure_provider_from_environment,
 )
 
 
@@ -36,9 +36,9 @@ def main() -> int:
         arguments = request.get("arguments") or {}
         if not isinstance(arguments, dict):
             return _error("INVALID_ARG", "bridge arguments must be an object")
-        keychain = MacOSKeychain.from_environment()
+        provider = secure_provider_from_environment()
         if tool == "auth_status":
-            status = keychain.status()
+            status = provider.status()
             print(
                 json.dumps(
                     {
@@ -53,7 +53,7 @@ def main() -> int:
                 )
             )
             return 0 if status.configured else 1
-        token = keychain.token()
+        token = provider.token()
         result = BaiduMCPClient.from_environment(token).call_tool(tool, arguments)
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0

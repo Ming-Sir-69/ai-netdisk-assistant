@@ -2,7 +2,7 @@
 
 ## 通用 I/O
 
-本项目原有 **7 个 CLI**：`panlib-doctor`、`panlib-search`、`panlib-imdb`、`panlib-extract`、`panlib-verify`、`panlib-transfer`、`panlib-organize`；macOS 版本另提供 `panlib-library` 全盘 MCP 入口。
+本项目原有 **7 个 CLI**：`panlib-doctor`、`panlib-search`、`panlib-imdb`、`panlib-extract`、`panlib-verify`、`panlib-transfer`、`panlib-organize`；另提供 `panlib-library` 全盘 MCP 入口。
 
 - Python 业务 CLI 进入主逻辑后，stdout 为机器可读 JSON：成功为 `{"data": ..., "meta": ...}`，失败为 `{"error": {"code": ..., "message": ..., "details": ...}}`。
 - `panlib-doctor` 是独立诊断契约：`{"status": ..., "checks": ..., "next_steps": [...]}`。只有顶层 `status=ready` 可继续。
@@ -24,6 +24,7 @@
 | `panlib-transfer` | resource-id/type/title/IMDb/year/quality；人工兼容 share URL | 是 | `--execute` |
 | `panlib-organize` | source/target/title/IMDb/year/quality/mode | 是 | `--execute` |
 | `panlib-library auth-status` | 无 | 是 | 无 |
+| `panlib-library auth-store` | stdin 凭证 JSON | 否 | 写入当前安全凭证后端 |
 | `panlib-library list` | `--path` 绝对云端目录 | 是 | 无 |
 | `panlib-library search` | `--keyword`, 可选 `--path`/`--dir` | 是 | 无 |
 | `panlib-library meta` | `--path` 或 `--fsid` | 是 | 无 |
@@ -38,7 +39,7 @@
 - 不调用任何 bdpan 写操作。
 - `meta.mode=plan-only`。
 - `data.execute_required=true`，并给出脱敏 plan 和 `dest_dir`。
-- Agent 路径使用 `--resource-id`。唯一候选直接选择；多候选使用 `preset-quality-v1` 确定性排序：分辨率 → 片源（REMUX/原盘/蓝光/流媒体）→ HDR/杜比视界 → 音轨 → 字幕 → 大小，完全相同以资源站原始顺序决胜。计划返回脱敏的 `selection.strategy` 和候选数；不询问用户。`--link-index` 仅用于用户明确要求的人工覆盖。
+- Agent 路径使用 `--resource-id`。唯一候选直接选择；多候选使用 `preset-quality-v1` 确定性排序：分辨率 → 片源（REMUX/原盘/蓝光/流媒体）→ HDR/杜比视界 → 音轨 → 字幕 → 大小，完全相同以资源站原始顺序决胜。计划返回脱敏的 `selection.strategy`、候选数和 `selection.selected`（index/description/quality/resource_type/has_password，不含 URL 或提取码），便于核对依据而不询问用户。`--link-index` 仅用于用户明确要求的人工覆盖。
 - resource-id 计划/执行在内部通过官方 `bdpan transfer list --json` 做只读分享探测；成功时返回 `share_probe.status=valid`。过期分享返回 `NOT_FOUND` 与 `share_status=expired`；网络、认证、权限或无法解析的响应返回 `share_status=unverified` 并停止。该探测不执行转存。
 - resource-id 计划返回 64 位小写十六进制 `share_ref`，它绑定资源、候选索引和 URL，但不编码提取码；输出不返回 URL 或提取码。
 
@@ -94,16 +95,23 @@ SeedHub `link_start` 解析优先读取页面 allowlist 内的 `.direct-pan`、`
 CLI 的既有边界；wrapper 不把 argv、stdout 或 stderr 转发给 Agent，并对错误
 和日志做脱敏。项目不读取本地 bdpan 配置，也不允许 Agent 直接调用 bdpan。
 
-## macOS MCP library 契约
+## 可替换凭证与 MCP library 契约
 
 `panlib-library` 默认通过仓库内 `bin/panlib-mcp-bridge` 调用官方 MCP Python SDK；只有
-测试或替代 host 才设置 `PANLIB_MCP_COMMAND`。凭证从 macOS Keychain 服务
+测试或替代 host 才设置 `PANLIB_MCP_COMMAND`。默认凭证从 macOS Keychain 服务
 `ai-netdisk-manager.baidu-mcp.oauth` 读取 JSON（`access_token`、`scope`、`expires_at_utc`
-或兼容 `expires_at`），不输出 Token；过期状态返回 `AUTH`，Windows/Linux 后端不在本轮范围。
+或兼容 `expires_at`），不输出 Token；过期状态返回 `AUTH`。
+
+其他系统可显式设置 `PANLIB_CREDENTIAL_BACKEND=external-command` 与绝对可执行的
+`PANLIB_CREDENTIAL_COMMAND`（兼容 `PANLIB_CREDENTIAL_HELPER`）。helper 每次只接收一个
+JSON stdin 请求：`{"op":"get"}` 或 `{"op":"set","credential":"..."}`，并返回受限
+JSON stdout。进程使用 `shell=False`、超时与输入/输出大小上限；凭证不进入 argv 或日志。
+仓库不捆绑 Windows/Linux 安全存储 helper，也不提供明文文件回退。
 
 交互授权入口为 `scripts/authorize_mcp_macos.py`：已有有效授权时直接退出且不打开浏览器；仅缺失、过期或用户显式 `--force` 时打开百度官方个人体验授权页，完整回调只从 `getpass` 隐藏输入读取。脚本固定校验官方 HTTPS 主机、成功回调路径以及 `response_type=token`、`redirect_uri=oob`、`scope=basic,netdisk`，并只把 JSON 载荷写入 Keychain。
 
 - `auth-status` 只读并返回 backend/available/configured/reason/expiry/scope。
+- `auth-store` 从 stdin 写入当前安全凭证后端并返回实际 backend；不回显凭证。
 - `list` 调用 `file_list(dir=<path>,page=1)`；官方列表缺少 `isdir` 时，`category=6` 且
   `size=0` 视为目录，显式 `isdir` 优先。
 - `search` 调用 `file_keyword_search(dir=<path>,key=<keyword>,page=1,num=100)`；`--path`
