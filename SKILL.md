@@ -22,6 +22,8 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 - SeedHub 影视搜索与百度分享链接提取。
 - 本地已知表或用户提供的 IMDb ID。
 - 百度网盘转存与影视文件整理。
+- macOS 上通过官方百度网盘 MCP 读取全盘目录、搜索和读取元数据；旧资源仅能通过
+  `panlib-library archive` 以 `file_move` 归档到指定目录，人工审核后再手动删除。
 
 当前不支持：整盘盘点、定期任务、其他网盘写入、磁力下载、实时豆瓣/OMDb 查询。对“整理我的网盘”这类宽泛请求，先请用户给出影视关键词或精确 `source_dir`，不扫描整盘，不直接拼接网盘命令。
 
@@ -34,6 +36,7 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 5. 缺少 bdpan：展示并打开 `https://github.com/baidu-netdisk/bdpan-storage` 或官方 `skills/baidu-drive/scripts/install.sh` 页，停止等待用户安装。不静默下载或执行外部安装器。
 6. 未授权：运行 `./scripts/login.sh`。用户自行阅读提示、在百度官方页登录、将 32 位授权码粘贴到终端并回车。Agent 不索要授权码。
 7. 运行 `./bin/panlib-doctor`。仅顶层 `status=ready` 可继续；其他状态按 `next_steps` 停止或交给用户。
+8. 在 macOS 上运行 `.venv/bin/python bin/panlib-library auth-status`。已有有效授权时继续，且不得再次打开浏览器。仅当 Keychain 未配置或过期时，给用户 `scripts/authorize_mcp_macos.py` 的绝对路径和唯一命令，让用户在自己可见的终端手动运行；完整回调只粘贴到脚本的隐藏输入，不发送给 Agent。授权后非交互检查由 Agent 执行。
 
 ## 业务状态机
 
@@ -43,7 +46,8 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 2. 用户选择或请求中已唯一确定候选后，获取返回的 `id`。
 3. `.venv/bin/python bin/panlib-imdb --title "<title>"`；本地表无结果就请用户提供 `tt...`，然后用 `--imdb-id`验证。
 4. 用 `.venv/bin/python bin/panlib-transfer --resource-id <id> ...` 生成转存计划，**不加** `--execute`。transfer 在自己的进程内解析链接，不把 URL/提取码返回给 Agent。
-5. 若返回 `INVALID_ARG` 且 `error.details.candidates` 非空，只展示其中的 index、description、quality、resource_type 和 has_password，请用户选择唯一候选后用 `--link-index <index>` 重新生成计划；不默认选第一条。
+   resource-id 路径会在计划生成前通过官方 `bdpan transfer list --json` 做只读探测；只有 `share_probe.status=valid` 才继续返回计划。过期分享返回 `NOT_FOUND/share_status=expired`，网络、认证、权限或未知响应为 `share_status=unverified` 并停止。
+5. 多个百度候选由 transfer 的 `preset-quality-v1` 固定策略自动排序，依次比较分辨率、片源、HDR、音轨、字幕和大小，完全相同才按资源站原始顺序稳定选择。Agent 不询问用户；只有用户明确覆盖时才传 `--link-index <index>`。计划必须回传 `selection.strategy` 和候选数。
 6. `NOT_FOUND`、`NETWORK`、`PARSE` 或任何其他非零退出：停止并报告，可请用户选择另一资源；不自动进入写操作。
 
 ### B. 转存：计划 → 第一次确认 → 执行
@@ -54,18 +58,37 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 4. 只有结果同时满足 `executed=true`、`postcondition.status=verified`、`organize_ready=true`、`source_dir` 非空，才可进入整理。
 5. `postcondition.status=ambiguous|unverified`、`partial`、空 `source_dir` 或失败：立即停止。**不得猜测 `source_dir`**，不得自动重试写操作。
 
+### B+. 系列电影结构约束（强制）
+
+同系列不同期的电影**必须**归入一个系列副文件夹，不得平铺在主目录。判断与落位规则：
+
+1. **判定**：片名存在共享主标题 + 副标题（如 `The.Lord.of.the.Rings.The.Fellowship.of.the.Ring` / `...The.Two.Towers` / `...The.Return.of.the.King`），或属同一 franchise（漫威、速度与激情、哈利波特等）的 ≥2 部作品，即为同系列。
+2. **结构**：系列副文件夹命名为 `{共享主标题}.{series}`，位于类型目录之下（如 `/apps/bdpan/片库/Movies/The.Lord.of.the.Rings.{series}/`）；各单部仍以 `{英文名}.{imdb-ttXXXXXXX}` 文件夹存放于系列文件夹之内，文件命名规则不变。
+3. **路径计算**：计算 `dest_dir` / `target_dir` 时，先判断是否已有同系列 `{series}` 文件夹——有则直接落入其内；无则先创建再落入。禁止把同系列单部直接平铺到 `Movies/` 顶层。
+4. **标记语义**：`{series}` 是结构占位符，标识"这是系列副文件夹"，与单部的 `{imdb-ttXXXXXXX}` 区分；两者不得互换。
+5. **混合情况**：系列中仅入库 1 部时，也先建 `{series}` 文件夹再放入，避免后续补全同系列时二次迁移。
+
 ### C. 整理：计划 → 第二次确认 → 执行
 
 1. `source_dir` 只能来自上一步已验证输出，或用户显式给出的精确路径。
 2. 运行 `.venv/bin/python bin/panlib-organize` 并传入 source/target/title/IMDb/year/quality/mode，**不加** `--execute`。
 3. 展示完整 `actions`、源目录、目标目录、文件数和“该流程非事务，可能部分完成”，获得第二次明确确认。
-4. 如果不移除空源，用完全相同的参数加 `--execute` 且只执行一次。如果用户希望移除空源，先执行 D 的额外计划与确认，然后只执行一次。
-5. 源为空、文件名无法解析或发生冲突时停止，不创建、不删除。任何部分失败：报告 `error.details.completed` 与 `error.details.failed_action`，停止当前项及批处理；不自动重试、不猜测回滚。
-6. 如计划包含空源移除，执行后必须检查 `data.cleanup`。只有 `requested=true`、`verified_empty=true`、`removed=true` 才报告已移除；`removed=false` 时报告“媒体整理已完成，源目录未移除”，不重试。
+4. 用完全相同的参数加 `--execute` 且只执行一次。整理默认保留源目录；遗留旧目录按 D 单独生成归档移动计划。
+5. 视频旁的 `.ass/.srt/.ssa/.sub/.sup/.vtt/.idx` 字幕一并移动；文件名含简体/简中/`zh-Hans`/`chs` 时使用 `.zh-Hans`，含繁体/繁中/`zh-Hant`/`cht` 时使用 `.zh-Hant`。电影 `.jpg` 海报统一命名 `poster.jpg`。
+6. 源为空、文件名无法解析或发生冲突时停止，不创建、不删除。任何部分失败：报告 `error.details.completed` 与 `error.details.failed_action`，停止当前项及批处理；不自动重试、不猜测回滚。旧版 `--remove-empty-source` 会立即返回 `INVALID_ARG`，不能绕过归档流程。
 
-### D. 空源目录移除：第三次独立确认
+### D. 旧资源归档：独立移动确认
 
-`--remove-empty-source` 默认禁用。用户希望移除时，在尚未执行 organize 前，用同一组参数加 `--remove-empty-source` 但仍不加 `--execute` 重新生成计划；展示 `verify-empty`/`rm` 和精确源路径，获得**第三次独立确认**。然后才可用该已确认参数加 `--execute`，且整个 organize 只执行一次。CLI 会在末尾重读，仅源目录为空时移除；不删除非空目录或媒体文件。
+整理完成后若留下旧版或空残留目录，不调用删除接口。先用官方 MCP 只读确认源路径和归档目标：
+
+```bash
+./bin/panlib-library archive \
+  --source "/apps/bdpan/片库/Movies/旧目录" \
+  --archive-dir "/我的资源/_已归档_待删除" \
+  --new-name "旧目录_旧版_待删除"
+```
+
+计划会绑定 `plan_ref`，并只生成一次 `file_move(async=0,ondup=fail)`。得到明确确认后，使用完全相同的参数加 `--execute --plan-ref <plan_ref>`。CLI 在写前重读源/目标、拒绝冲突，写后按源路径消失和目标名称存在验收；任何失败立即停止。归档目录中的内容由用户人工审核后再在百度网盘 App 中手动删除。
 
 ## 错误决策
 
@@ -77,14 +100,17 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 | `INVALID_ARG` | 补全参数或处理冲突后重新生成计划 |
 | `NOT_FOUND` | 区分资源、分享链接和源目录；不用“换关键词”处理空源目录 |
 | `PERMISSION` | 停止并报告精确目标，不改到更宽范围 |
+| `share_status=expired` | 报告分享已失效，不进入转存 |
+| `share_status=unverified` | 报告只读探测未确认；按 `AUTH`/`NETWORK`/`PERMISSION`/`PARSE` 处理，不进入转存 |
+| MCP `AUTH`/`expired` | 只运行 `panlib-library auth-status`，让用户完成官方授权；不读取 Token 正文 |
 | `ambiguous` / `unverified` 或上层验收标为 `partial` | 停止，不继续整理，不宣称完成 |
 
 ## 禁止的快捷方式
 
-- 用户催促不能取消三个写入/移除确认点。
+- 用户催促不能取消转存、整理和归档的确认点。
 - 不将 plan-only 说成已执行。
 - 不从标题、目标路径或 bdpan 文本输出猜测 `source_dir`。
-- 不自动重试 transfer、mkdir、mv、rename 或移除操作。
+- 不自动重试 transfer、mkdir、mv、rename 或 `file_move` 归档操作。
 - 不用直接网盘命令绕过路径、冲突、脱敏或状态核验。
 - 不读取本地网盘配置文件。
 - 不用 `panlib-extract` stdout 或 transfer 的 `--url/--password` 人工兼容参数拼接 Agent 命令。
@@ -99,6 +125,7 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 | `panlib-extract/verify` | 人工诊断兼容入口，Agent 不调用 | 否 | 无 |
 | `panlib-transfer` | 默认 | `--execute` | 第一次 |
 | `panlib-organize` | 默认 | `--execute` | 第二次 |
-| `--remove-empty-source` | 否 | 是 | 第三次 |
+| `panlib-library auth-status/list/search/meta` | 是 | 否 | 无 |
+| `panlib-library archive` | 默认 | `--execute`（仅 `file_move`） | 归档确认 |
 
 参数以各命令 `--help` 和 [docs/CLI_CONTRACT.md](docs/CLI_CONTRACT.md) 为准。

@@ -16,11 +16,17 @@ Agent 应在同一个目录完成下载、环境检查和授权引导，不创�
 ## 当前能力
 
 - 连接百度网盘，引导用户在百度官方页面完成 OAuth。
-- 从 SeedHub 搜索少量影视资源，提取并验证百度网盘分享链接。
+- 从 SeedHub 搜索少量影视资源，优先提取直链；页面确实只有二维码时，在受限同源图片范围内本地解码并验证百度网盘分享链接。
+- 多个百度候选由 CLI 按固定的画质、片源、HDR、音轨、字幕和大小规则自动排序；不依赖 Agent 临场选择。
 - 按电影、剧集、纪录片、动漫、网剧分类转存。
 - 按 IMDb 标识和媒体信息生成整理计划，用户确认后执行。
+- 整理时保留常见外挂字幕（含 `.sup`）：简体/繁体分别规范为
+  `.zh-Hans`/`.zh-Hant`，电影目录中的 `poster.jpg` 作为海报旁车文件。
+- macOS 上通过官方百度 MCP 读取全盘目录、搜索和元数据；旧资源只通过
+  `panlib-library archive` 的 `file_move` 归档，人工审核后再手动删除。
 
-当前只支持百度网盘写入，资源索引也只接入 SeedHub。它不是通用网盘客户端，也不支持磁力链接下载。
+当前只支持百度网盘写入，资源索引也只接入 SeedHub。MCP 凭证本轮仅支持 macOS
+Keychain；不实现 Windows/Linux 后端。它不是通用网盘客户端，也不支持磁力链接下载。
 
 ## 安装与初始化
 
@@ -31,7 +37,13 @@ Agent 应在同一个目录完成下载、环境检查和授权引导，不创�
 3. 如果缺少 Python 依赖，先向用户说明会联网安装的内容；获得同意后才运行 `./scripts/bootstrap.sh --install-deps`。
 4. 如果缺少 `bdpan`，打开[百度官方 bdpan-storage 项目](https://github.com/baidu-netdisk/bdpan-storage)或[官方安装脚本页面](https://github.com/baidu-netdisk/bdpan-storage/blob/main/skills/baidu-drive/scripts/install.sh)，等用户确认后再继续。不静默下载或执行外部安装器。
 5. 运行 `./scripts/login.sh`。脚本会尝试打开百度官方授权页；用户在浏览器登录，将 32 位授权码粘贴到终端并回车。授权码通过 stdin 提交，不出现在命令行。
-6. 运行 `./bin/panlib-doctor`。只有顶层 `status=ready` 才进入业务流程。
+6. 运行 `.venv/bin/python bin/panlib-library auth-status`。若 macOS Keychain 已有有效授权，不打开浏览器；只有状态为缺失或过期时，Agent 才给出绝对路径，由用户在自己可见的终端手动运行 `.venv/bin/python scripts/authorize_mcp_macos.py`，并在隐藏输入提示中粘贴完整官方回调 URL。回调、Token 不发送给 Agent。
+7. 运行 `./bin/panlib-doctor`。只有顶层 `status=ready` 才进入业务流程。
+
+resource-id 的转存计划会先在 wrapper 内调用官方 `bdpan transfer list --json`
+做只读分享探测。探测结果为 `valid` 才能生成计划；`expired` 或
+`unverified` 都会停止，不会执行转存。链接和提取码只在 wrapper 子进程的
+短暂 argv 中出现，不进入 Agent 的 stdout/stderr 或计划 JSON。
 
 ### 人工快速路径
 
@@ -46,6 +58,9 @@ cd ai-netdisk-assistant
 ```bash
 ./scripts/bootstrap.sh --install-deps
 ./scripts/login.sh
+.venv/bin/python bin/panlib-library auth-status
+# 仅在上一步报告缺失或过期时，由用户手动运行：
+.venv/bin/python scripts/authorize_mcp_macos.py
 ./bin/panlib-doctor
 ```
 
@@ -53,12 +68,21 @@ cd ai-netdisk-assistant
 
 ## 安全工作流
 
-搜索、IMDb 查询、链接解析、链接验证和 doctor 是只读操作。写入分两个阶段：
+搜索、IMDb 查询、链接解析、链接验证和 doctor 是只读操作。写入分三个独立阶段：
 
 1. **转存**：首次调用 `panlib-transfer` 只返回 `plan-only`计划；展示目标目录并获得用户确认后，使用完全相同的参数加 `--execute`。
 2. **整理**：只有转存结果同时满足 `postcondition.status=verified`、`organize_ready=true` 且返回非空 `source_dir` 时才可继续。先调用 `panlib-organize` 生成计划，再获得第二次确认后加 `--execute`。
+   organize 会把视频旁的 `.ass/.srt/.ssa/.sub/.sup/.vtt/.idx` 一并搬入目标目录；
+   文件名含简体/繁体标记时分别规范为 `.zh-Hans`/`.zh-Hant`，电影 `.jpg` 海报统一为 `poster.jpg`。
 
-`--remove-empty-source` 必须在 organize 尚未执行时加入计划，展示 `verify-empty`/`rm` 后获得第三次单独授权，然后整个 organize 只执行一次。CLI 在末尾重读确认为空才移除，默认不使用。任何 `partial`、`unverified`、失败或歧义状态都必须停止；写操作不得自动重试。
+3. **MCP 归档**：macOS 先运行 `./bin/panlib-library auth-status`，再用
+   `archive` 生成 plan-only。计划只包含官方 `file_move(async=0,ondup=fail)`，并绑定
+   `plan_ref`；确认后使用相同参数加 `--execute --plan-ref`。写前重检源/目标，写后
+   验收源消失且目标唯一存在。CLI 不提供任何 delete；归档内容由用户人工审核后再手动删除。
+
+任何 `partial`、`unverified`、失败或歧义状态都必须停止；写操作不得自动重试。
+旧版 `--remove-empty-source` 仅保留兼容解析但会立即返回 `INVALID_ARG`；源目录不由 organize 删除，
+需要清理时必须按上面的 MCP `file_move` 归档流程人工审核。
 
 详细状态机见 [SKILL.md](SKILL.md)，命令参数和 JSON 契约见 [docs/CLI_CONTRACT.md](docs/CLI_CONTRACT.md)。
 
@@ -73,10 +97,10 @@ cd ai-netdisk-assistant
 
 ## 验证状态
 
-- 110 项核心与集成测试已通过，包含受控 bdpan fake、离线 SeedHub fixture、OAuth 交互、文档契约和隐私门禁。
+- 151 项核心与集成测试已通过，包含受控 bdpan fake、离线 SeedHub fixture、OAuth/Keychain 交互、官方 MCP SDK 契约、文档契约和隐私门禁。
 - 2026-08-09 在发布候选目录运行 `PANLIB_NETWORK_SKIP=1 ./bin/panlib-doctor`，顶层状态为 `ready`；该检查不读取账号正文。
-- 当前发布证据不包含外部 SeedHub/百度实时网络可达性；离线 fixture 通过不代表外部站点当前可用。
-- **未执行真实网盘写入验收**：未获得精确测试目录、资源与清理范围授权前，不声称真实端到端通过。
+- **macOS 单片真实链路验收通过**：2026-08-09 使用《云中漫步》完成官方 MCP 旧资源识别、SeedHub 搜索、百度分享只读验证、转存、规范整理和 MCP 归档写后验收。最终目录包含规范命名的视频、简繁 SUP 字幕和 `poster.jpg`；旧版资源与未纳入片库的截图只移动到待人工审核区，没有调用 delete。
+- 该证据只覆盖一个受控电影样本及当时的外部服务状态，不代表 SeedHub/百度永久可达，也不代表整盘自动扫描已实现。Windows/Linux 凭证后端仍未实现、未测试。
 
 ## 隐私与开源门禁
 
@@ -93,6 +117,7 @@ cd ai-netdisk-assistant
 
 - IMDb 只支持内置已知表或用户显式提供 `tt...` 标识，不调用豆瓣或 OMDb。
 - SeedHub 网页结构变化时会返回 `PARSE`，不猜测新结构。
+- SeedHub 解析优先使用 `.direct-pan`、`panLink` 和 `window.location` 直链；QR 回退需要 Pillow/zxing-cpp，且只读取受限同源图片（2 MiB、16 MP 上限）。
 - 真实 bdpan 没有由本项目控制的原子 no-clobber；我们通过重检和停止规则缩小风险。
 - 后续方向：定期自动整理、批量处理效率、更多网盘、磁力链接与下载速率优化、更多资源库。
 

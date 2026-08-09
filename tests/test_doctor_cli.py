@@ -109,6 +109,32 @@ esac
             self.assertIn("bs4", calls)
             self.assertNotIn("beautifulsoup4", calls)
 
+    def test_dependency_check_maps_qr_distribution_names_to_import_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_python = root / ".venv" / "bin" / "python"
+            fake_python.parent.mkdir(parents=True)
+            _executable(
+                fake_python,
+                """#!/bin/sh
+set -eu
+case "${1:-}" in
+  --version) printf 'Python 3.13.12\\n' ;;
+  -c) [ "${3:-}" = "PIL,zxingcpp,mcp" ] ;;
+  *) exit 64 ;;
+esac
+""",
+            )
+            (root / "requirements.txt").write_text(
+                "Pillow==12.3.0\nzxing-cpp==3.1.1\nmcp==1.28.1\n", encoding="utf-8"
+            )
+            fake_bdpan = self._fake_bdpan(root)
+            env = self.base_env(root)
+            env.update({"BDPAN_BIN": str(fake_bdpan), "PANLIB_REQUIRED_MODULES": ""})
+            result = self.run_doctor(env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["checks"]["dependencies"]["status"], "ready")
+
     def test_python_below_3_13_is_unsupported(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -252,11 +278,16 @@ esac
 
     def test_ready_status_uses_only_read_only_bdpan_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp) / "workspace with spaces"
+            root.mkdir()
             fake = self._fake_bdpan(root)
+            bundled_bridge = root / "bin" / "panlib-mcp-bridge"
+            bundled_bridge.parent.mkdir(parents=True)
+            _executable(bundled_bridge, "#!/bin/sh\nexit 0\n")
             curl = root / "curl"
             _executable(curl, "#!/bin/sh\nexit 0\n")
             env = self.base_env(root)
+            env["PANLIB_ROOT"] = str(root)
             env["BDPAN_BIN"] = str(fake)
             env["PANLIB_NETWORK_SKIP"] = "0"
             env["PANLIB_REQUIRED_MODULES"] = "json"
@@ -266,6 +297,8 @@ esac
             payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "ready")
             self.assertTrue(all(item["status"] in {"ready", "skipped"} for item in payload["checks"].values()))
+            self.assertEqual(payload["checks"]["mcp"]["bridge"]["status"], "configured")
+            self.assertNotIn("PANLIB_MCP_COMMAND", " ".join(payload["next_steps"]))
             calls = (root / "bdpan.log").read_text(encoding="utf-8")
             self.assertIn("--version", calls)
             self.assertIn("--help", calls)

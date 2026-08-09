@@ -9,7 +9,10 @@ from collections.abc import Iterable
 
 _IMDB_RE = re.compile(r"^tt\d{7,8}$")
 _YEAR_RE = re.compile(r"^(?:18|19|20|21)\d{2}$")
-_EXTENSIONS = {"mkv", "mp4", "ts", "avi", "iso"}
+_EXTENSIONS = {
+    "mkv", "mp4", "ts", "avi", "iso",
+    "ass", "srt", "ssa", "sub", "sup", "vtt", "idx",
+}
 _QUALITIES = {"2160p", "1080p", "1080p.REMUX", "1080p.BluRay", "720p", "WEB-DL"}
 _INVALID_NAME_CHARS = set('/\\:*?"<>|')
 
@@ -309,3 +312,56 @@ def build_episode_filenames(
     if not targets:
         raise ValueError("at least one episode is required")
     return reject_collisions(targets)
+
+
+# --- 系列电影结构约束 ---------------------------------------------------------
+
+_SERIES_MARKER = "{series}"
+
+
+def series_folder_name(shared_title: str) -> str:
+    """Build a series parent folder name from a shared main title.
+
+    同系列不同期的电影必须归入一个系列副文件夹，命名为
+    ``{共享主标题}.{series}``，与单部的 ``{imdb-ttXXXXXXX}`` 文件夹区分。
+
+    >>> series_folder_name("The.Lord.of.the.Rings")
+    'The.Lord.of.the.Rings.{series}'
+    """
+
+    base = sanitize(shared_title)
+    if base.endswith(_SERIES_MARKER):
+        return base
+    return f"{base}.{_SERIES_MARKER}"
+
+
+def is_series_folder(name: str) -> bool:
+    """Return whether a folder name is a series parent folder."""
+
+    return isinstance(name, str) and name.rstrip("/").endswith(_SERIES_MARKER)
+
+
+def shared_main_title(title_en: str, known_main_titles: Iterable[str] | None = None) -> str:
+    """Best-effort extraction of the shared main title for series grouping.
+
+    优先用 ``known_main_titles``（已有系列主标题）做最长前缀匹配；
+    否则按启发式去掉末尾副标题段。副标题常为多段（如 The.Two.Towers），
+    因此启发式只作参考，最终归属由调用方确认。
+    """
+
+    cleaned = sanitize(title_en)
+    if known_main_titles:
+        candidates = sorted(
+            (sanitize(t) for t in known_main_titles),
+            key=len,
+            reverse=True,
+        )
+        for main in candidates:
+            if cleaned == main or cleaned.startswith(main + "."):
+                return main
+    parts = [p for p in cleaned.split(".") if p]
+    stop = {"part", "chapter", "episode", "ii", "iii", "iv", "v"}
+    for i, token in enumerate(parts):
+        if token.lower() in stop or token.isdigit():
+            return ".".join(parts[:i]) if i > 0 else ".".join(parts)
+    return ".".join(parts[:-1]) if len(parts) > 1 else ".".join(parts)

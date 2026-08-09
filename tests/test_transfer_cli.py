@@ -38,6 +38,7 @@ class TransferCliTests(unittest.TestCase):
         *,
         state: dict | None = None,
         fake_fail: str = "",
+        list_status: str = "",
         inject_after_ls: int | None = None,
         inject_dir: str = "",
         inject_name: str = "",
@@ -61,6 +62,8 @@ class TransferCliTests(unittest.TestCase):
         )
         if fake_fail:
             env["BDPAN_FAKE_FAIL"] = fake_fail
+        if list_status:
+            env["BDPAN_FAKE_LIST_STATUS"] = list_status
         if inject_after_ls is not None:
             env["BDPAN_FAKE_INJECT_AFTER_LS"] = str(inject_after_ls)
             env["BDPAN_FAKE_INJECT_DIR"] = inject_dir
@@ -128,7 +131,7 @@ class TransferCliTests(unittest.TestCase):
         detail = (FIXTURES / "detail.html").read_text(encoding="utf-8")
         detail = detail.replace(
             '</section>',
-            '      <a data-link="baidu" title="Fixture Film 720p 提取码: abcd" '
+            '      <a data-link="baidu" title="Fixture Film 4K REMUX 原盘简繁字幕 26G 提取码: abcd" '
             'href="/link_start/?redirect_to=pan_id_90002&movie_title=Fixture%20Film%202">'
             '百度网盘 2</a>\n'
             '    </section>',
@@ -150,7 +153,8 @@ class TransferCliTests(unittest.TestCase):
         output = proc.stdout + proc.stderr
         self.assertNotIn(FIXTURE_SHARE_URL, output)
         self.assertNotIn(FIXTURE_PASSWORD, output)
-        self.assertEqual(calls, [])
+        self.assertTrue(calls)
+        self.assertEqual(calls[0][0:2], ["transfer", "list"])
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["data"]["resource_id"], "90001")
         self.assertEqual(payload["data"]["link_index"], 0)
@@ -159,6 +163,78 @@ class TransferCliTests(unittest.TestCase):
         self.assertNotIn("url", action)
         self.assertNotIn("password", action)
         self.assertEqual(action["share_ref"], share_ref)
+
+    def test_resource_id_plan_probes_share_with_read_only_bdpan_list(self):
+        proc, calls = self.run_cli(self.resource_args())
+        self._read_share_ref(proc)
+        self.assertTrue(calls)
+        self.assertEqual(calls[0][0:2], ["transfer", "list"])
+        self.assertIn(FIXTURE_SHARE_URL, calls[0])
+        self.assertEqual(calls[0][calls[0].index("-p") + 1], FIXTURE_PASSWORD)
+        self.assertNotIn(FIXTURE_SHARE_URL, proc.stdout + proc.stderr)
+        self.assertNotIn(FIXTURE_PASSWORD, proc.stdout + proc.stderr)
+
+    def test_resource_id_plan_reports_expired_share_as_not_found(self):
+        proc, calls = self.run_cli(self.resource_args(), list_status="expired")
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+        self.assertEqual(
+            payload["error"]["details"],
+            {
+                "share_status": "expired",
+                "reason": "expired",
+                "remote_code": 1,
+                "errno": None,
+            },
+        )
+        self.assertNotIn(FIXTURE_SHARE_URL, proc.stdout + proc.stderr)
+        self.assertNotIn(FIXTURE_PASSWORD, proc.stdout + proc.stderr)
+
+    def test_resource_id_plan_reports_auth_probe_as_unverified_auth(self):
+        proc, calls = self.run_cli(self.resource_args(), list_status="auth")
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["error"]["code"], "AUTH")
+        self.assertEqual(
+            payload["error"]["details"],
+            {
+                "share_status": "unverified",
+                "reason": "auth_required",
+                "remote_code": 1,
+                "errno": None,
+            },
+        )
+        self.assertNotIn(FIXTURE_SHARE_URL, proc.stdout + proc.stderr)
+        self.assertNotIn(FIXTURE_PASSWORD, proc.stdout + proc.stderr)
+
+    def test_probe_classifies_password_rate_limit_and_unsupported_without_external_text(self):
+        cases = (
+            ("wrong_password", "INVALID_ARG", "password_invalid", 2),
+            ("rate_limited", "NETWORK", "rate_limited", 429),
+            ("unsupported", "PARSE", "unsupported", 405),
+        )
+        for list_status, error_code, reason, errno in cases:
+            with self.subTest(list_status=list_status):
+                proc, _calls = self.run_cli(self.resource_args(), list_status=list_status)
+                self.assertNotEqual(proc.returncode, 0)
+                payload = json.loads(proc.stdout)
+                self.assertEqual(payload["error"]["code"], error_code)
+                self.assertEqual(
+                    payload["error"]["details"],
+                    {
+                        "share_status": "unverified",
+                        "reason": reason,
+                        "remote_code": 1,
+                        "errno": errno,
+                    },
+                )
+                output = proc.stdout + proc.stderr
+                self.assertNotIn(FIXTURE_SHARE_URL, output)
+                self.assertNotIn(FIXTURE_PASSWORD, output)
+                self.assertNotIn("提取码错误", output)
+                self.assertNotIn("请求过于频繁", output)
+                self.assertNotIn("接口暂不支持", output)
 
     def test_share_ref_does_not_encode_low_entropy_extraction_code(self):
         module = _load_transfer_module()
@@ -199,7 +275,7 @@ class TransferCliTests(unittest.TestCase):
         output = proc.stdout + proc.stderr
         self.assertNotIn(FIXTURE_SHARE_URL, output)
         self.assertNotIn(FIXTURE_PASSWORD, output)
-        self.assertEqual([item[0] for item in calls], ["ls", "ls", "transfer", "ls"])
+        self.assertEqual([item[0] for item in calls], ["transfer", "ls", "ls", "transfer", "ls"])
         transfer_argv = calls[-2]
         self.assertEqual(transfer_argv[0], "transfer")
         self.assertEqual(transfer_argv[1], FIXTURE_SHARE_URL)
@@ -237,23 +313,18 @@ class TransferCliTests(unittest.TestCase):
         self.assertNotIn("changed-share-90001", proc.stdout + proc.stderr)
         self.assertEqual(calls, [])
 
-    def test_multiple_resource_links_require_explicit_index_and_redact_candidate_metadata(self):
+    def test_multiple_resource_links_automatically_select_best_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture_dir = self._write_two_candidate_fixture(Path(tmp))
             proc, calls = self.run_cli(self.resource_args(fixture_dir=fixture_dir))
-        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["error"]["code"], "INVALID_ARG")
-        candidates = payload["error"]["details"]["candidates"]
-        self.assertEqual([item["index"] for item in candidates], [0, 1])
-        self.assertEqual(candidates[0]["quality"], "1080p.BluRay")
-        self.assertEqual(candidates[1]["quality"], "720p")
-        for item in candidates:
-            self.assertNotIn("url", item)
-            self.assertNotIn("password", item)
+        self.assertEqual(payload["data"]["link_index"], 1)
+        self.assertEqual(payload["data"]["selection"]["strategy"], "preset-quality-v1")
+        self.assertEqual(payload["data"]["selection"]["candidate_count"], 2)
+        self.assertTrue(calls)
         self.assertNotIn(FIXTURE_SHARE_URL, proc.stdout + proc.stderr)
         self.assertNotIn(FIXTURE_PASSWORD, proc.stdout + proc.stderr)
-        self.assertEqual(calls, [])
 
     def test_resource_link_index_selects_candidate_without_exposing_link(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,11 +333,28 @@ class TransferCliTests(unittest.TestCase):
                 self.resource_args(fixture_dir=fixture_dir, link_index=1)
             )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(calls, [])
+        self.assertTrue(calls)
+        self.assertEqual(calls[0][0:2], ["transfer", "list"])
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["data"]["link_index"], 1)
         self.assertNotIn(FIXTURE_SHARE_URL, proc.stdout + proc.stderr)
         self.assertNotIn(FIXTURE_PASSWORD, proc.stdout + proc.stderr)
+
+    def test_candidate_ranking_uses_audio_subtitles_size_and_stable_tie_break(self):
+        module = _load_transfer_module()
+        links = [
+            {"desc": "Film 1080p REMUX 30G", "quality": "1080p.REMUX"},
+            {
+                "desc": "Film 1080p REMUX Atmos 原盘简繁字幕 20G",
+                "quality": "1080p.REMUX",
+            },
+        ]
+        self.assertEqual(module._automatic_candidate_index(links), 1)
+        exact_tie = [
+            {"desc": "Film 1080p REMUX 20G", "quality": "1080p.REMUX"},
+            {"desc": "Film 1080p REMUX 20G", "quality": "1080p.REMUX"},
+        ]
+        self.assertEqual(module._automatic_candidate_index(exact_tie), 0)
 
     def test_default_emits_plan_without_any_mutating_bdpan_call(self):
         proc, calls = self.run_cli(self.base_args())

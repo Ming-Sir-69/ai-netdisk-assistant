@@ -19,6 +19,8 @@ Local patches:
 - add JSON output and resource-type filtering;
 - resolve Baidu share links with restricted intermediate redirects and keep
   extraction codes separate;
+- prefer `.direct-pan`/`panLink` direct links and use a restricted local QR
+  fallback when no direct link exists;
 - add an explicit file-backed fixture seam using reserved `.example` hosts.
 
 ## Runtime dependency: cloudscraper
@@ -30,6 +32,27 @@ Local patches:
 
 cloudscraper retains its upstream copyright and license. The project's MIT
 license does not replace or reattribute that upstream work.
+
+## Runtime dependency: MCP Python SDK
+
+- **Version:** 1.28.1 (v1 maintenance line; constrained below 2.0)
+- **License:** MIT
+- **Source:** <https://github.com/modelcontextprotocol/python-sdk>
+- **Distribution:** installed from the pinned entry in `requirements.txt`; not
+  vendored in this repository.
+
+The SDK supplies the official legacy SSE transport and `ClientSession`. The
+project only uses it in the macOS Baidu bridge; OAuth values remain in the
+macOS Keychain and are passed to the SSE URL in memory.
+
+## Runtime dependencies: QR decoding
+
+- **Pillow 12.3.0:** Pillow License (HPND-style); [source and license](https://github.com/python-pillow/Pillow)
+- **zxing-cpp 3.1.1:** Apache-2.0; [source and license](https://github.com/zxing-cpp/zxing-cpp)
+
+These packages are installed from the exact pins in the repository
+`requirements.txt`. They are used only for the QR-image fallback after direct
+Baidu link extraction has found no candidate. Their binaries are not vendored.
 
 ## External tool and installation reference: bdpan-storage
 

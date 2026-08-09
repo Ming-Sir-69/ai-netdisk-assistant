@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Official Baidu MCP library boundary.
+
+The bridge process owns MCP transport and OAuth.  This CLI adds deterministic
+path validation, plan-first archive moves and postcondition checks; it never
+offers a delete operation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import (  # noqa: E402
+    AUTH,
+    INTERNAL,
+    INVALID_ARG,
+    NETWORK,
+    NOT_FOUND,
+    PARSE,
+    PERMISSION,
+    emit_error,
+    emit_success,
+)
+from keychain_store import (  # noqa: E402
+    CredentialError,
+    CredentialUnavailable,
+    MacOSKeychain,
+)
+from mcp_client import (  # noqa: E402
+    MCPBridge,
+    MCPBridgeError,
+    build_archive_plan,
+    execute_archive,
+    list_directory,
+    meta_library,
+    search_library,
+)
+
+
+_ERROR_CODES = {AUTH, INTERNAL, INVALID_ARG, NETWORK, NOT_FOUND, PARSE, PERMISSION}
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="百度官方 MCP 全盘资源读取与安全归档")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("auth-status", help="只读检查 macOS Keychain 授权状态")
+    store = sub.add_parser("auth-store", help="从 stdin 写入 macOS Keychain；不回显凭证")
+    store.add_argument("--stdin", action="store_true", default=True, help=argparse.SUPPRESS)
+
+    list_cmd = sub.add_parser("list", help="读取一个绝对云端目录")
+    list_cmd.add_argument("--path", required=True)
+
+    search_cmd = sub.add_parser("search", help="通过官方 MCP 搜索资源")
+    search_cmd.add_argument("--keyword", required=True)
+    search_cmd.add_argument("--path", "--dir", dest="directory", default="/", help="搜索根目录，默认全盘根")
+
+    meta_cmd = sub.add_parser("meta", help="读取单个资源元数据")
+    meta_group = meta_cmd.add_mutually_exclusive_group(required=True)
+    meta_group.add_argument("--path")
+    meta_group.add_argument("--fsid")
+
+    archive_cmd = sub.add_parser(
+        "archive",
+        help="通过官方 MCP file_move 将一个精确旧资源移入归档目录（绝不删除）",
+    )
+    archive_cmd.add_argument("--source", required=True, help="绝对源路径，可跨 /apps/bdpan 与全盘")
+    archive_cmd.add_argument("--archive-dir", required=True, help="绝对归档目录")
+    archive_cmd.add_argument("--new-name", help="归档后的精确名称；默认沿用源名称")
+    archive_cmd.add_argument("--ondup", choices=("fail",), default="fail")
+    archive_cmd.add_argument("--async", dest="async_mode", choices=("0",), default="0")
+    archive_cmd.add_argument("--execute", action="store_true")
+    archive_cmd.add_argument("--plan-ref", help="执行时必须回传 plan-only 的 64 位引用")
+
+    return parser
+
+
+def _keychain_status() -> dict:
+    keychain = MacOSKeychain.from_environment()
+    status = keychain.status()
+    return {
+        "backend": status.backend,
+        "available": status.available,
+        "configured": status.configured,
+        "reason": status.reason,
+        "expires_at": status.expires_at,
+        "scope": status.scope,
+    }
+
+
+def _map_bridge_error(exc: MCPBridgeError) -> str:
+    return exc.code if exc.code in _ERROR_CODES else NETWORK
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "auth-status":
+            emit_success(_keychain_status(), {"command": "panlib-library auth-status", "mode": "read-only"})
+        if args.command == "auth-store":
+            token = sys.stdin.read().strip()
+            if not token:
+                raise ValueError("credential stdin is empty")
+            MacOSKeychain.from_environment().set(token)
+            emit_success(
+                {"backend": "macos-keychain", "stored": True},
+                {"command": "panlib-library auth-store", "mode": "write-keychain-only"},
+            )
+
+        bridge = MCPBridge.from_environment()
+        if args.command == "list":
+            emit_success(
+                {"path": args.path, "entries": list_directory(bridge, args.path)},
+                {"command": "panlib-library list", "mode": "read-only"},
+            )
+        if args.command == "search":
+            emit_success(
+                {
+                    "directory": args.directory,
+                    "keyword": args.keyword,
+                    "entries": search_library(bridge, args.keyword, args.directory),
+                },
+                {"command": "panlib-library search", "mode": "read-only"},
+            )
+        if args.command == "meta":
+            emit_success(
+                {"meta": meta_library(bridge, path=args.path, fsid=args.fsid)},
+                {"command": "panlib-library meta", "mode": "read-only"},
+            )
+        if args.command == "archive":
+            if args.execute and not args.plan_ref:
+                parser.error("archive --execute requires --plan-ref from a prior plan-only run")
+            if not args.execute:
+                plan = build_archive_plan(bridge, args.source, args.archive_dir, args.new_name)
+                emit_success(plan, {"command": "panlib-library archive", "mode": "plan-only"})
+            result = execute_archive(
+                bridge,
+                args.source,
+                args.archive_dir,
+                args.new_name,
+                args.plan_ref,
+            )
+            emit_success(result, {"command": "panlib-library archive", "mode": "execute"})
+        raise ValueError("unknown command")
+    except MCPBridgeError as exc:
+        emit_error(_map_bridge_error(exc), str(exc), exc.details)
+    except CredentialUnavailable as exc:
+        emit_error(AUTH, str(exc))
+    except CredentialError as exc:
+        emit_error(AUTH, str(exc))
+    except ValueError as exc:
+        emit_error(INVALID_ARG, str(exc))
+    except OSError as exc:
+        emit_error(NETWORK, str(exc))
+    except Exception as exc:  # pragma: no cover - final safety boundary
+        emit_error(INTERNAL, "library command failed", {"type": type(exc).__name__})
+
+
+if __name__ == "__main__":
+    main()

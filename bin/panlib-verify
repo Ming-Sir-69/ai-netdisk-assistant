@@ -70,10 +70,16 @@ def _validate_redirect_url(value: str) -> str:
         if "pwd" in query and not _PASSWORD_RE.fullmatch(query["pwd"][0]):
             raise ValueError("share redirect pwd is invalid")
     else:
-        if set(query) != {"surl"} or len(query["surl"]) != 1:
+        if set(query) - {"surl", "pwd"} or "surl" not in query:
+            raise ValueError("share init redirect requires one surl value")
+        if len(query["surl"]) != 1 or (
+            "pwd" in query and len(query["pwd"]) != 1
+        ):
             raise ValueError("share init redirect requires one surl value")
         if not _SHARE_ID_RE.fullmatch(query["surl"][0]):
             raise ValueError("share init redirect surl is invalid")
+        if "pwd" in query and not _PASSWORD_RE.fullmatch(query["pwd"][0]):
+            raise ValueError("share init redirect pwd is invalid")
     return value
 
 

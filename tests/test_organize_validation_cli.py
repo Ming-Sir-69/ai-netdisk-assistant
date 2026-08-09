@@ -82,6 +82,43 @@ class OrganizeValidationCliTests(unittest.TestCase):
         self.assertNotIn("--episode", proc.stdout)
         self.assertNotIn("--dry-run", proc.stdout)
 
+    def test_remove_empty_source_is_rejected_before_bdpan_and_points_to_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "bdpan-called"
+            fake_bdpan = root / "bdpan"
+            fake_bdpan.write_text(
+                "#!/bin/sh\n"
+                f"printf called > {marker}\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_bdpan.chmod(fake_bdpan.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["BDPAN_BIN"] = str(fake_bdpan)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(ORGANIZE),
+                    "--source-dir", "/apps/bdpan/Library/Movies/source",
+                    "--target-dir", "/apps/bdpan/Library/Movies/Show.{imdb-tt1234567}",
+                    "--title-en", "Show",
+                    "--imdb-id", "tt1234567",
+                    "--year", "2020",
+                    "--quality", "1080p",
+                    "--remove-empty-source",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["error"]["code"], "INVALID_ARG")
+        self.assertIn("panlib-library archive", payload["error"]["message"])
+        self.assertFalse(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

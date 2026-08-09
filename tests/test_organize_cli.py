@@ -141,7 +141,7 @@ class OrganizeCliTests(unittest.TestCase):
     def test_failed_mv_stops_and_never_removes_source(self):
         initial = self.episode_state()
         proc, calls, final_state = self.run_cli(
-            self.base_args() + ["--execute", "--remove-empty-source"],
+            self.base_args() + ["--execute"],
             state=initial,
             fake_fail="mv:1",
             return_state=True,
@@ -158,7 +158,7 @@ class OrganizeCliTests(unittest.TestCase):
     def test_failed_rename_stops_before_next_file_and_never_removes_source(self):
         initial = self.episode_state()
         proc, calls, final_state = self.run_cli(
-            self.base_args() + ["--execute", "--remove-empty-source"],
+            self.base_args() + ["--execute"],
             state=initial,
             fake_fail="rename:1",
             return_state=True,
@@ -182,25 +182,16 @@ class OrganizeCliTests(unittest.TestCase):
             [{"server_filename": "Limitless.S01E01.mkv", "isdir": False}],
         )
 
-    def test_remove_empty_source_checks_again_then_removes(self):
+    def test_remove_empty_source_is_disabled_without_mutation(self):
         proc, calls, final_state = self.run_cli(
             self.base_args() + ["--execute", "--remove-empty-source"],
             state=self.episode_state(),
             return_state=True,
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual([item[0] for item in calls], [
-            "ls", "ls", "ls", "mv", "ls", "rename", "ls", "mv",
-            "ls", "rename", "ls", "rm",
-        ])
-        cleanup = json.loads(proc.stdout)["data"]["cleanup"]
-        self.assertEqual(cleanup, {
-            "requested": True,
-            "verified_empty": True,
-            "removed": True,
-        })
-        self.assertNotIn("/safe/base/Library/Movies/incoming", final_state["entries"])
-        self.assertNotIn("/safe/base/Library/Movies/incoming", final_state["directories"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout)["error"]["code"], "INVALID_ARG")
+        self.assertEqual(calls, [])
+        self.assertEqual(final_state, self.episode_state())
 
     def test_nested_discovery_is_explicit_and_recursive(self):
         state = {
@@ -231,7 +222,7 @@ class OrganizeCliTests(unittest.TestCase):
             {"server_filename": "Limitless.S01E01.mkv", "isdir": False}
         ]
         proc, calls, final_state = self.run_cli(
-            self.base_args() + ["--execute", "--remove-empty-source"],
+            self.base_args() + ["--execute"],
             state=state,
             return_state=True,
         )
@@ -274,6 +265,51 @@ class OrganizeCliTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("rm", [item[0] for item in calls])
+
+    def test_movie_plan_moves_sup_subtitles_and_poster_with_distinct_names(self):
+        source = "/safe/base/Library/Movies/incoming"
+        target = "/safe/base/Library/Movies/A.Walk.in.the.Clouds.{imdb-tt0114887}"
+        state = {
+            "directories": [source, target],
+            "entries": {
+                source: [
+                    {"server_filename": "云中漫步 1995 原盘简体中字.sup", "isdir": False},
+                    {"server_filename": "云中漫步 1995 原盘繁体中字.sup", "isdir": False},
+                    {"server_filename": "云中漫步.jpg", "isdir": False},
+                ],
+                target: [
+                    {
+                        "server_filename": "A.Walk.in.the.Clouds.1995.1080p.REMUX.mkv",
+                        "isdir": False,
+                    }
+                ],
+            },
+        }
+        args = [
+            "--source-dir", source,
+            "--target-dir", target,
+            "--title-en", "A Walk in the Clouds",
+            "--imdb-id", "tt0114887",
+            "--year", "1995",
+            "--quality", "1080p.REMUX",
+            "--mode", "movie",
+        ]
+
+        proc, calls = self.run_cli(args, state=state)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        actions = json.loads(proc.stdout)["data"]["actions"]
+        planned = [item["new_name"] for item in actions if item["action"] == "rename"]
+        self.assertEqual(
+            planned,
+            [
+                "A.Walk.in.the.Clouds.1995.1080p.REMUX.zh-Hans.sup",
+                "A.Walk.in.the.Clouds.1995.1080p.REMUX.zh-Hant.sup",
+                "poster.jpg",
+            ],
+        )
+        self.assertNotIn("mv", [item[0] for item in calls])
+        self.assertNotIn("rename", [item[0] for item in calls])
 
     def test_preflight_toctou_target_collision_stops_before_mutation(self):
         target = "/safe/base/Library/Movies/Limitless.{imdb-tt1219289}"

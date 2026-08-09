@@ -54,6 +54,8 @@ _SHARE_REF_RE = re.compile(r"^[0-9a-f]{64}$")
 _CODE_IN_TEXT_RE = re.compile(
     r"(?i)((?:提取码|密码|pwd|code)\s*[:：=]?\s*)[A-Za-z0-9]{4}"
 )
+_PROBE_ERRNO_RE = re.compile(r"(?i)\berrno\s*[=:]\s*(-?\d{1,12})\b")
+_SIZE_GIB_RE = re.compile(r"(?i)(\d+(?:\.\d+)?)\s*(?:g|gb|gib)\b")
 
 
 class _ResourceResolutionError(RuntimeError):
@@ -64,6 +66,37 @@ class _ResourceResolutionError(RuntimeError):
         self.code = code
         self.message = message
         self.details = details
+
+
+class _ShareProbeError(RuntimeError):
+    """A stable failure from the read-only official ``transfer list`` probe."""
+
+    def __init__(
+        self,
+        code: str,
+        status: str,
+        reason: str,
+        remote_code: int | None = None,
+        errno: int | None = None,
+    ):
+        message = "Baidu share probe could not confirm the share"
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.reason = reason
+        self.remote_code = remote_code
+        self.errno = errno
+        self.message = message
+
+    def details(self) -> dict:
+        """Return only the fixed status fields allowed across the CLI boundary."""
+
+        return {
+            "share_status": self.status,
+            "reason": self.reason,
+            "remote_code": self.remote_code,
+            "errno": self.errno,
+        }
 
 
 def _safe_candidate_description(value: object) -> str:
@@ -90,6 +123,50 @@ def _candidate_metadata(index: int, item: object) -> dict:
         "resource_type": _safe_candidate_description(item.get("resource_type", "unknown")),
         "has_password": bool(item.get("password")),
     }
+
+
+def _candidate_rank(item: dict, index: int) -> tuple[int, int, int, int, int, float, int]:
+    """Rank public SeedHub descriptions with a stable, model-free policy."""
+
+    description = str(item.get("desc", ""))
+    lowered = description.lower()
+    quality = str(item.get("quality", "unknown"))
+
+    resolution = 4 if any(token in lowered for token in ("2160p", "4k", "uhd")) else 0
+    if not resolution:
+        resolution = 3 if "1080p" in lowered or quality.startswith("1080p") else 0
+    if not resolution:
+        resolution = 2 if "720p" in lowered or quality == "720p" else 1
+
+    source = 4 if "remux" in lowered else 0
+    if not source:
+        source = 3 if any(token in lowered for token in ("原盘", "uhd bluray", "uhd blu-ray")) else 0
+    if not source:
+        source = 2 if any(token in lowered for token in ("bluray", "blu-ray", "蓝光")) else 0
+    if not source:
+        source = 1 if any(token in lowered for token in ("web-dl", "webdl", "流媒体")) else 0
+
+    video = sum(
+        int(token in lowered)
+        for token in ("dolby vision", "杜比视界", "hdr10+", "hdr10", "hdr")
+    )
+    audio = sum(
+        int(token in lowered)
+        for token in ("atmos", "全景声", "truehd", "dts-hd", "dts:x", "dolby audio")
+    )
+    subtitles = sum(
+        int(token in lowered)
+        for token in ("原盘简繁", "简繁", "双语字幕", "中文字幕", "中字", "外挂")
+    )
+    sizes = [float(match) for match in _SIZE_GIB_RE.findall(description)]
+    size_gib = max(sizes, default=0.0)
+    return resolution, source, video, audio, subtitles, size_gib, -index
+
+
+def _automatic_candidate_index(links: list[dict]) -> int:
+    """Choose one candidate deterministically; original order breaks exact ties."""
+
+    return max(range(len(links)), key=lambda index: _candidate_rank(links[index], index))
 
 
 def _share_ref(resource_id: str, link_index: int, url: str, _password: str) -> str:
@@ -207,15 +284,11 @@ def _resolve_resource(
             {"resource_id": resource_id, "candidates": []},
         )
     if link_index is None:
-        if len(links) != 1:
-            raise _ResourceResolutionError(
-                INVALID_ARG,
-                "multiple Baidu share candidates require --link-index",
-                {"resource_id": resource_id, "candidates": metadata},
-            )
-        selected_index = 0
+        selected_index = _automatic_candidate_index(links)
+        selection_strategy = "single-candidate" if len(links) == 1 else "preset-quality-v1"
     else:
         selected_index = link_index
+        selection_strategy = "explicit-link-index"
         if selected_index < 0 or selected_index >= len(links):
             raise _ResourceResolutionError(
                 INVALID_ARG,
@@ -239,7 +312,129 @@ def _resolve_resource(
         "link_index": selected_index,
         "share_ref": _share_ref(resource_id, selected_index, url, effective_password),
         "resource_id": resource_id,
+        "selection": {
+            "strategy": selection_strategy,
+            "candidate_count": len(metadata),
+        },
     }
+
+
+def _probe_share(url: str, password: str, settings) -> dict:
+    """Probe share metadata through official bdpan without performing a write."""
+
+    parsed = urlsplit(url)
+    bare_url = parsed._replace(query="").geturl()
+    argv = ["transfer", "list", bare_url]
+    if password:
+        argv.extend(["-p", password])
+    argv.extend(["--json", "--no-check-update"])
+    code, stdout, stderr = run_bdpan(argv, timeout=settings.bdpan_timeout, settings=settings)
+    payload: dict | None = None
+    try:
+        parsed = json.loads(stdout) if stdout.strip() else None
+        if isinstance(parsed, dict):
+            payload = parsed
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+
+    def safe_remote_int(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and -2_147_483_648 <= value <= 2_147_483_647:
+            return value
+        if isinstance(value, str) and re.fullmatch(r"-?\d{1,12}", value.strip()):
+            try:
+                parsed_value = int(value.strip())
+            except ValueError:
+                return None
+            return parsed_value if -2_147_483_648 <= parsed_value <= 2_147_483_647 else None
+        return None
+
+    def payload_fields() -> tuple[int | None, int | None, str]:
+        if not isinstance(payload, dict):
+            return None, None, stderr
+        raw_error = payload.get("error")
+        if isinstance(raw_error, dict):
+            message = raw_error.get("message") or raw_error.get("msg") or ""
+            remote_value = raw_error.get("code", payload.get("code"))
+            errno_value = raw_error.get("errno", payload.get("errno"))
+        else:
+            message = raw_error or payload.get("message") or stderr
+            remote_value = payload.get("code")
+            errno_value = payload.get("errno")
+        message_text = message if isinstance(message, str) else ""
+        errno = safe_remote_int(errno_value)
+        if errno is None:
+            errno_match = _PROBE_ERRNO_RE.search(message_text)
+            errno = safe_remote_int(errno_match.group(1)) if errno_match else None
+        return safe_remote_int(remote_value), errno, message_text
+
+    def raise_classified(
+        message: str,
+        fallback_code: str,
+        remote_code: int | None,
+        errno: int | None,
+    ) -> None:
+        lowered = message.lower()
+        if any(marker in lowered for marker in ("提取码错误", "密码错误", "password incorrect", "wrong password", "invalid password")):
+            raise _ShareProbeError(INVALID_ARG, "unverified", "password_invalid", remote_code, errno)
+        if any(marker in lowered for marker in ("需要提取码", "请输入提取码", "password required", "passcode required")):
+            raise _ShareProbeError(INVALID_ARG, "unverified", "password_required", remote_code, errno)
+        if any(marker in lowered for marker in ("expired", "expire", "失效", "不存在", "已取消")):
+            raise _ShareProbeError(NOT_FOUND, "expired", "expired", remote_code, errno)
+        if any(marker in lowered for marker in ("频繁", "频率", "rate limit", "too many", "429")) or errno == 429:
+            raise _ShareProbeError(NETWORK, "unverified", "rate_limited", remote_code, errno)
+        if any(marker in lowered for marker in ("验证码", "captcha", "安全验证", "verify code")):
+            raise _ShareProbeError(NETWORK, "unverified", "captcha_required", remote_code, errno)
+        if any(marker in lowered for marker in ("不支持", "unsupported", "not support", "method not allowed")):
+            raise _ShareProbeError(PARSE, "unverified", "unsupported", remote_code, errno)
+        if any(marker in lowered for marker in ("auth", "oauth", "登录", "认证", "token")):
+            raise _ShareProbeError(AUTH, "unverified", "auth_required", remote_code, errno)
+        if any(marker in lowered for marker in ("permission", "scope", "403", "权限")):
+            raise _ShareProbeError(PERMISSION, "unverified", "permission_denied", remote_code, errno)
+        if any(marker in lowered for marker in ("param", "invalid", "格式", "链接")):
+            raise _ShareProbeError(INVALID_ARG, "unverified", "invalid_share", remote_code, errno)
+        if any(marker in lowered for marker in ("timeout", "network", "connect")):
+            raise _ShareProbeError(NETWORK, "unverified", "network", remote_code, errno)
+        raise _ShareProbeError(fallback_code, "unverified", "unknown", remote_code, errno)
+
+    if code != 0:
+        remote_code, errno, message = payload_fields()
+        raise_classified(
+            message,
+            NETWORK,
+            remote_code,
+            errno,
+        )
+    if payload is None:
+        raise _ShareProbeError(PARSE, "unverified", "invalid_response", None, None)
+    remote_code, errno, message = payload_fields()
+    # bdpan 3.8.5 真实成功响应没有 code 字段，结构为:
+    #   {"dir": "...", "page": 1, "count": N, "has_more": false, "items": [...]}
+    # 旧判定 `remote_code == 0` 永远为 False，导致成功响应被误判为
+    # PARSE/unverified/unknown。这里显式识别真实成功结构，并兼容
+    # 假想中的 {"code": 0, "data": [...]} 形态。
+    items = payload.get("items")
+    if isinstance(items, list) and isinstance(payload.get("count"), int):
+        return {
+            "status": "valid",
+            "source": "bdpan-transfer-list",
+            "item_count": payload.get("count"),
+        }
+    if remote_code == 0:
+        data = payload.get("data")
+        count = len(data) if isinstance(data, list) else None
+        return {
+            "status": "valid",
+            "source": "bdpan-transfer-list",
+            "item_count": count,
+        }
+    raise_classified(
+        message,
+        PARSE,
+        remote_code,
+        errno,
+    )
 
 
 def _safe_external_text(value: object, secrets: tuple[str, ...] = ()) -> str:
@@ -452,6 +647,7 @@ def main(argv: list[str] | None = None) -> None:
     if any(item == "--auto-organize" or item.startswith("--auto-organize=") for item in raw_argv):
         emit_error(INVALID_ARG, "--auto-organize is no longer supported; run panlib-organize separately")
     args = _parser().parse_args(raw_argv)
+    share_probe = None
 
     try:
         if args.link_index is not None and args.link_index < 0:
@@ -490,8 +686,10 @@ def main(argv: list[str] | None = None) -> None:
             url = resolved["url"]
             effective_password = resolved["password"]
             selected_link_index = resolved["link_index"]
+            selection = resolved["selection"]
             share_ref = resolved["share_ref"]
             resource_id = resolved["resource_id"]
+            share_probe = _probe_share(url, effective_password, settings)
         else:
             if args.link_index is not None:
                 raise ValueError("link-index is only valid with --resource-id")
@@ -504,10 +702,13 @@ def main(argv: list[str] | None = None) -> None:
             ).get("pwd", [""])[0]
             effective_password = password or embedded_password
             selected_link_index = None
+            selection = None
             share_ref = ""
             resource_id = ""
     except _ResourceResolutionError as exc:
         emit_error(exc.code, exc.message, exc.details)
+    except _ShareProbeError as exc:
+        emit_error(exc.code, exc.message, exc.details())
     except (TypeError, ValueError) as exc:
         emit_error(INVALID_ARG, str(exc))
     except Exception as exc:
@@ -525,6 +726,7 @@ def main(argv: list[str] | None = None) -> None:
                 "resource_id": resource_id,
                 "link_index": selected_link_index,
                 "share_ref": share_ref,
+                "share_status": share_probe["status"],
             }
         )
     plan = [action]
@@ -540,6 +742,8 @@ def main(argv: list[str] | None = None) -> None:
                         "resource_id": resource_id,
                         "link_index": selected_link_index,
                         "share_ref": share_ref,
+                        "share_probe": share_probe,
+                        "selection": selection,
                     }
                     if resource_id
                     else {}
@@ -603,6 +807,8 @@ def main(argv: list[str] | None = None) -> None:
                     "resource_id": resource_id,
                     "link_index": selected_link_index,
                     "share_ref": share_ref,
+                    "share_probe": share_probe,
+                    "selection": selection,
                 }
                 if resource_id
                 else {}

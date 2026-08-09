@@ -34,6 +34,11 @@ auth_status="unknown"
 network_status="skipped"
 overall="not_ready"
 guidance=""
+mcp_credential_status="unsupported"
+mcp_bridge_status="missing"
+mcp_full_drive_read_status="blocked"
+mcp_full_drive_move_status="blocked"
+mcp_overall_status="skipped"
 
 add_guidance() {
     guidance="${guidance:+$guidance }$1"
@@ -46,6 +51,8 @@ modules_from_requirements() {
         distribution="$(printf '%s' "$distribution" | tr '[:upper:]' '[:lower:]')"
         case "$distribution" in
             beautifulsoup4) module="bs4" ;;
+            pillow) module="PIL" ;;
+            zxing-cpp) module="zxingcpp" ;;
             *) module="$(printf '%s' "$distribution" | tr '-' '_')" ;;
         esac
         modules="${modules:+$modules,}$module"
@@ -185,6 +192,56 @@ else
     fi
 fi
 
+# The formal MCP path is intentionally macOS-only in this release.  Doctor
+# never asks security for ``-w`` and therefore never reads or prints the
+# Keychain secret; it only checks whether the generic-password item exists.
+if [ "$(uname -s 2>/dev/null || printf unknown)" = "Darwin" ]; then
+    keychain_security="${PANLIB_KEYCHAIN_SECURITY:-/usr/bin/security}"
+    keychain_service="${PANLIB_KEYCHAIN_SERVICE:-ai-netdisk-manager.baidu-mcp.oauth}"
+    keychain_account="${PANLIB_KEYCHAIN_ACCOUNT:-$(id -un 2>/dev/null || printf default)}"
+    if command -v "$keychain_security" >/dev/null 2>&1 || [ -x "$keychain_security" ]; then
+        if "$keychain_security" find-generic-password -a "$keychain_account" -s "$keychain_service" >/dev/null 2>&1; then
+            mcp_credential_status="ready"
+        else
+            mcp_credential_status="missing"
+        fi
+    else
+        mcp_credential_status="security_unavailable"
+    fi
+else
+    mcp_credential_status="macos_required"
+fi
+
+mcp_bridge_source="default"
+if [ -n "${PANLIB_MCP_COMMAND:-}" ] || [ -n "${PANLIB_MCP_BRIDGE:-}" ]; then
+    mcp_bridge_source="custom"
+fi
+mcp_bridge_value="${PANLIB_MCP_COMMAND:-${PANLIB_MCP_BRIDGE:-$ROOT/bin/panlib-mcp-bridge}}"
+if [ -n "$mcp_bridge_value" ]; then
+    # Only inspect the first token.  The bridge is not started by doctor.
+    if [ "$mcp_bridge_source" = "default" ]; then
+        # The repository path itself may contain spaces/CJK; do not split the
+        # bundled executable value at all.
+        mcp_bridge_executable="$mcp_bridge_value"
+    else
+        # Custom overrides are command strings.  Doctor only inspects their
+        # first (unquoted) token and never starts the process.
+        mcp_bridge_executable="${mcp_bridge_value%% *}"
+    fi
+    if command -v "$mcp_bridge_executable" >/dev/null 2>&1 || [ -x "$mcp_bridge_executable" ]; then
+        mcp_bridge_status="configured"
+    else
+        mcp_bridge_status="missing"
+    fi
+fi
+if [ "$mcp_credential_status" = "ready" ] && [ "$mcp_bridge_status" = "configured" ]; then
+    # Configured is deliberately weaker than a live end-to-end claim; the
+    # bridge itself must be exercised by panlib-library list/archive.
+    mcp_full_drive_read_status="configured"
+    mcp_full_drive_move_status="configured"
+    mcp_overall_status="ready"
+fi
+
 case "$python_status" in
     missing) add_guidance "项目 .venv Python 缺失；请先运行 scripts/bootstrap.sh。" ;;
     invalid) add_guidance "项目 .venv Python 不可执行；不会自动替换。" ;;
@@ -204,6 +261,15 @@ esac
 if [ "$auth_status" = "unauthenticated" ]; then add_guidance "请通过 scripts/login.sh 完成 OAuth。"; fi
 if [ "$auth_status" = "timeout" ]; then add_guidance "bdpan 认证检查超时。"; fi
 if [ "$network_status" = "failure" ]; then add_guidance "百度网盘网络入口不可达，请检查网络。"; fi
+if [ "$mcp_credential_status" = "missing" ]; then add_guidance "macOS Keychain 未找到百度 MCP 凭证；请通过官方授权流程写入。"; fi
+if [ "$mcp_credential_status" = "macos_required" ]; then add_guidance "本版本 MCP 凭证后端仅支持 macOS Keychain。"; fi
+if [ "$mcp_bridge_status" = "missing" ]; then
+    if [ "$mcp_bridge_source" = "custom" ]; then
+        add_guidance "配置的 MCP bridge 不可执行；全盘 MCP 读写能力保持 blocked。"
+    else
+        add_guidance "内置 panlib-mcp-bridge 不可执行；全盘 MCP 读写能力保持 blocked。"
+    fi
+fi
 
 if [ "$python_status" = "ready" ] && [ "$dependency_status" = "ready" ] && [ "$bdpan_status" = "ready" ] \
     && [ "$auth_status" = "ready" ] && [ "$network_status" != "failure" ]; then
@@ -215,8 +281,9 @@ if [ -n "$python_version" ]; then version_json="\"$python_version\""; fi
 bdpan_version_json="null"
 if [ -n "$bdpan_version" ]; then bdpan_version_json="\"$bdpan_version\""; fi
 
-printf '{"status":"%s","checks":{"python":{"status":"%s","version":%s},"dependencies":{"status":"%s"},"bdpan":{"status":"%s","version":%s},"auth":{"status":"%s"},"network":{"status":"%s"}},"next_steps":[' \
-    "$overall" "$python_status" "$version_json" "$dependency_status" "$bdpan_status" "$bdpan_version_json" "$auth_status" "$network_status"
+printf '{"status":"%s","checks":{"python":{"status":"%s","version":%s},"dependencies":{"status":"%s"},"bdpan":{"status":"%s","version":%s},"auth":{"status":"%s"},"network":{"status":"%s"},"mcp":{"status":"%s","credential":{"backend":"macos-keychain","status":"%s"},"bridge":{"status":"%s"},"full_drive_read":{"status":"%s"},"full_drive_move":{"status":"%s"}}},"next_steps":[' \
+    "$overall" "$python_status" "$version_json" "$dependency_status" "$bdpan_status" "$bdpan_version_json" "$auth_status" "$network_status" \
+    "$mcp_overall_status" "$mcp_credential_status" "$mcp_bridge_status" "$mcp_full_drive_read_status" "$mcp_full_drive_move_status"
 if [ -n "$guidance" ]; then printf '"%s"' "$guidance"; fi
 printf ']}\n'
 

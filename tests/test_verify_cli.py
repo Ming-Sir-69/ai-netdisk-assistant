@@ -178,6 +178,34 @@ class VerifyCliTests(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertEqual(json.loads(stdout)["error"]["code"], "INVALID_ARG")
 
+    def test_accepts_official_share_init_redirect_with_single_password(self):
+        url = "https://pan.baidu.com/s/fake-redirect"
+        redirect = httpx.Response(
+            302,
+            headers={"location": f"/share/init?surl=fake-redirect&pwd={PASSWORD}"},
+            request=httpx.Request("HEAD", url),
+        )
+        ok = httpx.Response(
+            200,
+            request=httpx.Request(
+                "HEAD",
+                f"https://pan.baidu.com/share/init?surl=fake-redirect&pwd={PASSWORD}",
+            ),
+        )
+        module = _load_verify_module()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", [str(VERIFY), "--url", url]):
+            with mock.patch.object(module.httpx, "head", side_effect=[redirect, ok]) as head:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        module.main()
+        self.assertEqual(raised.exception.code, 0, stderr.getvalue())
+        self.assertEqual(head.call_count, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["data"], {"valid": True, "status_code": 200})
+        self.assertNotIn(PASSWORD, stdout.getvalue() + stderr.getvalue())
+
     def test_redirect_without_location_is_network_not_not_found(self):
         url = "https://pan.baidu.com/s/fake-redirect"
         response = httpx.Response(302, request=httpx.Request("HEAD", url))

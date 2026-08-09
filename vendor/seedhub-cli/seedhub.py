@@ -17,6 +17,7 @@ import re
 import json
 import argparse
 import urllib.parse
+import html as html_lib
 from pathlib import Path
 
 try:
@@ -66,20 +67,231 @@ class _FixtureScraper:
 
 _BAIDU_SHARE_URL_RE = (
     r"https://pan\.baidu\.(?:com|example)/s/[A-Za-z0-9_-]{6,64}"
+    r"(?:\?pwd=[A-Za-z0-9]{4})?"
     r"(?=$|[\s<>\"'])"
 )
 _QUARK_SHARE_URL_RE = (
     r"https://pan\.quark\.cn/s/[A-Za-z0-9_-]{6,64}(?=$|[\s<>\"'])"
 )
+_BAIDU_PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{4}$")
+_QR_MAX_BYTES = 2 * 1024 * 1024
+_QR_MAX_PIXELS = 16_000_000
+_QR_MAX_IMAGES = 4
+_QR_HINT_RE = re.compile(r"(?:qr|qrcode|qr-code|二维码|扫码)", re.IGNORECASE)
+
+
+def _normalise_baidu_share(value: str, *, allow_fixture: bool = False) -> tuple[str, str]:
+    """Return a canonical Baidu share URL and a separately carried password."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Baidu share URL is empty")
+    raw = html_lib.unescape(value).strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Baidu share URL is malformed") from exc
+    allowed_hosts = {"pan.baidu.com"}
+    if allow_fixture:
+        allowed_hosts.add("pan.baidu.example")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname is None
+        or parsed.hostname.lower() not in allowed_hosts
+        or port is not None
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise ValueError("Baidu share URL left the official host")
+    if not re.fullmatch(r"/s/[A-Za-z0-9_-]{6,64}", parsed.path):
+        raise ValueError("Baidu share URL path is invalid")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - {"pwd"} or any(len(values) != 1 for values in query.values()):
+        raise ValueError("Baidu share URL query is invalid")
+    password = query.get("pwd", [""])[0]
+    if password and not _BAIDU_PASSWORD_RE.fullmatch(password):
+        raise ValueError("Baidu share URL password is invalid")
+    return parsed._replace(query="").geturl(), password
+
+
+def _direct_baidu_candidates(html: str) -> list[str]:
+    """Extract only explicit, allowlisted direct-link shapes from HTML."""
+
+    candidates: list[str] = []
+
+    def add(value: str | None) -> None:
+        if not value:
+            return
+        for match in re.finditer(_BAIDU_SHARE_URL_RE, html_lib.unescape(value)):
+            candidate = match.group(0)
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    # The current SeedHub template exposes the canonical link on this anchor.
+    for tag in re.findall(r"<a\b[^>]*>", html, flags=re.IGNORECASE):
+        class_match = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+        if class_match and "direct-pan" in class_match.group(2).split():
+            href_match = re.search(r"\bhref\s*=\s*(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+            if href_match:
+                add(href_match.group(2))
+
+    # Some variants store the same value in a short inline variable.
+    for match in re.finditer(
+        r"\b(?:var|let|const)\s+panLink\s*=\s*(['\"])(.*?)\1",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        add(match.group(2))
+
+    # Keep the existing redirect shape as a third, explicit source.
+    for match in re.finditer(
+        rf"window\.location\.href\s*=\s*(['\"])(\s*{_BAIDU_SHARE_URL_RE})\1",
+        html,
+        flags=re.IGNORECASE,
+    ):
+        add(match.group(2))
+
+    # Last, accept a canonical URL rendered as plain text in the page.
+    add(html)
+    return candidates
+
+
+def _qr_image_sources(html: str, page_url: str) -> list[tuple[str, bytes | str]]:
+    """Return data images or same-origin HTTPS image URLs only."""
+
+    candidates: list[tuple[int, str, bytes | str]] = []
+    page = urllib.parse.urlsplit(page_url)
+    if page.scheme.lower() != "https" or not page.hostname or page.port is not None:
+        return []
+    for tag in re.findall(r"<(?:img|source)\b[^>]*>", html, flags=re.IGNORECASE):
+        src_match = re.search(r"\bsrc\s*=\s*(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+        if not src_match:
+            continue
+        source = html_lib.unescape(src_match.group(2)).strip()
+        if source.lower().startswith("data:"):
+            header, separator, encoded = source.partition(",")
+            if not separator:
+                continue
+            metadata = header[5:].split(";", 1)[0].lower()
+            if not metadata.startswith("image/") or ";base64" not in header.lower():
+                continue
+            if len(encoded) > _QR_MAX_BYTES * 2:
+                continue
+            try:
+                import base64
+
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError):
+                continue
+            if len(content) <= _QR_MAX_BYTES:
+                priority = 0 if _QR_HINT_RE.search(tag) else 1
+                candidates.append((priority, metadata, content))
+            continue
+
+        absolute = urllib.parse.urljoin(page_url, source)
+        parsed = urllib.parse.urlsplit(absolute)
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname is None
+            or parsed.hostname.lower() != page.hostname.lower()
+            or parsed.port is not None
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            continue
+        priority = 0 if _QR_HINT_RE.search(tag) else 1
+        candidates.append((priority, "url", parsed.geturl()))
+    candidates.sort(key=lambda item: item[0])
+    # Prefer explicitly labelled QR images.  A small generic fallback keeps
+    # simple QR-only pages working without fetching every page image.
+    hinted = [item for item in candidates if item[0] == 0]
+    selected = hinted if hinted else candidates[:2]
+    return [(mime, source) for _, mime, source in selected[:_QR_MAX_IMAGES]]
+
+
+def _decode_qr_payload(content: bytes) -> list[str]:
+    """Decode QR text locally; dependency errors are explicit parse failures."""
+
+    if len(content) > _QR_MAX_BYTES:
+        return []
+    try:
+        from io import BytesIO
+
+        from PIL import Image, UnidentifiedImageError
+        import zxingcpp
+    except ImportError as exc:
+        raise SeedhubParseError("QR decoder dependencies are unavailable") from exc
+    try:
+        with Image.open(BytesIO(content)) as image:
+            if image.width <= 0 or image.height <= 0 or image.width * image.height > _QR_MAX_PIXELS:
+                return []
+            image.load()
+            decoded = zxingcpp.read_barcodes(image.convert("RGB"))
+    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+        return []
+    values: list[str] = []
+    for result in decoded:
+        text = getattr(result, "text", "")
+        if isinstance(text, str) and text and text not in values:
+            values.append(text)
+    return values
+
+
+def _qr_baidu_candidates(
+    scraper,
+    html: str,
+    page_url: str,
+    *,
+    allow_fixture: bool = False,
+) -> list[tuple[str, str]]:
+    """Decode same-origin QR images and retain only canonical Baidu shares."""
+
+    candidates: list[tuple[str, str]] = []
+    for mime, source in _qr_image_sources(html, page_url):
+        if mime == "url":
+            try:
+                response = scraper.get(
+                    source,
+                    allow_redirects=False,
+                    timeout=10,
+                )
+            except Exception:
+                continue
+            if response.status_code != 200:
+                continue
+            content_type = str(response.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
+            if not content_type.startswith("image/"):
+                continue
+            content = getattr(response, "content", b"")
+            if not isinstance(content, bytes) or len(content) > _QR_MAX_BYTES:
+                continue
+        else:
+            content = source
+        for decoded in _decode_qr_payload(content):
+            try:
+                candidate = _normalise_baidu_share(decoded, allow_fixture=allow_fixture)
+            except ValueError:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
 
 
 def _validated_redirect(location: str, kind: str) -> str:
+    if kind == "baidu":
+        try:
+            _normalise_baidu_share(location)
+        except ValueError as exc:
+            raise SeedhubNetworkError("intermediate redirect left the expected share host") from exc
+        return location
     try:
         parsed = urllib.parse.urlsplit(location)
         port = parsed.port
     except ValueError as exc:
         raise SeedhubNetworkError("intermediate redirect URL was malformed") from exc
-    expected_host = "pan.baidu.com" if kind == "baidu" else "pan.quark.cn"
+    expected_host = "pan.quark.cn"
     if (
         parsed.scheme.lower() != "https"
         or parsed.hostname != expected_host
@@ -272,30 +484,41 @@ def get_links(
         try:
             redirect_url = f"{base}{item['path']}"
             r2, direct_url = _fetch_intermediate(scraper, redirect_url, "baidu")
-            # 真实 pan.baidu.com 分享链接（window.location.href 赋值或重定向）
-            url_match = None
-            if direct_url is None:
-                url_match = re.search(
-                    rf'window\.location\.href\s*=\s*["\']({_BAIDU_SHARE_URL_RE})',
-                    r2.text,
-                )
-                if not url_match:
-                    # 兜底：HTML 里直接出现的 pan.baidu.com 链接
-                    url_match = re.search(
-                        rf'({_BAIDU_SHARE_URL_RE})',
-                        r2.text,
+            # Direct-first: redirect, .direct-pan, panLink, window.location,
+            # then a canonical URL rendered as plain text.
+            raw_candidates = [direct_url] if direct_url else []
+            raw_candidates.extend(_direct_baidu_candidates(r2.text))
+            parsed_candidates: list[tuple[str, str]] = []
+            for raw_candidate in raw_candidates:
+                if not raw_candidate:
+                    continue
+                try:
+                    parsed_candidate = _normalise_baidu_share(
+                        raw_candidate,
+                        allow_fixture=fixture_dir is not None,
                     )
-            baidu_url = direct_url or (url_match.group(1) if url_match else "")
-            if not baidu_url:
+                except ValueError:
+                    continue
+                if parsed_candidate not in parsed_candidates:
+                    parsed_candidates.append(parsed_candidate)
+            if not parsed_candidates:
+                parsed_candidates.extend(
+                    _qr_baidu_candidates(
+                        scraper,
+                        r2.text,
+                        redirect_url,
+                        allow_fixture=fixture_dir is not None,
+                    )
+                )
+            if not parsed_candidates:
                 continue
-            if fixture_dir is None:
-                baidu_url = _validated_redirect(baidu_url, "baidu")
+            baidu_url, url_password = parsed_candidates[0]
             # 提取码：从 desc 文本正则拿 4 位字母数字
             pwd_match = re.search(
                 r'(?:提取码|密码|pwd|code)[：:\s]*([a-zA-Z0-9]{4})',
                 item["desc"],
             )
-            pwd = pwd_match.group(1) if pwd_match else ""
+            pwd = url_password or (pwd_match.group(1) if pwd_match else "")
             item["url"] = baidu_url
             item["pwd"] = pwd
             resolved_baidu.append(item)

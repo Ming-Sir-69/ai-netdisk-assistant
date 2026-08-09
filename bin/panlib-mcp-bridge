@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Default macOS bridge from panlib JSON requests to official Baidu MCP SSE."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from baidu_mcp import BaiduMCPClient, BaiduMCPError  # noqa: E402
+from common import redact_text  # noqa: E402
+from keychain_store import (  # noqa: E402
+    CredentialError,
+    CredentialExpired,
+    CredentialUnavailable,
+    MacOSKeychain,
+)
+
+
+def _error(code: str, message: str, details=None) -> int:
+    payload = {"error": {"code": code, "message": redact_text(message)}}
+    if details is not None:
+        payload["error"]["details"] = details
+    print(json.dumps(payload, ensure_ascii=False))
+    return 1
+
+
+def main() -> int:
+    try:
+        request = json.loads(sys.stdin.read())
+        if not isinstance(request, dict) or not isinstance(request.get("tool"), str):
+            return _error("INVALID_ARG", "bridge request must contain a tool")
+        tool = request["tool"]
+        arguments = request.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return _error("INVALID_ARG", "bridge arguments must be an object")
+        keychain = MacOSKeychain.from_environment()
+        if tool == "auth_status":
+            status = keychain.status()
+            print(
+                json.dumps(
+                    {
+                        "backend": status.backend,
+                        "available": status.available,
+                        "configured": status.configured,
+                        "reason": status.reason,
+                        "expires_at": status.expires_at,
+                        "scope": status.scope,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0 if status.configured else 1
+        token = keychain.token()
+        result = BaiduMCPClient.from_environment(token).call_tool(tool, arguments)
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        return 0
+    except CredentialExpired as exc:
+        return _error("AUTH", "MCP credential has expired", {"expires_at": exc.expires_at})
+    except CredentialUnavailable as exc:
+        return _error("AUTH", str(exc))
+    except CredentialError as exc:
+        return _error("AUTH", str(exc))
+    except BaiduMCPError as exc:
+        return _error(exc.code, str(exc), exc.details)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _error("INVALID_ARG", str(exc))
+    except Exception as exc:  # pragma: no cover - final process boundary
+        return _error("NETWORK", "MCP bridge failed", {"type": type(exc).__name__})
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

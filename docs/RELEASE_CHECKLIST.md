@@ -17,6 +17,10 @@
 - [ ] bootstrap/login/doctor 只读或 fake 验收通过，不输出账号正文。
 - [ ] SeedHub 离线 fixture 只包含 `.example` 保留域名和假提取码。
 - [ ] transfer/organize 默认 plan-only，写前冲突和写后状态测试通过。
+- [ ] organize sidecar 验收通过：SUP 简繁字幕分别得到 `.zh-Hans`/`.zh-Hant`，电影海报得到 `poster.jpg`；`--remove-empty-source` 返回 `INVALID_ARG` 且不调用 rm。
+- [ ] macOS `panlib-library` 的 Keychain 读取、官方 SDK bridge、list/search/meta 只读测试通过；
+      `archive` 只发 `file_move(async=0,ondup=fail)`，plan_ref、写前重检和写后验收测试通过。
+- [ ] `scripts/authorize_mcp_macos.py` 在已有有效授权时不打开浏览器；缺失/过期时只接受隐藏的官方完整回调，Keychain 临时假值写入、读回与清理冒烟通过。
 
 ## 隐私与 Git
 
@@ -46,9 +50,10 @@
 
 1. 唯一测试资源或分享链接。
 2. 唯一云端目标目录。
-3. 允许的 transfer/organize/空目录移除范围。
-4. 成功标准、残留物和清理方式。
+3. 允许的 transfer/organize/archive `file_move` 范围（本项目不调用 delete）。
+4. 成功标准、归档残留物和人工审核后的清理方式。
 
-执行后必须使用只读列表对照已确认的每个 action 和 `data.cleanup`；不能仅凭 exit 0 宣称转存、整理或空源移除完成。
+执行后必须使用只读列表对照已确认的每个 action；archive 还必须验证源路径消失、归档目标唯一存在
+并返回 `postcondition.status=verified`。不能仅凭 exit 0 宣称转存、整理或归档完成。
 
 未授权时标记 `untested`；仅转存或仅只读环节成功时标记 `partial`。

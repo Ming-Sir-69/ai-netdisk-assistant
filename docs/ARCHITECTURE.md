@@ -13,8 +13,28 @@ bin/panlib-* 公开 CLI（JSON 契约）
   ↓
 panlib/ 配置、路径、命名、脱敏与进程边界
   ↓
-vendor/seedhub-cli（只读网络） | bdpan（外部网盘能力）
+vendor/seedhub-cli（只读网络/直链与受限 QR 解析） | bdpan（wrapper 内只读探测与外部网盘能力）
 ```
+
+## macOS 官方 MCP 边界
+
+`panlib-library` 是与既有 transfer/organize 并列的 macOS-only 全盘能力入口。它通过
+内置 `bin/panlib-mcp-bridge` 调用官方 Python MCP SDK（SSE `ClientSession`），不要求
+默认设置 `PANLIB_MCP_COMMAND`。bridge 从 macOS Keychain
+`ai-netdisk-manager.baidu-mcp.oauth` 读取 JSON 授权载荷，Token 只存在进程内存，不进入
+argv、日志或 JSON 输出；本轮不实现 Windows/Linux 凭证后端。
+
+`list`、`search`、`meta` 只读；`archive` 仅调用官方 `file_move`，参数固定为
+`async=0`、`ondup=fail`、`filelist=[{path,dest,newname}]`。归档默认 plan-first，执行前
+重读精确源/目标并绑定 `plan_ref`，执行后必须验证源路径消失且目标名称唯一存在；没有
+delete CLI 或 delete MCP 调用，归档内容由用户人工审核后手动删除。MCP 路径允许官方全盘
+绝对 POSIX 根（包括 `/apps/bdpan` 与 `/我的资源`），但仍拒绝遍历、反斜杠、控制字符和
+模糊目标。
+
+organize 的媒体侧车规则属于现有 bdpan 流程：`.ass/.srt/.ssa/.sub/.sup/.vtt/.idx` 随正片
+一起移动；文件名中的简体/繁体标记稳定映射为 `.zh-Hans`/`.zh-Hant`；电影 `.jpg` 统一
+落为 `poster.jpg`。organize 不再移除源目录，兼容参数 `--remove-empty-source` 直接
+返回 `INVALID_ARG`，旧源应转交上面的 MCP archive 做人工审核。
 
 ## 层级职责
 
@@ -29,7 +49,8 @@ vendor/seedhub-cli（只读网络） | bdpan（外部网盘能力）
 ## 不变量
 
 1. 配置优先级为环境变量 > 仓库根 `.env` > 可移植默认值。
-2. 所有云端路径必须在 `BDPAN_BASE` 内，禁止遍历、空组件、反斜杠和控制字符。
+2. legacy bdpan 路径必须在 `BDPAN_BASE` 内；MCP 全盘路径可使用官方允许的绝对 POSIX
+   根，但两类路径都禁止遍历、空组件、反斜杠和控制字符。
 3. 成功 JSON 写 stdout，人类日志写 stderr；错误、日志和 transfer 输出中的分享 URL/提取码以及所有个人路径必须脱敏。Agent 的 SeedHub 路径由 transfer 通过 resource-id 内部解析，计划/执行只交接不包含提取码的 share_ref。extract 的敏感 stdout 仅为人工诊断兼容边界，不得进入 Agent 状态机。
 4. transfer 和 organize 默认 plan-first；仅显式 `--execute` 写入。
 5. 写前重新读取目标状态；写后只有唯一、合法、新增目录才能交给 organize。
@@ -37,6 +58,7 @@ vendor/seedhub-cli（只读网络） | bdpan（外部网盘能力）
 7. 任何部分完成或读回失败都不得触发自动写重试。
 8. organize 的 `target-dir` 叶子名必须等于 naming 模块根据 title/IMDb 生成的标准文件夹名；Agent 只拼接已验证分类父目录与 CLI 确定性叶子。
 9. resource-id 计划与执行会分别解析候选；只有绑定资源、候选索引和 URL 的 share_ref 完全一致才允许写入，防止确认后的资源目标漂移。
+10. resource-id 计划/执行在写入前先由 wrapper 调用官方 `bdpan transfer list --json`；只有 `share_probe.status=valid` 才能继续。探测失败不执行 transfer，且 URL/提取码不进入 Agent 输出。
 
 ## 非事务写入
 

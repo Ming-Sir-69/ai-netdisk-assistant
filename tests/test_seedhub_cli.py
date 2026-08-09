@@ -218,7 +218,7 @@ class SeedhubCliTests(unittest.TestCase):
 
         for unsafe in (
             "https://pan.baidu.com:bad/s/fake-share",
-            "https://pan.baidu.com/s/fake-share?pwd=abcd",
+            "https://pan.baidu.com/s/fake-share?pwd=abc",
             "https://pan.baidu.com/s/short",
             "https://pan.baidu.com/s/" + "a" * 65,
         ):
@@ -234,7 +234,7 @@ class SeedhubCliTests(unittest.TestCase):
                 "https://pan.baidu.com/s/fake-share-unsafe/extra",
             )
         )
-        for suffix in (".extra", "!extra", "?pwd=z9x8"):
+        for suffix in (".extra", "!extra"):
             with self.subTest(suffix=suffix):
                 self.assertIsNone(
                     re.search(
@@ -242,6 +242,174 @@ class SeedhubCliTests(unittest.TestCase):
                         f"https://pan.baidu.com/s/fake-share-unsafe{suffix}",
                     )
                 )
+
+    def test_direct_pan_anchor_query_is_normalized_and_password_is_split(self):
+        module = _load_vendor_module()
+
+        class Response:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.headers = {}
+
+        detail = (
+            '<h1><a>#</a> Direct fixture</h1>'
+            '<a class="direct-pan" data-link="baidu" '
+            'title="Direct fixture 1080p" '
+            'href="/link_start/?redirect_to=pan_id_90002&movie_title=Direct">'
+            '百度网盘</a>'
+        )
+        intermediate = (
+            '<html><body><a class="direct-pan" '
+            'href="https://pan.baidu.example/s/fake-direct-90002?pwd=abcd">'
+            'direct</a></body></html>'
+        )
+
+        class Scraper:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **_kwargs):
+                self.calls.append(url)
+                return Response(detail if len(self.calls) == 1 else intermediate)
+
+        scraper = Scraper()
+        with mock.patch.object(module, "create_scraper", return_value=scraper):
+            result = module.get_links("90002", fixture_dir="reserved-fixture")
+
+        self.assertEqual(len(result["baidu_resolved"]), 1)
+        item = result["baidu_resolved"][0]
+        self.assertEqual(item["url"], "https://pan.baidu.example/s/fake-direct-90002")
+        self.assertEqual(item["pwd"], "abcd")
+        self.assertNotIn("?pwd=", item["url"])
+
+    def test_direct_url_password_wins_over_stale_description_code(self):
+        module = _load_vendor_module()
+
+        class Response:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.headers = {}
+
+        detail = (
+            '<h1><a>#</a> Conflicting code fixture</h1>'
+            '<a data-link="baidu" title="Conflicting 提取码: zzzz" '
+            'href="/link_start/?redirect_to=pan_id_90006&movie_title=Conflict">'
+            '百度网盘</a>'
+        )
+        intermediate = (
+            '<a class="direct-pan" '
+            'href="https://pan.baidu.example/s/fake-conflict-90006?pwd=abcd">direct</a>'
+        )
+
+        class Scraper:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, _url, **_kwargs):
+                self.calls.append(True)
+                return Response(detail if len(self.calls) == 1 else intermediate)
+
+        scraper = Scraper()
+        with mock.patch.object(module, "create_scraper", return_value=scraper):
+            result = module.get_links("90006", fixture_dir="reserved-fixture")
+        self.assertEqual(result["baidu_resolved"][0]["pwd"], "abcd")
+
+    def test_panlink_and_window_location_are_direct_candidates(self):
+        module = _load_vendor_module()
+
+        class Response:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.headers = {}
+
+        cases = (
+            (
+                'var panLink = "https://pan.baidu.example/s/fake-panlink-90003?pwd=efgh";',
+                "fake-panlink-90003",
+                "efgh",
+            ),
+            (
+                "window.location.href = 'https://pan.baidu.example/s/fake-window-90004?pwd=ijkl';",
+                "fake-window-90004",
+                "ijkl",
+            ),
+        )
+        for script, share_id, password in cases:
+            with self.subTest(share_id=share_id):
+                detail = (
+                    '<h1><a>#</a> Script fixture</h1>'
+                    '<a data-link="baidu" title="Script fixture" '
+                    'href="/link_start/?redirect_to=pan_id_90003&movie_title=Script">'
+                    '百度网盘</a>'
+                )
+
+                class Scraper:
+                    def __init__(self):
+                        self.calls = []
+
+                    def get(self, _url, **_kwargs):
+                        self.calls.append(True)
+                        return Response(detail if len(self.calls) == 1 else script)
+
+                scraper = Scraper()
+                with mock.patch.object(module, "create_scraper", return_value=scraper):
+                    result = module.get_links("90003", fixture_dir="reserved-fixture")
+                item = result["baidu_resolved"][0]
+                self.assertEqual(item["url"], f"https://pan.baidu.example/s/{share_id}")
+                self.assertEqual(item["pwd"], password)
+
+    def test_qr_image_fallback_decodes_baidu_payload_without_echoing_secret(self):
+        module = _load_vendor_module()
+        qr_png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAZoAAAGaAQAAAAAefbjOAAAC/ElEQVR4nO1cW46jQAx0A9J8NlIOkKOQm63mZuEoOcBK9OdIRF750Q0a7cewQcMyXfWR4RELYiy7ym4mMG3G2Gy3IYKRA45wwBEOOMIBRzjgCAcccSZHBEdH4ZZCoLEvx/pnIEr5C7dDbm8jYLSDIwYWTEIbr8z64JmnlpkfnZyXLebMQuHyChyRPAEwT8+gHzReP8LyRc0gh93eJsBoT0eE0Lccbqmj8GuSregpY/crfQkw+nZHdJ/2mZImhnb2A+ky73OlBkaniogoHCHlrfEqYZD61Rf5PL+pgdHrjhhNVxB5wXiI6qC2hMHTpMYOV9oGGB2UI3g5MPYUiOJMPPYtrTPIi1dqYHQKR5CpymEi4rvs3qPqUE8Pyy7f4+wq9f6f/6YGRjs4IkqzIc65YNjTl13RoVI1iBLUZw2x1/nfdJnD8HiTzDCL4LjMNPYTh0IvA8Xf3Tl+UwOj16vG3+qHtDCZWVSH0AqrH6gaPz32yB9ylDKhwVAevEWEhYXXFPCIepglexYwRiEE0qYZ5ZgGDXJENTmCtTgIBpEZki3y9KvN0gNVo65p+JslCqKo8y0JAZ2B61y8fwa+Q2uc8+H+K49gyQyeD7xCLD0KCRA7C2ZZU4eKjUx4K8IZhdFLrRpglpWpT3IKUaYZK6KpSgQ5oipmyS5BlUJ4ysj9bAsVDQtUjTpzxGCMQtsTpUOVl9ZhrlFFRETvQbncVEZh/QjdymQCOaKaqjG5pMj00jtU3pnIqgMRUY/6JH3c6+KQ+aScseYUeER1XWySMmGrIlx92op9hbUwwSNq0hqCVa1wWuHBgC52pe90kXKG92t5oUeXR0gD26LkkNvbCBjtUjUEuTWZdYULzzwKBbOsrItNpQthJ7xhlYGeZbXvdFGOEllktww83nXt/sG39yXAaFdHDJojdPItOWLML/0pTKXC5TXxCC4S9PMCmrK4Cl3sauYalJdBrNSnB4jOQzHXqMEo4D+TneI5NTAywBEOOMIBRzjgCAcc4fg+R/wBCUfFqeK9Fa8AAAAASUVORK5CYII="
+        )
+        class Response:
+            def __init__(self, text):
+                self.status_code = 200
+                self.text = text
+                self.headers = {}
+
+        detail = (
+            '<h1><a>#</a> QR fixture</h1>'
+            '<a data-link="baidu" title="QR fixture" '
+            'href="/link_start/?redirect_to=pan_id_90005&movie_title=QR">'
+            '百度网盘</a>'
+        )
+        intermediate = f'<html><body><img src="data:image/png;base64,{qr_png_b64}"></body></html>'
+
+        class Scraper:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, _url, **_kwargs):
+                self.calls.append(True)
+                return Response(detail if len(self.calls) == 1 else intermediate)
+
+        scraper = Scraper()
+        with mock.patch.object(module, "create_scraper", return_value=scraper):
+            result = module.get_links("90005", fixture_dir="reserved-fixture")
+        item = result["baidu_resolved"][0]
+        self.assertEqual(item["url"], "https://pan.baidu.example/s/fake-qr-90002")
+        self.assertEqual(item["pwd"], "abcd")
+        self.assertNotIn("?pwd=", item["url"])
+
+    def test_qr_sources_are_restricted_to_same_origin_and_qr_hint_is_prioritized(self):
+        module = _load_vendor_module()
+        html = (
+            '<img src="https://evil.example/qr.png" class="qr">'
+            '<img src="/poster.jpg" alt="poster">'
+            '<img src="/code.png" id="qrcode" alt="二维码">'
+        )
+        sources = module._qr_image_sources(
+            html,
+            "https://seedhub.example/link_start/?redirect_to=pan_id_90007",
+        )
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0], ("url", "https://seedhub.example/code.png"))
+        self.assertNotIn("evil.example", repr(sources))
 
     def test_missing_explicit_fixture_directory_returns_parse_without_network(self):
         missing = REPO_ROOT / "tests" / "fixtures" / "seedhub" / "does-not-exist"

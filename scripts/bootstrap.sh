@@ -52,6 +52,8 @@ modules_from_requirements() {
         distribution="$(printf '%s' "$distribution" | tr '[:upper:]' '[:lower:]')"
         case "$distribution" in
             beautifulsoup4) module="bs4" ;;
+            pillow) module="PIL" ;;
+            zxing-cpp) module="zxingcpp" ;;
             *) module="$(printf '%s' "$distribution" | tr '-' '_')" ;;
         esac
         modules="${modules:+$modules,}$module"

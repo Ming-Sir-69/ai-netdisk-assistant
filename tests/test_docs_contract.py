@@ -51,8 +51,10 @@ class PublicDocumentationContractTests(unittest.TestCase):
             "share_ref",
             "organize_ready=true",
             "source_dir",
-            "--remove-empty-source",
-            "第三次独立确认",
+            "panlib-library archive",
+            "file_move",
+            "plan_ref",
+            "人工审核后再手动删除",
             "partial",
             "unverified",
         )
@@ -100,7 +102,18 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assertNotIn("--config-path", ci)
         self.assertIn('"status": ..., "checks": ..., "next_steps": [...]', cli_contract)
         self.assertIn("error.details.completed", cli_contract)
-        self.assertIn("data.cleanup", cli_contract)
+        self.assertIn("panlib-library archive", cli_contract)
+        self.assertIn("file_move", cli_contract)
+        self.assertIn("plan_ref", cli_contract)
+        self.assertIn("--remove-empty-source", cli_contract)
+        self.assertIn("已禁用", cli_contract)
+        self.assertIn("不会调用 `rm`", cli_contract)
+        self.assertNotIn("data.cleanup", cli_contract)
+        self.assertIn("preset-quality-v1", cli_contract)
+        self.assertNotIn("多候选返回 `INVALID_ARG`", cli_contract)
+        for document in (self.read("README.md"), self.read("SKILL.md")):
+            self.assertIn("scripts/authorize_mcp_macos.py", document)
+            self.assertIn("已有有效授权", document)
 
     def test_license_and_third_party_attribution_are_exact(self):
         license_lines = self.read("LICENSE").splitlines()
@@ -119,7 +132,7 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assertIn("Apache-2.0", notices)
         self.assertIn("081b273c5842560e7be15949a5970dc3da25ede0", notices)
 
-    def test_readme_does_not_claim_unverified_live_write_or_automatic_safety(self):
+    def test_readme_reports_bounded_live_e2e_without_overclaiming_safety(self):
         readme = self.read("README.md")
         for stale in (
             "6 个 CLI",
@@ -129,7 +142,10 @@ class PublicDocumentationContractTests(unittest.TestCase):
             "cloudscraper](https://github.com/VeNoMouS/cloudscraper)（AGPL",
         ):
             self.assertNotIn(stale, readme)
-        self.assertIn("未执行真实网盘写入验收", readme)
+        self.assertNotIn("未执行真实网盘写入验收", readme)
+        self.assertIn("macOS 单片真实链路验收通过", readme)
+        self.assertIn("《云中漫步》", readme)
+        self.assertIn("MCP 归档写后验收", readme)
         self.assertRegex(readme, r"(?s)转存.*plan-only.*--execute")
 
 

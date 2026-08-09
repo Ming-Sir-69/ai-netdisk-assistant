@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Plan-first, fail-fast organizer for files already in bdpan.
 
-Planning performs only read operations.  Every write (mkdir, mv, rename and
-optional empty-source removal) is explicit, prevalidated and executed in the
-order represented by the returned plan.
+Planning performs only read operations. Every write (mkdir, mv and rename) is
+explicit, prevalidated and executed in the order represented by the returned
+plan. Old source directories are archived through ``panlib-library`` instead
+of being deleted.
 """
 
 from __future__ import annotations
@@ -46,7 +47,13 @@ from naming import (  # noqa: E402
 
 
 MEDIA_EXTENSIONS = {"mkv", "mp4", "ts", "avi", "iso"}
-_NOT_FOUND_RE = re.compile(r"(?:not[ -]?found|does not exist|no such|errno\s*=?\s*2)", re.I)
+# 字幕随正片一起搬入目标目录，命名沿用正片主名以便播放器自动匹配。
+SUBTITLE_EXTENSIONS = {"ass", "srt", "ssa", "sub", "sup", "vtt", "idx"}
+IMAGE_EXTENSIONS = {"jpg"}
+_NOT_FOUND_RE = re.compile(
+    r"(?:not[ -]?found|does not exist|no such|errno\s*=?\s*2|目录不存在|文件不存在|路径不存在)",
+    re.I,
+)
 _CONFLICT_RE = re.compile(
     r"(?:conflict|already exists|duplicate|clobber|appeared|not a directory)", re.I
 )
@@ -113,12 +120,21 @@ def _list_target(path: str, settings) -> tuple[list[dict], bool]:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
     if not isinstance(result, list):
+        # bdpan 对"目录不存在"返回 exit 0 + {"code":1,"data":null,"error":"目录不存在"}
+        # 而不是非零退出码。显式识别这种形态并当作 missing 处理，
+        # 否则目标目录尚不存在的正常场景会被误判为 NETWORK 错误。
+        if isinstance(result, dict):
+            error_text = str(result.get("error") or "")
+            if result.get("code") and _looks_missing(error_text):
+                return [], False
+            if result.get("code"):
+                raise RuntimeError(error_text or "bdpan ls returned an error object")
         raise RuntimeError("bdpan ls returned a non-list result")
     return [item for item in result if isinstance(item, dict)], True
 
 
 def find_source_files(
-    source_dir: str, depth: int = 2, *, settings=None
+    source_dir: str, depth: int = 2, *, include_images: bool = False, settings=None
 ) -> list[dict]:
     """Discover video files recursively up to ``depth`` directory levels."""
 
@@ -139,7 +155,10 @@ def find_source_files(
                     queue.append((safe_cloud_join(current, filename), level + 1))
                 continue
             suffix = PurePosixPath(filename).suffix.lower().lstrip(".")
-            if suffix not in MEDIA_EXTENSIONS:
+            supported = MEDIA_EXTENSIONS | SUBTITLE_EXTENSIONS
+            if include_images:
+                supported |= IMAGE_EXTENSIONS
+            if suffix not in supported:
                 continue
             full_path = safe_cloud_join(current, filename)
             files.append(
@@ -147,6 +166,8 @@ def find_source_files(
                     "filename": PurePosixPath(filename).name,
                     "path": full_path,
                     "ext": suffix,
+                    "is_subtitle": suffix in SUBTITLE_EXTENSIONS,
+                    "is_image": suffix in IMAGE_EXTENSIONS,
                     "fs_id": item.get("fs_id"),
                     "size": item.get("size", 0),
                 }
@@ -178,23 +199,40 @@ def validate_arguments(args: argparse.Namespace) -> None:
 
 
 def _new_name(args: argparse.Namespace, source: dict) -> str:
+    if source.get("is_image"):
+        if args.mode != "movie":
+            raise ValueError("image sidecars are supported only in movie mode")
+        return f"poster.{source['ext']}"
     if args.mode == "movie":
-        return build_movie_filename(args.title_en, args.year, args.quality, source["ext"])
-    if args.mode == "season":
-        return build_season_filename(
+        name = build_movie_filename(args.title_en, args.year, args.quality, source["ext"])
+    elif args.mode == "season":
+        name = build_season_filename(
             args.title_en, args.season, args.imdb_id, args.quality, source["ext"]
         )
-    episodes = parse_episodes(source["filename"])
-    if not episodes:
-        raise ValueError(f"could not parse season/episode from {source['filename']!r}")
-    if len(episodes) != 1:
-        raise ValueError(
-            f"source contains multiple episodes; split before organizing: {source['filename']!r}"
+    else:
+        episodes = parse_episodes(source["filename"])
+        if not episodes:
+            raise ValueError(f"could not parse season/episode from {source['filename']!r}")
+        if len(episodes) != 1:
+            raise ValueError(
+                f"source contains multiple episodes; split before organizing: {source['filename']!r}"
+            )
+        season, episode = episodes[0]
+        name = build_episode_filename(
+            args.title_en, season, episode, args.imdb_id, args.quality, source["ext"]
         )
-    season, episode = episodes[0]
-    return build_episode_filename(
-        args.title_en, season, episode, args.imdb_id, args.quality, source["ext"]
-    )
+    if source.get("is_subtitle"):
+        filename = source["filename"].lower()
+        if any(marker in filename for marker in ("简体", "简中", "zh-hans", "chs")):
+            tag = "zh-Hans"
+        elif any(marker in filename for marker in ("繁体", "繁中", "zh-hant", "cht")):
+            tag = "zh-Hant"
+        else:
+            tag = ""
+        if tag:
+            stem, ext = name.rsplit(".", 1)
+            name = f"{stem}.{tag}.{ext}"
+    return name
 
 
 def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, list[dict]]:
@@ -207,7 +245,12 @@ def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, l
     ):
         raise ValueError("source and target must stay inside BDPAN_BASE")
 
-    sources = find_source_files(source_dir, args.depth, settings=settings)
+    sources = find_source_files(
+        source_dir,
+        args.depth,
+        include_images=args.mode == "movie",
+        settings=settings,
+    )
     if not sources:
         raise FileNotFoundError(f"source directory has no video files: {source_dir}")
 
@@ -262,13 +305,6 @@ def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, l
                 "old_name": source["filename"],
             }
         )
-    if args.remove_empty_source:
-        actions.extend(
-            [
-                {"action": "verify-empty", "path": source_dir},
-                {"action": "rm", "path": source_dir},
-            ]
-        )
     return actions, target_exists, sources
 
 
@@ -280,8 +316,6 @@ def _run_mutation(action: dict, settings) -> None:
         argv = ["mv", action["from"], action["to"]]
     elif kind == "rename":
         argv = ["rename", action["from"], action["new_name"]]
-    elif kind == "rm":
-        argv = ["rm", "-f", action["path"]]
     else:
         return
     code, out, err = run_bdpan(argv, timeout=120, settings=settings)
@@ -316,15 +350,11 @@ def _check_destination(action: dict, target_dir: str, settings) -> None:
 
 def _execute(
     actions: list[dict],
-    source_dir: str,
     target_dir: str,
-    remove_empty: bool,
     settings,
 ) -> dict:
     completed: list[dict] = []
     for action in actions:
-        if action["action"] in {"verify-empty", "rm"}:
-            continue
         try:
             if action["action"] == "mkdir":
                 entries, exists = _list_target(target_dir, settings)
@@ -337,28 +367,7 @@ def _execute(
             raise OperationFailure(action, redact_text(exc), completed) from exc
         completed.append(action)
 
-    cleanup: dict = {"requested": remove_empty, "verified_empty": False, "removed": False}
-    if remove_empty:
-        try:
-            remaining = list_dir(source_dir, settings=settings)
-        except Exception as exc:
-            raise OperationFailure(
-                {"action": "verify-empty", "path": source_dir},
-                redact_text(exc),
-                completed,
-            ) from exc
-        cleanup["verified_empty"] = not remaining
-        if not remaining:
-            rm_action = {"action": "rm", "path": source_dir}
-            try:
-                _run_mutation(rm_action, settings)
-            except Exception as exc:
-                raise OperationFailure(rm_action, redact_text(exc), completed) from exc
-            completed.append(rm_action)
-            cleanup["removed"] = True
-        else:
-            cleanup["reason"] = "source directory is not empty"
-    return {"completed": completed, "cleanup": cleanup}
+    return {"completed": completed}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -377,7 +386,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--depth", type=int, default=2, help="源目录递归深度（1-8）")
     parser.add_argument("--execute", action="store_true", help="确认后执行云盘写操作")
-    parser.add_argument("--remove-empty-source", action="store_true", help="确认源目录为空后移除")
+    parser.add_argument("--remove-empty-source", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
     return parser
@@ -385,6 +394,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.remove_empty_source:
+        emit_error(
+            INVALID_ARG,
+            "source deletion is disabled; use panlib-library archive for manual-review cleanup",
+        )
     try:
         validate_arguments(args)
         settings = load_settings()
@@ -415,9 +429,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         result = _execute(
             actions,
-            data["source_dir"],
             data["target_dir"],
-            args.remove_empty_source,
             settings,
         )
     except OperationFailure as exc:

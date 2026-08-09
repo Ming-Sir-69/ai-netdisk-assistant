@@ -89,9 +89,30 @@ def _main(argv: list[str]) -> int:
     log = _load(os.environ.get("BDPAN_FAKE_LOG", ""), [])
     count = sum(1 for item in log if isinstance(item, list) and item and item[0] == command) + 1
     ls_count = sum(1 for item in log if isinstance(item, list) and item and item[0] == "ls")
+    _log(argv)
+    if command == "transfer" and len(argv) > 1 and argv[1] == "list":
+        status = os.environ.get("BDPAN_FAKE_LIST_STATUS", "valid")
+        if status == "valid":
+            sys.stdout.write(json.dumps({"code": 0, "data": [{"server_filename": "fixture"}]}))
+        elif status == "expired":
+            sys.stdout.write(json.dumps({"code": 1, "data": None, "error": "share expired"}))
+        elif status == "auth":
+            sys.stdout.write(json.dumps({"code": 1, "data": None, "error": "authentication required"}))
+        elif status == "wrong_password":
+            sys.stdout.write(json.dumps({"code": 1, "data": None, "errno": 2, "error": "提取码错误"}, ensure_ascii=False))
+        elif status == "rate_limited":
+            sys.stdout.write(json.dumps({"code": 1, "data": None, "errno": 429, "error": "请求过于频繁"}, ensure_ascii=False))
+        elif status == "unsupported":
+            sys.stdout.write(json.dumps({"code": 1, "data": None, "errno": 405, "error": "接口暂不支持"}, ensure_ascii=False))
+        elif status == "network":
+            sys.stderr.write("network timeout\n")
+            return 28
+        else:
+            sys.stdout.write(json.dumps({"code": 1, "data": None, "error": "param error"}))
+        return 0
+
     if command == "ls":
         ls_count += 1
-    _log(argv)
     if _failure_requested(command, count):
         sys.stderr.write(f"fake failure: {command} #{count} argv={argv!r}\n")
         return 23
