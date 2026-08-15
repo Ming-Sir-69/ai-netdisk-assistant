@@ -96,3 +96,6 @@ tests/.cache/
 /vendor/seedhub-cli/README.md
 /vendor/seedhub-cli/SKILL.md
 /vendor/seedhub-cli/requirements.txt
+
+# 本机 Agent 开发配置，不随仓库分发
+.claude/
