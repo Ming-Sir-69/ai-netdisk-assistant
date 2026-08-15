@@ -13,6 +13,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 LOGIN = REPO_ROOT / "scripts" / "login.sh"
+PREFLIGHT = REPO_ROOT / "scripts" / "preflight.sh"
 BASH = shutil.which("bash") or "/bin/bash"
 
 
@@ -29,6 +30,12 @@ class SetupScriptTests(unittest.TestCase):
         env: dict[str, str],
         input_text: str = "",
     ) -> subprocess.CompletedProcess[str]:
+        if script == LOGIN:
+            opener = env.get("OPEN_BIN", "")
+            if not opener:
+                raise AssertionError("LOGIN tests must set OPEN_BIN to a browser double")
+            if opener in {"open", "xdg-open", "/usr/bin/open", "/usr/bin/xdg-open"}:
+                raise AssertionError("LOGIN tests must not use a system browser opener; use a browser double")
         return subprocess.run(
             [BASH, str(script)],
             cwd=REPO_ROOT,
@@ -37,6 +44,22 @@ class SetupScriptTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_login_tests_require_an_explicit_browser_double(self):
+        env = os.environ.copy()
+        env.pop("OPEN_BIN", None)
+        env["BDPAN_BIN"] = "/definitely/missing/bdpan"
+
+        with self.assertRaisesRegex(AssertionError, "OPEN_BIN"):
+            self.run_script(LOGIN, env=env)
+
+    def test_login_tests_reject_the_system_browser_opener(self):
+        env = os.environ.copy()
+        env["OPEN_BIN"] = "/usr/bin/open"
+        env["BDPAN_BIN"] = "/definitely/missing/bdpan"
+
+        with self.assertRaisesRegex(AssertionError, "browser double"):
+            self.run_script(LOGIN, env=env)
 
     def test_bootstrap_is_idempotent_and_preserves_existing_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +89,60 @@ class SetupScriptTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("Python 3.13.12", venv_python.read_text(encoding="utf-8"))
             self.assertIn("existing", first.stdout + second.stdout)
+
+    def test_preflight_hard_fails_when_host_cannot_read_mcp_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir()
+            _executable(root / "bin" / "panlib-doctor", "#!/bin/sh\nexit 0\n")
+            (root / "bin" / "panlib-library").write_text("fixture\n", encoding="utf-8")
+            python = root / ".venv" / "bin" / "python"
+            python.parent.mkdir(parents=True)
+            _executable(
+                python,
+                "#!/bin/sh\n"
+                "case \"${2:-}\" in\n"
+                "  auth-status) printf '%s\\n' '{\"data\":{\"configured\":false}}'; exit 0 ;;\n"
+                "esac\n"
+                "exit 64\n",
+            )
+            env = os.environ.copy()
+            env["PANLIB_ROOT"] = str(root)
+
+            result = self.run_script(PREFLIGHT, env=env)
+
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "blocked")
+            self.assertEqual(payload["check"], "host_full_access")
+            self.assertIn("完全访问", payload["next_step"])
+
+    def test_preflight_verifies_real_root_read_without_opening_browser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir()
+            _executable(root / "bin" / "panlib-doctor", "#!/bin/sh\nexit 0\n")
+            (root / "bin" / "panlib-library").write_text("fixture\n", encoding="utf-8")
+            python = root / ".venv" / "bin" / "python"
+            python.parent.mkdir(parents=True)
+            _executable(
+                python,
+                "#!/bin/sh\n"
+                "case \"${2:-}\" in\n"
+                "  auth-status) printf '%s\\n' '{\"data\":{\"configured\":true}}' ;;\n"
+                "  list) [ \"${3:-}\" = --path ] && [ \"${4:-}\" = / ] || exit 64; printf '%s\\n' '{\"data\":{\"path\":\"/\",\"entries\":[]}}' ;;\n"
+                "  *) exit 64 ;;\n"
+                "esac\n",
+            )
+            env = os.environ.copy()
+            env["PANLIB_ROOT"] = str(root)
+
+            result = self.run_script(PREFLIGHT, env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "ready")
+            self.assertEqual(payload["checks"]["full_drive_read"], "ready")
 
     def test_bootstrap_preserves_but_rejects_non_executable_venv_python(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -410,6 +487,8 @@ esac
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fake, log = self._fake_bdpan(root)
+            open_fake = root / "open"
+            _executable(open_fake, "#!/bin/sh\n: > \"$OPEN_LOG\"\n")
             env = os.environ.copy()
             env.update(
                 {
@@ -417,6 +496,8 @@ esac
                     "BDPAN_BIN": str(fake),
                     "BDPAN_FAKE_LOG": str(log),
                     "BDPAN_FAKE_AUTH_FILE": str(root / "authenticated"),
+                    "OPEN_BIN": str(open_fake),
+                    "OPEN_LOG": str(root / "open.log"),
                     "PATH": f"{root}:{os.environ.get('PATH', '')}",
                     "TMPDIR": str(root),
                 }
@@ -425,6 +506,7 @@ esac
             result = self.run_script(LOGIN, env=env, input_text="y\nnot-a-code\n")
 
             self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((root / "open.log").exists())
             self.assertFalse(list(root.glob("panlib-login.*")))
 
     def test_setup_help_is_side_effect_free(self):
