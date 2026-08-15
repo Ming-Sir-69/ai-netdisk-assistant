@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Read-only consistency audit against the recursive naming contract.
+
+批量整理的第一步不是动手，而是**先让人看见要改什么**。本 CLI 只读扫描片库，
+把每一处偏差连同「现状 / 应为」列成清单；它不写、不移动、不重命名。
+
+读不到的目录会作为 ``unreadable_directory`` 显式出现在清单里，而不是被跳过——
+「没检查到」和「检查过且合规」必须区分，否则清单会假装自己是完整的。
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from panlib.common import add_common_args, emit_error, emit_success  # noqa: E402
+from panlib.mcp_client import (  # noqa: E402
+    MCPBridge,
+    MCPBridgeError,
+    list_directory,
+    validate_mcp_path,
+)
+from panlib.media_manifest import CATEGORY_DIRS  # noqa: E402
+from panlib.naming import (  # noqa: E402
+    is_group_folder,
+    is_normalized_episode_filename,
+    is_normalized_movie_filename,
+)
+
+VIDEO_EXTENSIONS = {"mkv", "mp4", "ts", "avi", "iso"}
+SUBTITLE_EXTENSIONS = {"ass", "srt", "ssa", "sub", "sup", "vtt", "idx"}
+MAX_DEPTH = 8
+
+# 类别根与归档区本来就装目录，空着也不算整理残留。按名字识别而不是按深度，
+# 因为片库根之下未必只有类别根。
+CONTAINER_DIRS = set(CATEGORY_DIRS.values()) | {"_已归档_待删除", "_待整理"}
+
+
+def _extension(name: str) -> str:
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _finding(path: str, issue: str, current: str, expected: str, severity: str) -> dict:
+    return {
+        "path": path,
+        "issue": issue,
+        "current": current,
+        "expected": expected,
+        "severity": severity,
+    }
+
+
+def audit(client: MCPBridge, root: str) -> list[dict]:
+    findings: list[dict] = []
+
+    def visit(directory: str, depth: int) -> int:
+        """Return the number of media files at or below ``directory``."""
+
+        if depth > MAX_DEPTH:
+            findings.append(
+                _finding(
+                    directory,
+                    "depth_limit_reached",
+                    f"深度超过 {MAX_DEPTH}",
+                    "人工确认这一层是否必要",
+                    "low",
+                )
+            )
+            return 0
+        try:
+            entries = list_directory(client, directory)
+        except MCPBridgeError as exc:
+            findings.append(
+                _finding(
+                    directory,
+                    "unreadable_directory",
+                    f"读取失败（{exc.code}）",
+                    "改用搜索接口枚举后重新校验",
+                    "high",
+                )
+            )
+            return 0
+
+        subdirectories = [item for item in entries if item.get("isdir")]
+        files = [item for item in entries if not item.get("isdir")]
+        media = [
+            item
+            for item in files
+            if _extension(str(item.get("name", ""))) in VIDEO_EXTENSIONS
+        ]
+        subtitles = [
+            item
+            for item in files
+            if _extension(str(item.get("name", ""))) in SUBTITLE_EXTENSIONS
+        ]
+        others = [
+            item
+            for item in files
+            if item not in media and item not in subtitles
+        ]
+
+        leaf_name = PurePosixPath(directory).name
+        # 片库根与其直接子目录（Movies / TV shows / 动漫 / 归档区…）是容器，
+        # 不是内容节点：它们本来就该装目录，空着也不算整理残留。
+        is_container_root = directory == root or leaf_name in CONTAINER_DIRS
+        is_group = is_group_folder(leaf_name) or is_container_root
+
+        if is_group and media:
+            findings.append(
+                _finding(
+                    directory,
+                    "group_node_holds_media",
+                    f"分组节点里直接放着 {len(media)} 个媒体文件",
+                    "媒体文件只能放在内容节点内",
+                    "medium",
+                )
+            )
+        if not is_group and subdirectories:
+            findings.append(
+                _finding(
+                    directory,
+                    "content_node_holds_directories",
+                    f"内容节点里有 {len(subdirectories)} 个子目录",
+                    "内容节点只放文件；需要再分层就改成分组节点",
+                    "medium",
+                )
+            )
+        for item in others:
+            findings.append(
+                _finding(
+                    str(item.get("path")),
+                    "non_media_file",
+                    str(item.get("name")),
+                    "海报、NFO、说明等不入片库",
+                    "low",
+                )
+            )
+
+        for item in media + subtitles:
+            name = str(item.get("name", ""))
+            if is_normalized_movie_filename(name) or is_normalized_episode_filename(name):
+                continue
+            findings.append(
+                _finding(
+                    str(item.get("path")),
+                    "unnormalized_filename",
+                    name,
+                    "文件名需含 {imdb-ttXXXXXXX} 或 {imdb-none} 段",
+                    "high",
+                )
+            )
+
+        total = len(media)
+        for item in subdirectories:
+            total += visit(str(item.get("path")), depth + 1)
+
+        if total == 0 and not subdirectories and not is_container_root:
+            findings.append(
+                _finding(
+                    directory,
+                    "empty_container",
+                    "空目录",
+                    "整理残留，应同根归档后人工确认删除",
+                    "medium",
+                )
+            )
+        return total
+
+    visit(root, 1)
+    return findings
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="只读校验片库是否符合命名与层级契约")
+    parser.add_argument("--path", required=True, help="片库根（绝对云端路径）")
+    parser.add_argument(
+        "--severity",
+        choices=("low", "medium", "high"),
+        default="low",
+        help="只报告不低于该级别的偏差",
+    )
+    add_common_args(parser)
+    args = parser.parse_args()
+
+    order = {"low": 0, "medium": 1, "high": 2}
+    try:
+        root = validate_mcp_path(args.path, allow_root=False)
+    except (TypeError, ValueError) as exc:
+        emit_error("INVALID_ARG", f"invalid library path: {exc}")
+        return
+
+    try:
+        client = MCPBridge.from_environment()
+    except ValueError as exc:
+        emit_error("INVALID_ARG", str(exc))
+        return
+
+    findings = [
+        item
+        for item in audit(client, root)
+        if order[item["severity"]] >= order[args.severity]
+    ]
+    counts: dict[str, int] = {}
+    for item in findings:
+        counts[item["issue"]] = counts.get(item["issue"], 0) + 1
+
+    emit_success(
+        {"root": root, "findings": findings, "summary": counts},
+        {"command": "panlib-audit", "mode": "read-only"},
+    )
+
+
+if __name__ == "__main__":
+    main()
