@@ -1663,6 +1663,31 @@ class OrganizeCliTests(unittest.TestCase):
             },
         }
 
+    def test_manifest_normalizes_in_place_without_moving(self):
+        # 文件已经在目标目录里、只差名字时，多发一次 mv 只会凭空增加失败面。
+        manifest = self.season_manifest()
+        target = "/safe/base/Library/TV shows/Falcon.{series}/Falcon.S02"
+        manifest["items"][0]["source_path"] = f"{target}/Falcon.S02.raw.mkv"
+        state = self.season_manifest_state()
+        state["directories"] += [
+            "/safe/base/Library/TV shows",
+            "/safe/base/Library/TV shows/Falcon.{series}",
+            target,
+        ]
+        state["entries"][target] = [
+            {"server_filename": "Falcon.S02.raw.mkv", "isdir": False, "fs_id": 301, "size": 3000}
+        ]
+        with tempfile.TemporaryDirectory() as manifest_root:
+            manifest_file = self.write_manifest(Path(manifest_root), manifest)
+            proc, calls = self.run_cli(
+                ["--source-dir", target], state=state, manifest_file=manifest_file
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        actions = json.loads(proc.stdout)["data"]["actions"]
+        kinds = [item["action"] for item in actions]
+        self.assertIn("rename", kinds)
+        self.assertNotIn("mv", kinds)
+
     def test_manifest_season_target_uses_work_and_padded_season(self):
         with tempfile.TemporaryDirectory() as manifest_root:
             manifest_file = self.write_manifest(Path(manifest_root), self.season_manifest())

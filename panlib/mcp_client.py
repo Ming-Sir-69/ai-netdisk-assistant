@@ -341,9 +341,41 @@ def normalize_entries(payload: Any, directory: str) -> list[dict[str, Any]]:
     return normalized
 
 
+# 一页的上限由服务端决定；超过这个页数就认为出了循环，宁可停下也不空转。
+_MAX_LIST_PAGES = 200
+
+
 def list_directory(client: MCPBridge, directory: str) -> list[dict[str, Any]]:
+    """Return every entry in one directory, following pagination to the end.
+
+    官方 ``file_list`` 一次只返回一页。2026-08-16 实测：一个 25 个文件的季目录
+    只返回了前 10 个，于是审计漏报、清单据此建成残缺集合。**漏读比读错更危险**
+    ——它会安静地假装自己完整，所以这里必须翻到空页为止。
+
+    服务端若反复返回同一页（分页参数不被支持等），按去重后无新增即停止，
+    避免空转。
+    """
+
     path = validate_mcp_path(directory)
-    return normalize_entries(client.call("file_list", {"dir": path, "page": 1}), path)
+    collected: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for page in range(1, _MAX_LIST_PAGES + 1):
+        entries = normalize_entries(
+            client.call("file_list", {"dir": path, "page": page}), path
+        )
+        if not entries:
+            break
+        fresh = []
+        for item in entries:
+            key = (item.get("fsid"), item.get("path"), item.get("name"))
+            if key in seen:
+                continue
+            seen.add(key)
+            fresh.append(item)
+        if not fresh:
+            break
+        collected.extend(fresh)
+    return collected
 
 
 def search_library(

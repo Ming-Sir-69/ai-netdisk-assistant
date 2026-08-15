@@ -241,7 +241,11 @@ def build_movie_filename(
     parts = [sanitize(title_en), _checked_year(year)]
     if imdb_id is not None:
         parts.append(f"{{imdb-{_checked_imdb_id(imdb_id)}}}")
-    parts.extend([_checked_quality(quality), _checked_extension(ext)])
+    # 清晰度是执行标准而非判断标准：云端不返回宽高、抽样探测又缺通道，
+    # 所以「测不出」是常态。测不出就不写该段，而不是卡住整理。
+    if quality is not None:
+        parts.append(_checked_quality(quality))
+    parts.append(_checked_extension(ext))
     return ".".join(parts)
 
 
@@ -257,15 +261,15 @@ def build_episode_filename(
 
     season_number = _checked_index(season, "season")
     episode_number = _checked_index(episode, "episode")
-    return ".".join(
-        (
-            sanitize(title_en),
-            f"S{season_number:02d}E{episode_number:02d}",
-            f"{{imdb-{_checked_imdb_id(imdb_id)}}}",
-            _checked_quality(quality),
-            _checked_extension(ext),
-        )
-    )
+    parts = [
+        sanitize(title_en),
+        f"S{season_number:02d}E{episode_number:02d}",
+        f"{{imdb-{_checked_imdb_id(imdb_id)}}}",
+    ]
+    if quality is not None:
+        parts.append(_checked_quality(quality))
+    parts.append(_checked_extension(ext))
+    return ".".join(parts)
 
 
 def build_season_filename(
@@ -278,15 +282,15 @@ def build_season_filename(
     """Generate a full-season filename."""
 
     season_number = _checked_index(season, "season")
-    return ".".join(
-        (
-            sanitize(title_en),
-            f"S{season_number:02d}",
-            f"{{imdb-{_checked_imdb_id(imdb_id)}}}",
-            _checked_quality(quality),
-            _checked_extension(ext),
-        )
-    )
+    parts = [
+        sanitize(title_en),
+        f"S{season_number:02d}",
+        f"{{imdb-{_checked_imdb_id(imdb_id)}}}",
+    ]
+    if quality is not None:
+        parts.append(_checked_quality(quality))
+    parts.append(_checked_extension(ext))
+    return ".".join(parts)
 
 
 _SINGLE_EPISODE_RE = re.compile(

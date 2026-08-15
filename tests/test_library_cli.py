@@ -144,6 +144,62 @@ else:
     _executable(path, body)
 
 
+class ListDirectoryPaginationTests(unittest.TestCase):
+    """MCP file_list 一次只返回一页，必须翻完。
+
+    2026-08-16 实测：一个 25 个文件的季目录只返回了前 10 个，导致审计漏报、
+    清单据此建成残缺集合。漏读比读错更危险——它会安静地假装自己完整。
+    """
+
+    class PagedClient:
+        def __init__(self, pages):
+            self.pages = pages
+            self.calls = []
+
+        def call(self, tool, arguments):
+            self.calls.append(arguments)
+            page = arguments.get("page", 1)
+            return {"list": self.pages.get(page, [])}
+
+    def entries(self, start, count):
+        return [
+            {
+                "server_filename": f"file{index}.mkv",
+                "path": f"/lib/dir/file{index}.mkv",
+                "isdir": False,
+                "fs_id": index,
+            }
+            for index in range(start, start + count)
+        ]
+
+    def test_every_page_is_read_until_the_listing_is_exhausted(self):
+        from panlib.mcp_client import list_directory
+
+        client = self.PagedClient({1: self.entries(0, 10), 2: self.entries(10, 10), 3: self.entries(20, 5)})
+        result = list_directory(client, "/lib/dir")
+        self.assertEqual(len(result), 25)
+        self.assertEqual([call["page"] for call in client.calls][:3], [1, 2, 3])
+
+    def test_a_short_first_page_still_confirms_the_end_before_returning(self):
+        # 服务端不返回任何分页元信息，页大小也不可调（实测 num/limit 均无效）。
+        # 因此「这页短就是最后一页」只是猜测——猜错的方向正是漏读。
+        # 宁可多发一次请求确认到空页，也不接受安静的不完整。
+        from panlib.mcp_client import list_directory
+
+        client = self.PagedClient({1: self.entries(0, 3)})
+        self.assertEqual(len(list_directory(client, "/lib/dir")), 3)
+        self.assertEqual([call["page"] for call in client.calls], [1, 2])
+
+    def test_a_repeated_page_stops_the_walk_instead_of_looping_forever(self):
+        from panlib.mcp_client import list_directory
+
+        same = self.entries(0, 10)
+        client = self.PagedClient({index: same for index in range(1, 60)})
+        result = list_directory(client, "/lib/dir")
+        self.assertEqual(len(result), 10)
+        self.assertLess(len(client.calls), 5)
+
+
 class LibraryCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

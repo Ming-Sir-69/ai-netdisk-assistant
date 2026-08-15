@@ -226,7 +226,7 @@ def _normalise_item(
     # fields may be omitted when they are not applicable; omission is treated
     # the same as an explicit JSON null and is represented explicitly in the
     # normalized output.
-    missing = (_ITEM_KEYS - {"year", "season", "episode"}) - set(raw_item)
+    missing = (_ITEM_KEYS - {"year", "season", "episode", "quality"}) - set(raw_item)
     if missing:
         _fail("manifest item is missing required field(s): " + ", ".join(sorted(missing)))
 
@@ -289,10 +289,16 @@ def _normalise_item(
     season = _optional_positive_integer(raw_item.get("season"), "season")
     episode = _optional_positive_integer(raw_item.get("episode"), "episode")
 
-    quality = _required_text(raw_item["quality"], "quality")
-    if not validate_quality(quality):
-        _fail(f"unsupported quality: {quality}")
-    quality = normalize_quality(quality)
+    # 清晰度可缺省：云端不返回宽高、抽样探测又缺通道，「测不出」是常态。
+    # 缺省时文件名省略该段；给了值就必须是受支持的取值，不接受占位文字。
+    raw_quality = raw_item.get("quality")
+    if raw_quality is None:
+        quality = None
+    else:
+        quality = _required_text(raw_quality, "quality")
+        if not validate_quality(quality):
+            _fail(f"unsupported quality: {quality}")
+        quality = normalize_quality(quality)
 
     if layout == "single":
         if year is None:

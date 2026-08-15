@@ -231,6 +231,30 @@ class RecursiveGroupNamingTests(unittest.TestCase):
         )
 
 
+class OptionalQualityTests(unittest.TestCase):
+    """清晰度拿不到就不写（铭哥 2026-08-15 定）。
+
+    云端接口不返回宽高，抽样探测又缺通道，所以「测不出清晰度」是常态而非
+    异常。必填会让这批文件永远整理不了。
+    """
+
+    def test_movie_filename_omits_the_segment_when_quality_is_unknown(self):
+        self.assertEqual(
+            naming.build_movie_filename("The Movie", "2020", None, "mkv", "tt1234567"),
+            "The.Movie.2020.{imdb-tt1234567}.mkv",
+        )
+
+    def test_episode_filename_omits_the_segment_when_quality_is_unknown(self):
+        self.assertEqual(
+            naming.build_episode_filename("Loki", 1, 2, "tt1286039", None, "mkv"),
+            "Loki.S01E02.{imdb-tt1286039}.mkv",
+        )
+
+    def test_a_known_quality_is_still_required_to_be_valid(self):
+        with self.assertRaises(ValueError):
+            naming.build_movie_filename("X", "2020", "9001p", "mkv", "tt1234567")
+
+
 class PlaceholderImdbTests(unittest.TestCase):
     """无 IMDB 编号统一写 {imdb-none}（铭哥 2026-08-15 定）。
 

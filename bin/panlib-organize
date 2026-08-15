@@ -489,10 +489,13 @@ def _build_tv_plan(
             for item in entries
             if item.get("server_filename")
         }
+        # 已经躺在目标目录里的文件不算冲突——它们只差一个名字。
+        # 「原地规范化」是真实场景：整理过一半、或先建好容器再补命名。
         destination_sources = [
             source["filename"]
             for source, target, _ in source_destinations
             if target == destination
+            and str(PurePosixPath(source["path"]).parent) != destination
         ]
         source_collision = existing_names.intersection(destination_sources)
         if source_collision:
@@ -519,6 +522,18 @@ def _build_tv_plan(
         if not season_entries[destination][1]:
             actions.append({"action": "mkdir", "path": destination})
     for source, destination, new_name in source_destinations:
+        if str(PurePosixPath(source["path"]).parent) == destination:
+            # 原地规范化：只改名，不搬家。多一次 mv 只会凭空增加失败面。
+            if source["filename"] != new_name:
+                actions.append(
+                    {
+                        "action": "rename",
+                        "from": source["path"],
+                        "new_name": new_name,
+                        "old_name": source["filename"],
+                    }
+                )
+            continue
         destination_path = safe_cloud_join(destination, source["filename"])
         actions.append(
             {
@@ -890,7 +905,10 @@ def _manifest_plan(args: argparse.Namespace, settings) -> dict:
             if entry.get("server_filename")
         }
         source_name = PurePosixPath(item["source_path"]).name
-        if source_name in existing_names:
+        # 源文件本来就在目标目录里时，它「占用」的正是自己的名字——那不是冲突，
+        # 而是原地规范化：只需改名。
+        already_in_place = str(PurePosixPath(item["source_path"]).parent) == item["target_dir"]
+        if source_name in existing_names and not already_in_place:
             raise ValueError(f"target already contains source basename: {source_name}")
         if item["target_name"] in existing_names:
             raise ValueError(f"target already contains final filename: {item['target_name']}")
@@ -903,6 +921,20 @@ def _manifest_plan(args: argparse.Namespace, settings) -> dict:
         source_path = item["source_path"]
         source_name = PurePosixPath(source_path).name
         destination = item["target_dir"]
+        if str(PurePosixPath(source_path).parent) == destination:
+            # 原地规范化：文件已在目标目录，只改名。少一次 mv 就少一个失败点。
+            if source_name != item["target_name"]:
+                actions.append(
+                    {
+                        "action": "rename",
+                        "from": source_path,
+                        "new_name": item["target_name"],
+                        "old_name": source_name,
+                        "expected_fs_id": item["fs_id"],
+                        "expected_size": item["size"],
+                    }
+                )
+            continue
         actions.append(
             {
                 "action": "mv",

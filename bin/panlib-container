@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Guarded in-place rename for a library container directory.
+
+结构修正常常只差一个名字——`Loki` 要变成 `Loki.{series}`。没有这个入口时，
+唯一的办法是把目录里的每个文件搬到新目录，用上百次写操作换一次改名，失败面
+大得多。因此本 CLI 只做这一件事，并且做得极窄：
+
+**同一个父目录内、只改名字、不移动、不合并、不覆盖、不删除。**
+
+计划先行并绑定 ``plan_ref``；写前重读父目录确认源在、新名未被占用；写后读回
+验收；每一步进恢复台账。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path, PurePosixPath
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "panlib"))
+sys.path.insert(0, str(_REPO_ROOT))
+
+import journal  # noqa: E402
+from common import (  # noqa: E402
+    INVALID_ARG,
+    NOT_FOUND,
+    add_common_args,
+    decode_bdpan_ls,
+    emit_error,
+    emit_success,
+    load_settings,
+    run_bdpan,
+    safe_cloud_join,
+    validate_cloud_path,
+)
+
+_ILLEGAL_NAME_CHARS = set('/\\:*?"<>|')
+
+
+def _validated_name(value: str) -> str:
+    name = str(value).strip()
+    if not name or name in {".", ".."}:
+        raise ValueError("new name must not be empty or a path segment")
+    if any(char in _ILLEGAL_NAME_CHARS for char in name):
+        raise ValueError("new name must not contain a path separator or illegal character")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("new name must not contain control characters")
+    return name
+
+
+def _entries(path: str, settings) -> tuple[list[dict], bool]:
+    code, out, err = run_bdpan(["ls", path, "--json"], timeout=60, settings=settings)
+    if code != 0:
+        message = err.strip() or out.strip() or "bdpan ls failed"
+        raise RuntimeError(message)
+    return decode_bdpan_ls(out, path)
+
+
+def _names(entries: list[dict]) -> set[str]:
+    return {
+        str(item.get("server_filename") or item.get("name") or "")
+        for item in entries
+        if item.get("server_filename") or item.get("name")
+    }
+
+
+def _plan_ref(path: str, new_name: str) -> str:
+    canonical = json.dumps(
+        {"action": "rename", "path": path, "new_name": new_name},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="在原位重命名片库容器目录（默认只生成计划）")
+    sub = parser.add_subparsers(dest="command", required=True)
+    rename_cmd = sub.add_parser("rename", help="原位重命名一个容器目录")
+    rename_cmd.add_argument("--path", required=True, help="目标目录的绝对云端路径")
+    rename_cmd.add_argument("--new-name", required=True, help="新名字（不含路径分隔符）")
+    rename_cmd.add_argument("--execute", action="store_true", help="确认后执行改名")
+    rename_cmd.add_argument("--plan-ref", default="", help="计划指纹（仅执行时使用）")
+    add_common_args(rename_cmd)
+    args = parser.parse_args()
+
+    settings = load_settings()
+    library_root = safe_cloud_join(settings.bdpan_base, settings.bdpan_lib)
+
+    try:
+        target = validate_cloud_path(args.path, library_root)
+    except (TypeError, ValueError) as exc:
+        emit_error(INVALID_ARG, f"path must stay inside the library root: {exc}")
+        return
+    if target == library_root:
+        emit_error(INVALID_ARG, "the library root itself cannot be renamed")
+        return
+    try:
+        new_name = _validated_name(args.new_name)
+    except ValueError as exc:
+        emit_error(INVALID_ARG, str(exc))
+        return
+
+    parent = str(PurePosixPath(target).parent)
+    current_name = PurePosixPath(target).name
+    if new_name == current_name:
+        emit_error(INVALID_ARG, "new name is identical to the current name")
+        return
+
+    try:
+        siblings, parent_exists = _entries(parent, settings)
+    except RuntimeError as exc:
+        emit_error("NETWORK", str(exc))
+        return
+    if not parent_exists:
+        emit_error(NOT_FOUND, f"parent directory not found: {parent}")
+        return
+    sibling_names = _names(siblings)
+    if current_name not in sibling_names:
+        emit_error(NOT_FOUND, f"container not found: {target}")
+        return
+    if new_name in sibling_names:
+        emit_error(INVALID_ARG, f"parent already holds an entry named {new_name}")
+        return
+
+    plan_ref = _plan_ref(target, new_name)
+    if not args.execute:
+        emit_success(
+            {
+                "mode": "plan-only",
+                "path": target,
+                "parent": parent,
+                "current_name": current_name,
+                "new_name": new_name,
+                "plan_ref": plan_ref,
+                "execute_required": True,
+                "actions": [{"action": "rename", "path": target, "new_name": new_name}],
+            },
+            {"command": "panlib-container rename", "mode": "plan-only"},
+        )
+        return
+
+    if args.plan_ref != plan_ref:
+        emit_error(
+            INVALID_ARG,
+            "rename --execute requires --plan-ref from a matching plan-only run",
+        )
+        return
+
+    run_id = journal.new_run_id()
+    renamed = str(PurePosixPath(parent) / new_name)
+    base_event = {
+        "run_id": run_id,
+        "stage": "container-rename",
+        "attempt": 1,
+        "source_path": target,
+        "target_path": renamed,
+        "identity": {"name": current_name, "new_name": new_name},
+        "plan_ref": plan_ref,
+        "recovery_read_paths": [parent, target, renamed],
+    }
+
+    code, out, err = run_bdpan(["rename", target, new_name], timeout=120, settings=settings)
+    if code != 0:
+        message = err.strip() or out.strip() or "bdpan rename failed"
+        try:
+            journal.append_event(
+                {
+                    **base_event,
+                    "status": "failed",
+                    "failed_action": "rename",
+                    "error_code": "RCV-002",
+                    "original_cli_code": "NETWORK",
+                    "next_action": "read_recovery_paths_and_replan",
+                }
+            )
+        except Exception:  # pragma: no cover - ledger must not mask the failure
+            pass
+        emit_error("NETWORK", message)
+        return
+
+    try:
+        after, _ = _entries(parent, settings)
+    except RuntimeError as exc:
+        emit_error("NETWORK", str(exc))
+        return
+    after_names = _names(after)
+    verified = new_name in after_names and current_name not in after_names
+
+    try:
+        journal.append_event(
+            {
+                **base_event,
+                "status": "executed" if verified else "unverified",
+                "completed_actions": 1,
+                **(
+                    {}
+                    if verified
+                    else {
+                        "error_code": "RCV-005",
+                        "original_cli_code": "OK",
+                        "next_action": "stop_postcondition_unverified",
+                    }
+                ),
+            }
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"journal unavailable: {exc}", file=sys.stderr)
+
+    emit_success(
+        {
+            "executed": True,
+            "path": target,
+            "renamed_to": renamed,
+            "plan_ref": plan_ref,
+            "run_id": run_id,
+            "postcondition": {
+                "status": "verified" if verified else "unverified",
+                "checked_path": renamed,
+            },
+        },
+        {"command": "panlib-container rename", "mode": "execute"},
+    )
+
+
+if __name__ == "__main__":
+    main()
