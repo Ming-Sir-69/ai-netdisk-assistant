@@ -12,13 +12,32 @@ from __future__ import annotations
 import os
 import getpass
 import json
+import pwd
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
+
+
+def _current_user() -> str:
+    """Resolve the login user even when LOGNAME/USER are spoofed as root.
+
+    WorkBuddy's sandbox exports LOGNAME=root while USER stays the login
+    user; getpass.getuser() prefers LOGNAME and would therefore address the
+    wrong Keychain account.  Fall back through USER, then the password
+    database for the real uid.
+    """
+
+    user = os.environ.get("USER")
+    if user:
+        return user
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, AttributeError):
+        return getpass.getuser()
 
 
 class CredentialUnavailable(RuntimeError):
@@ -55,7 +74,7 @@ class MacOSKeychain:
     """Small native wrapper around ``/usr/bin/security`` generic passwords."""
 
     service: str = "ai-netdisk-manager.baidu-mcp.oauth"
-    account: str = getpass.getuser()
+    account: str = field(default_factory=_current_user)
     security: str | Path = "/usr/bin/security"
     runner: Runner = subprocess.run
 
@@ -65,7 +84,7 @@ class MacOSKeychain:
             service=os.environ.get(
                 "PANLIB_KEYCHAIN_SERVICE", "ai-netdisk-manager.baidu-mcp.oauth"
             ),
-            account=os.environ.get("PANLIB_KEYCHAIN_ACCOUNT", getpass.getuser()),
+            account=os.environ.get("PANLIB_KEYCHAIN_ACCOUNT", _current_user()),
             security=os.environ.get("PANLIB_KEYCHAIN_SECURITY", "/usr/bin/security"),
         )
 
