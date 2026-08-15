@@ -99,3 +99,6 @@ tests/.cache/
 
 # 本机 Agent 开发配置，不随仓库分发
 .claude/
+
+# 运行时台账与中间产物，不随仓库分发
+runtime/

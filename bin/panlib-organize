@@ -22,6 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "panlib"))
 sys.path.insert(0, str(_REPO_ROOT))
 
+import journal  # noqa: E402
 from common import (  # noqa: E402
     AUTH,
     INVALID_ARG,
@@ -620,11 +621,73 @@ def _check_source_identity(action: dict, settings) -> None:
         raise ValueError(f"source fs_id mismatch: {action['old_name']}")
 
 
+def _action_paths(action: dict) -> tuple[str, str]:
+    """Return ``(source_path, target_path)`` for one action, for the ledger."""
+
+    kind = action.get("action")
+    if kind == "mkdir":
+        path = str(action.get("path") or "")
+        return path, path
+    source = str(action.get("from") or "")
+    if kind == "rename":
+        parent = str(PurePosixPath(source).parent)
+        return source, f"{parent}/{action.get('new_name')}"
+    return source, str(action.get("to") or "")
+
+
+def _journal_event(
+    action: dict,
+    *,
+    run_id: str,
+    plan_ref: str | None,
+    status: str,
+    completed: list[dict],
+    failure: str = "",
+) -> dict:
+    source_path, target_path = _action_paths(action)
+    event = {
+        "run_id": run_id,
+        "stage": "organize",
+        "attempt": 1,
+        "source_path": source_path,
+        "target_path": target_path,
+        "identity": {
+            "name": action.get("old_name") or PurePosixPath(source_path).name,
+            "new_name": action.get("new_name"),
+        },
+        "plan_ref": plan_ref,
+        "action": action.get("action"),
+        "status": status,
+        "completed_actions": len(completed),
+        "recovery_read_paths": sorted({source_path, target_path} - {""}),
+    }
+    if status != "executed":
+        event["failed_action"] = action.get("action")
+        event["error_code"] = "RCV-002"
+        event["original_cli_code"] = _error_code(failure)
+        event["next_action"] = "read_recovery_paths_and_replan"
+    return event
+
+
+def _record(event: dict) -> None:
+    """Append one ledger event; never let a ledger problem lose cloud work."""
+
+    try:
+        journal.append_event(event)
+    except Exception as exc:  # pragma: no cover - exercised via degraded runs
+        print(f"journal unavailable: {redact_text(exc)}", file=sys.stderr)
+
+
 def _execute(
     actions: list[dict],
     settings,
+    *,
+    run_id: str | None = None,
+    plan_ref: str | None = None,
 ) -> dict:
     completed: list[dict] = []
+    # 台账在第一个写操作之前就要有 run_id，否则失败时无从定位。
+    active_run = run_id or journal.new_run_id()
     for action in actions:
         try:
             if action["action"] == "mkdir":
@@ -636,10 +699,30 @@ def _execute(
                 _check_source_identity(action, settings)
             _run_mutation(action, settings)
         except Exception as exc:
-            raise OperationFailure(action, redact_text(exc), completed) from exc
+            message = redact_text(exc)
+            _record(
+                _journal_event(
+                    action,
+                    run_id=active_run,
+                    plan_ref=plan_ref,
+                    status="partial",
+                    completed=completed,
+                    failure=message,
+                )
+            )
+            raise OperationFailure(action, message, completed) from exc
         completed.append(action)
+        _record(
+            _journal_event(
+                action,
+                run_id=active_run,
+                plan_ref=plan_ref,
+                status="executed",
+                completed=completed,
+            )
+        )
 
-    return {"completed": completed}
+    return {"completed": completed, "run_id": active_run}
 
 
 _MANIFEST_LEGACY_FLAGS = {
@@ -1007,7 +1090,9 @@ def main(argv: list[str] | None = None) -> None:
                     meta={"mode": "plan-only", "manifest": True},
                 )
             try:
-                result = _execute(plan["actions"], settings)
+                result = _execute(
+                    plan["actions"], settings, plan_ref=plan.get("plan_ref")
+                )
             except OperationFailure as exc:
                 emit_error(
                     _error_code(str(exc)),
