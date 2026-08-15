@@ -16,6 +16,11 @@ _EXTENSIONS = {
 _QUALITIES = {"2160p", "1080p", "1080p.REMUX", "1080p.BluRay", "720p", "WEB-DL"}
 _INVALID_NAME_CHARS = set('/\\:*?"<>|')
 
+UNIVERSE_DIRS = {
+    "marvel": "Marvel Cinematic Universe",
+    "dc": "DC Cinematic Universe",
+}
+
 
 def _require_text(value: str, field: str) -> str:
     if not isinstance(value, str):
@@ -24,6 +29,18 @@ def _require_text(value: str, field: str) -> str:
     if not stripped:
         raise ValueError(f"{field} must not be empty")
     return stripped
+
+
+def universe_dir_name(key: str | None) -> str | None:
+    """Return the canonical directory name for a supported universe key."""
+
+    if key is None:
+        return None
+    value = _require_text(key, "universe")
+    try:
+        return UNIVERSE_DIRS[value]
+    except KeyError:
+        raise ValueError(f"unsupported universe: {key}") from None
 
 
 def sanitize(name: str) -> str:
@@ -40,6 +57,42 @@ def sanitize(name: str) -> str:
     if not sanitized or sanitized in {".", ".."}:
         raise ValueError("name becomes empty after sanitization")
     return sanitized
+
+
+def normalize_movie_title(name: str) -> str:
+    """Validate a canonical movie title while preserving word spaces."""
+
+    value = _require_text(name, "movie_title")
+    if ".." in value or any(char in _INVALID_NAME_CHARS for char in value):
+        raise ValueError("movie_title contains a path separator, traversal or illegal character")
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise ValueError("movie_title contains a control character")
+    normalized = re.sub(r"\s+", " ", value).strip()
+    if not normalized or normalized in {".", ".."}:
+        raise ValueError("movie_title must not be empty")
+    return normalized
+
+
+_CHINA_COUNTRY_NAMES = {
+    "china", "cn", "prc", "mainland china", "people's republic of china",
+    "中国", "中国大陆",
+}
+
+
+def select_movie_title(
+    production_countries: Iterable[str], title_zh: str, title_en: str
+) -> str:
+    """Choose the canonical title from structured production-country data."""
+
+    countries = {
+        _require_text(country, "production_country").casefold()
+        for country in production_countries
+    }
+    if not countries:
+        raise ValueError("at least one production_country is required")
+    if countries.intersection(_CHINA_COUNTRY_NAMES):
+        return normalize_movie_title(title_zh)
+    return normalize_movie_title(title_en)
 
 
 def is_chinese(name: str) -> bool:
@@ -150,18 +203,46 @@ def _checked_index(value: int | str, field: str) -> int:
     return parsed
 
 
-def build_folder_name(title: str, imdb_id: str) -> str:
-    """Generate ``{Name}.{imdb-ttXXXXXXX}`` safely."""
+def build_work_folder_name(canonical_title: str) -> str:
+    """Generate a validated work/collection folder name."""
 
-    return f"{sanitize(title)}.{{imdb-{_checked_imdb_id(imdb_id)}}}"
+    return normalize_movie_title(canonical_title)
 
 
-def build_movie_filename(title_en: str, year: str, quality: str, ext: str) -> str:
-    """Generate a single movie/documentary filename."""
+def build_season_folder_name(canonical_title: str, season: int) -> str:
+    """Generate a validated season folder name with a zero-padded marker."""
 
-    return ".".join(
-        (sanitize(title_en), _checked_year(year), _checked_quality(quality), _checked_extension(ext))
-    )
+    season_number = _checked_index(season, "season")
+    return f"{sanitize(canonical_title)}.S{season_number:02d}"
+
+
+def build_folder_name(title: str, imdb_id: str, year: str | None = None) -> str:
+    """Generate a movie folder or the legacy TV folder marker safely.
+
+    IMDB ID 只出现在视频文件名中，文件夹名不带 IMDB（2026-08-11 起）。
+    ``imdb_id`` 参数保留用于校验与未来兼容，但不进入文件夹名。
+    """
+
+    if year is None:
+        return f"{sanitize(title)}.{{imdb-{_checked_imdb_id(imdb_id)}}}"
+    _checked_imdb_id(imdb_id)  # 校验但不入名
+    return ".".join((sanitize(title), _checked_year(year)))
+
+
+def build_movie_filename(
+    title_en: str, year: str, quality: str, ext: str, imdb_id: str | None = None
+) -> str:
+    """Generate a single movie/documentary filename.
+
+    IMDB ID 只在视频文件名上显示（2026-08-11 起规则）。传入 ``imdb_id``
+    时插入 ``{imdb-ttXXX}`` 段；为 None 时保持旧格式（向后兼容）。
+    """
+
+    parts = [sanitize(title_en), _checked_year(year)]
+    if imdb_id is not None:
+        parts.append(f"{{imdb-{_checked_imdb_id(imdb_id)}}}")
+    parts.extend([_checked_quality(quality), _checked_extension(ext)])
+    return ".".join(parts)
 
 
 def build_episode_filename(
@@ -365,3 +446,62 @@ def shared_main_title(title_en: str, known_main_titles: Iterable[str] | None = N
         if token.lower() in stop or token.isdigit():
             return ".".join(parts[:i]) if i > 0 else ".".join(parts)
     return ".".join(parts[:-1]) if len(parts) > 1 else ".".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# “已规范”判定（判断标准，区别于清晰度这个“执行标准”）
+#
+# 规则（铭哥 2026-08-11 拍板）：清晰度是执行/重命名时的规范，不是判断
+# 是否需要整理的维度。因此判定“已规范”只看结构与 IMDB 标记，不看清晰度。
+# 只要视频文件名含 ``{imdb-ttXXXXXXX}`` 段且扩展名合法，即视为已规范——
+# 有没有清晰度段都算，避免占位清晰度或缺失清晰度被误判为“待整理”而重复调整。
+# ---------------------------------------------------------------------------
+
+_NORMALIZED_IMDB_RE = re.compile(r"\{imdb-tt\d{7,8}\}")
+
+
+def _media_extension_of(name: str) -> str | None:
+    """Return the lowercased extension when it is a known media/subtitle ext."""
+
+    if "." not in name:
+        return None
+    ext = name.rsplit(".", 1)[-1].lower()
+    return ext if ext in _EXTENSIONS else None
+
+
+def is_normalized_movie_filename(name: str) -> bool:
+    """Return whether a movie/documentary filename is already normalized.
+
+    已规范 = 文件名含 ``{imdb-ttXXXXXXX}`` 段，且扩展名是受支持的媒体/字幕
+    扩展名。清晰度段可有可无（清晰度是执行标准，不是判断标准）。
+
+    >>> is_normalized_movie_filename("Limitless.2011.{imdb-tt1219289}.mkv")
+    True
+    >>> is_normalized_movie_filename("Limitless.2011.{imdb-tt1219289}.1080p.mkv")
+    True
+    >>> is_normalized_movie_filename("Limitless.2011.tt1219289.mkv")
+    False
+    """
+
+    if not isinstance(name, str) or not _NORMALIZED_IMDB_RE.search(name):
+        return False
+    return _media_extension_of(name) is not None
+
+
+def is_normalized_episode_filename(name: str) -> bool:
+    """Return whether an episode/season filename is already normalized.
+
+    已规范 = 含 ``SxxExx``（单集）或 ``Sxx``（整季）标记 + ``{imdb-ttXXX}``
+    段，扩展名合法。清晰度同样不作为判断维度。
+
+    >>> is_normalized_episode_filename("Loki.S01E01.{imdb-tt1286039}.mkv")
+    True
+    >>> is_normalized_episode_filename("Loki.S02.{imdb-tt1286039}.1080p.mkv")
+    True
+    """
+
+    if not isinstance(name, str) or not _NORMALIZED_IMDB_RE.search(name):
+        return False
+    if parse_episode(name) is None and not re.search(r"(?i)\bS\d{2}\b", name):
+        return False
+    return _media_extension_of(name) is not None

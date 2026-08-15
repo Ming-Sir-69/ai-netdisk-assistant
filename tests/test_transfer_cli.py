@@ -147,6 +147,21 @@ class TransferCliTests(unittest.TestCase):
         self.assertRegex(share_ref, r"^[0-9a-f]{64}$")
         return share_ref
 
+    def test_movie_plan_selects_chinese_title_from_production_country(self):
+        args = self.base_args() + [
+            "--title-zh", "中国机长",
+            "--production-country", "China",
+            "--year", "2019",
+        ]
+
+        proc, calls = self.run_cli(args)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)["data"]
+        self.assertEqual(payload["title"], "中国机长")
+        self.assertNotIn("title_en", payload)
+        self.assertEqual(calls, [])
+
     def test_resource_id_plan_resolves_inside_transfer_without_echoing_secret(self):
         proc, calls = self.run_cli(self.resource_args())
         share_ref = self._read_share_ref(proc)

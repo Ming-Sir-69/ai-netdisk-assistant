@@ -14,12 +14,32 @@ class NamingValidationTests(unittest.TestCase):
             naming.build_movie_filename("Mr. & Mrs. Smith", "2005", "1080p", "mkv"),
             "Mr.&.Mrs.Smith.2005.1080p.mkv",
         )
-
-    def test_folder_and_episode_names_keep_imdb_marker(self):
+        # 传入 imdb_id 时，电影文件名带 IMDB 段（2026-08-11 起规则）
         self.assertEqual(
-            naming.build_folder_name("Limitless", "tt1219289"),
-            "Limitless.{imdb-tt1219289}",
+            naming.build_movie_filename(
+                "Mr. & Mrs. Smith", "2005", "1080p", "mkv", "tt0356910"
+            ),
+            "Mr.&.Mrs.Smith.2005.{imdb-tt0356910}.1080p.mkv",
         )
+
+    def test_movie_folder_uses_title_year_without_imdb_id(self):
+        # 文件夹不带 IMDB（2026-08-11 起规则）：IMDB 只在视频文件名上；点分隔
+        self.assertEqual(
+            naming.build_folder_name("A Walk in the Clouds", "tt0114887", "1995"),
+            "A.Walk.in.the.Clouds.1995",
+        )
+
+    def test_country_selects_the_canonical_movie_title(self):
+        self.assertEqual(
+            naming.select_movie_title(["China"], "中国机长", "The Captain"),
+            "中国机长",
+        )
+        self.assertEqual(
+            naming.select_movie_title(["United States"], "毒液", "Venom"),
+            "Venom",
+        )
+
+    def test_episode_names_keep_imdb_marker(self):
         self.assertEqual(
             naming.build_episode_filename("Breaking Bad", 1, 3, "tt0903747", "1080p", "mkv"),
             "Breaking.Bad.S01E03.{imdb-tt0903747}.1080p.mkv",
@@ -65,7 +85,7 @@ class NamingValidationTests(unittest.TestCase):
                     naming.build_movie_filename(title, year, quality, ext)
 
         with self.assertRaises(ValueError):
-            naming.build_folder_name("Show", "bad-id")
+            naming.build_folder_name("Show", "bad-id", "2020")
         with self.assertRaises(ValueError):
             naming.build_episode_filename("Show", 0, 1, "tt1234567", "1080p", "mkv")
 
@@ -79,6 +99,79 @@ class NamingValidationTests(unittest.TestCase):
             with self.subTest(quality=quality):
                 with self.assertRaises(ValueError):
                     naming.build_movie_filename("Show", "2020", quality, "mkv")
+
+
+class HierarchicalNamingTests(unittest.TestCase):
+    def test_universe_dir_name_maps_supported_keys_and_none(self):
+        self.assertEqual(
+            naming.universe_dir_name("marvel"), "Marvel Cinematic Universe"
+        )
+        self.assertEqual(naming.universe_dir_name("dc"), "DC Cinematic Universe")
+        self.assertIsNone(naming.universe_dir_name(None))
+
+    def test_universe_dir_name_rejects_unknown_and_legacy_keys(self):
+        for key in ("", "MCU", "unknown"):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    naming.universe_dir_name(key)
+
+    def test_work_folder_name_preserves_canonical_word_spaces(self):
+        self.assertEqual(naming.build_work_folder_name("Loki"), "Loki")
+        self.assertEqual(naming.build_work_folder_name("Moon Knight"), "Moon Knight")
+
+    def test_season_folder_name_sanitizes_title_and_pads_season(self):
+        self.assertEqual(naming.build_season_folder_name("Loki", 1), "Loki.S01")
+        self.assertEqual(
+            naming.build_season_folder_name("Moon Knight", 2), "Moon.Knight.S02"
+        )
+
+    def test_hierarchical_names_reject_invalid_titles_and_seasons(self):
+        for title in ("", "../escape", "a/b", "bad\nname"):
+            with self.subTest(title=title):
+                with self.assertRaises(ValueError):
+                    naming.build_work_folder_name(title)
+                with self.assertRaises(ValueError):
+                    naming.build_season_folder_name(title, 1)
+
+        for season in (0, -1, True):
+            with self.subTest(season=season):
+                with self.assertRaises(ValueError):
+                    naming.build_season_folder_name("Loki", season)
+
+    def test_is_normalized_movie_filename_ignores_quality_segment(self):
+        # 清晰度是执行标准不是判断标准：有/无清晰度段都判定已规范，
+        # 避免占位或缺失清晰度被误判为待整理而重复调整（铭哥 2026-08-11）。
+        self.assertTrue(
+            naming.is_normalized_movie_filename("Limitless.2011.{imdb-tt1219289}.mkv")
+        )
+        self.assertTrue(
+            naming.is_normalized_movie_filename(
+                "Limitless.2011.{imdb-tt1219289}.1080p.mkv"
+            )
+        )
+        # 字幕扩展名同样视为已规范
+        self.assertTrue(
+            naming.is_normalized_movie_filename("Limitless.2011.{imdb-tt1219289}.ass")
+        )
+        # 裸 tt（无花括号）不是新规范 → 未规范
+        self.assertFalse(
+            naming.is_normalized_movie_filename("Limitless.2011.tt1219289.mkv")
+        )
+        # 非媒体扩展名 → 未规范
+        self.assertFalse(naming.is_normalized_movie_filename("poster.jpg"))
+
+    def test_is_normalized_episode_filename(self):
+        self.assertTrue(
+            naming.is_normalized_episode_filename("Loki.S01E01.{imdb-tt1286039}.mkv")
+        )
+        self.assertTrue(
+            naming.is_normalized_episode_filename(
+                "Loki.S02.{imdb-tt1286039}.1080p.mkv"
+            )
+        )
+        self.assertFalse(
+            naming.is_normalized_episode_filename("Loki.S01E01.tt1286039.mkv")
+        )
 
 
 if __name__ == "__main__":

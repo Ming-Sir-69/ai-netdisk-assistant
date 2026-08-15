@@ -33,7 +33,13 @@ from common import (  # noqa: E402
     run_subprocess,
     safe_cloud_join,
 )
-from naming import build_folder_name, sanitize, validate_imdb_id, validate_year  # noqa: E402
+from naming import (  # noqa: E402
+    build_folder_name,
+    sanitize,
+    select_movie_title,
+    validate_imdb_id,
+    validate_year,
+)
 
 
 TYPE_DIR = {
@@ -627,7 +633,14 @@ def _parser() -> argparse.ArgumentParser:
         help="resource-id 计划返回的稳定交接引用（执行时必填）",
     )
     parser.add_argument("--type", "-t", choices=list(TYPE_DIR), required=True, help="资源类型")
-    parser.add_argument("--title-en", required=True, help="英文名/中文名")
+    parser.add_argument("--title-en", required=True, help="英文正式片名；兼容旧调用，国产片请同时提供 --title-zh 与 --production-country")
+    parser.add_argument("--title-zh", default="", help="中文正式片名（国产片必填）")
+    parser.add_argument(
+        "--production-country",
+        action="append",
+        default=[],
+        help="制片国家/地区，可重复；包含 China/中国时自动选中文片名",
+    )
     parser.add_argument("--imdb-id", required=True, help="IMDB ID (ttXXX)")
     parser.add_argument("--year", default="", help="年份")
     parser.add_argument("--quality", default="", help="清晰度（仅作为上游元数据）")
@@ -655,6 +668,12 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError("link-index must be zero or greater")
         if args.share_ref and not _SHARE_REF_RE.fullmatch(args.share_ref):
             raise ValueError("share-ref must be a 64-character lowercase hexadecimal value")
+        if args.production_country:
+            args.title_en = select_movie_title(
+                args.production_country, args.title_zh, args.title_en
+            )
+        elif args.title_zh:
+            raise ValueError("title-zh requires at least one production-country")
         sanitize(args.title_en)
         if not validate_imdb_id(args.imdb_id):
             raise ValueError("imdb_id must match tt followed by 7-8 digits")
@@ -662,7 +681,11 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError("year must be a four-digit value between 1800 and 2199")
         # Build the expected source folder only as a collision key.  The
         # transfer output intentionally does not claim that folder exists.
-        expected_folder = build_folder_name(args.title_en, args.imdb_id)
+        expected_folder = build_folder_name(
+            args.title_en,
+            args.imdb_id,
+            args.year if args.type == "movie" and args.year else None,
+        )
         settings = load_settings()
         destination = safe_cloud_join(
             settings.bdpan_base, settings.bdpan_lib, TYPE_DIR[args.type]
@@ -736,7 +759,7 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "plan": plan,
                 "dest_dir": destination,
-                "title_en": args.title_en,
+                "title": args.title_en,
                 "imdb_id": args.imdb_id,
                 **(
                     {
@@ -801,7 +824,7 @@ def main(argv: list[str] | None = None) -> None:
         {
             "plan": plan,
             "dest_dir": destination,
-            "title_en": args.title_en,
+            "title": args.title_en,
             "imdb_id": args.imdb_id,
             **(
                 {

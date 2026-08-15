@@ -15,7 +15,12 @@ import re
 import sys
 from pathlib import Path, PurePosixPath
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+# Keep the historical top-level ``common``/``naming`` imports available while
+# also making the ``panlib.media_manifest`` package importable.  The organizer
+# is launched as a script, so neither location is on ``sys.path`` by default.
+sys.path.insert(0, str(_REPO_ROOT / "panlib"))
+sys.path.insert(0, str(_REPO_ROOT))
 
 from common import (  # noqa: E402
     AUTH,
@@ -37,19 +42,27 @@ from naming import (  # noqa: E402
     build_folder_name,
     build_movie_filename,
     build_season_filename,
+    build_season_folder_name,
+    build_work_folder_name,
     parse_episodes,
     reject_collisions,
     sanitize,
+    select_movie_title,
+    universe_dir_name,
     validate_imdb_id,
     validate_quality,
     validate_year,
+)
+from panlib.media_manifest import (  # noqa: E402
+    CATEGORY_DIRS,
+    load_media_manifest,
+    manifest_plan_ref,
 )
 
 
 MEDIA_EXTENSIONS = {"mkv", "mp4", "ts", "avi", "iso"}
 # 字幕随正片一起搬入目标目录，命名沿用正片主名以便播放器自动匹配。
 SUBTITLE_EXTENSIONS = {"ass", "srt", "ssa", "sub", "sup", "vtt", "idx"}
-IMAGE_EXTENSIONS = {"jpg"}
 _NOT_FOUND_RE = re.compile(
     r"(?:not[ -]?found|does not exist|no such|errno\s*=?\s*2|目录不存在|文件不存在|路径不存在)",
     re.I,
@@ -156,8 +169,6 @@ def find_source_files(
                 continue
             suffix = PurePosixPath(filename).suffix.lower().lstrip(".")
             supported = MEDIA_EXTENSIONS | SUBTITLE_EXTENSIONS
-            if include_images:
-                supported |= IMAGE_EXTENSIONS
             if suffix not in supported:
                 continue
             full_path = safe_cloud_join(current, filename)
@@ -167,7 +178,7 @@ def find_source_files(
                     "path": full_path,
                     "ext": suffix,
                     "is_subtitle": suffix in SUBTITLE_EXTENSIONS,
-                    "is_image": suffix in IMAGE_EXTENSIONS,
+                    "is_image": False,
                     "fs_id": item.get("fs_id"),
                     "size": item.get("size", 0),
                 }
@@ -175,13 +186,58 @@ def find_source_files(
     return files
 
 
-def validate_arguments(args: argparse.Namespace) -> None:
+def _raw_option_present(raw_argv: list[str], option: str) -> bool:
+    """Return whether an exact long option appeared in the user's argv."""
+
+    return any(
+        token == option or token.startswith(option + "=")
+        for token in raw_argv
+    )
+
+
+def validate_arguments(
+    args: argparse.Namespace, *, raw_argv: list[str] | None = None
+) -> None:
     """Validate deterministic media fields before any cloud query."""
 
+    required = {
+        "target-dir": args.target_dir,
+        "title-en": args.title_en,
+        "imdb-id": args.imdb_id,
+        "quality": args.quality,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError("legacy mode requires: " + ", ".join(missing))
+    if args.mode is None:
+        args.mode = "movie"
+    if args.expected_episodes is not None:
+        if args.mode != "tv":
+            raise ValueError("expected-episodes is valid only for tv mode")
+        season_present = (
+            _raw_option_present(raw_argv, "--season")
+            if raw_argv is not None
+            else args.season is not None
+        )
+        if not season_present:
+            raise ValueError("expected-episodes requires explicit --season")
+    if args.season is None:
+        args.season = 1
+    if args.year is None:
+        args.year = ""
+    if args.production_country:
+        args.title_en = select_movie_title(
+            args.production_country, args.title_zh, args.title_en
+        )
+    elif args.title_zh:
+        raise ValueError("title-zh requires at least one production-country")
     sanitize(args.title_en)
     if not validate_imdb_id(args.imdb_id):
         raise ValueError("imdb_id must match tt followed by 7-8 digits")
-    expected_target_leaf = build_folder_name(args.title_en, args.imdb_id)
+    if args.mode == "movie":
+        expected_target_leaf = build_folder_name(args.title_en, args.imdb_id, args.year)
+    else:
+        expected_target_leaf = build_work_folder_name(args.title_en)
     if PurePosixPath(str(args.target_dir)).name != expected_target_leaf:
         raise ValueError(
             f"target-dir leaf must be the deterministic folder name: {expected_target_leaf}"
@@ -194,32 +250,38 @@ def validate_arguments(args: argparse.Namespace) -> None:
         raise ValueError("season must be a positive integer")
     if args.mode == "tv" and args.episode <= 0:
         raise ValueError("episode must be a positive integer")
+    if args.expected_episodes is not None:
+        if args.expected_episodes <= 0:
+            raise ValueError("expected-episodes must be a positive integer")
     if args.depth <= 0 or args.depth > 8:
         raise ValueError("depth must be between 1 and 8")
 
 
-def _new_name(args: argparse.Namespace, source: dict) -> str:
-    if source.get("is_image"):
-        if args.mode != "movie":
-            raise ValueError("image sidecars are supported only in movie mode")
-        return f"poster.{source['ext']}"
+def _new_name(
+    args: argparse.Namespace,
+    source: dict,
+    *,
+    episode: tuple[int, int] | None = None,
+) -> str:
     if args.mode == "movie":
-        name = build_movie_filename(args.title_en, args.year, args.quality, source["ext"])
+        name = build_movie_filename(
+            args.title_en, args.year, args.quality, source["ext"], args.imdb_id
+        )
     elif args.mode == "season":
         name = build_season_filename(
             args.title_en, args.season, args.imdb_id, args.quality, source["ext"]
         )
     else:
-        episodes = parse_episodes(source["filename"])
-        if not episodes:
+        if episode is None:
             raise ValueError(f"could not parse season/episode from {source['filename']!r}")
-        if len(episodes) != 1:
-            raise ValueError(
-                f"source contains multiple episodes; split before organizing: {source['filename']!r}"
-            )
-        season, episode = episodes[0]
+        season, episode_number = episode
         name = build_episode_filename(
-            args.title_en, season, episode, args.imdb_id, args.quality, source["ext"]
+            args.title_en,
+            season,
+            episode_number,
+            args.imdb_id,
+            args.quality,
+            source["ext"],
         )
     if source.get("is_subtitle"):
         filename = source["filename"].lower()
@@ -235,7 +297,7 @@ def _new_name(args: argparse.Namespace, source: dict) -> str:
     return name
 
 
-def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, list[dict]]:
+def _build_movie_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, list[dict]]:
     source_dir = validate_cloud_path(args.source_dir, settings.bdpan_base)
     target_dir = validate_cloud_path(args.target_dir, settings.bdpan_base)
     if source_dir == target_dir:
@@ -248,7 +310,7 @@ def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, l
     sources = find_source_files(
         source_dir,
         args.depth,
-        include_images=args.mode == "movie",
+        include_images=False,
         settings=settings,
     )
     if not sources:
@@ -297,15 +359,208 @@ def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, l
                 "new_name": new_name,
             }
         )
+        if source["filename"] != new_name:
+            actions.append(
+                {
+                    "action": "rename",
+                    "from": destination_path,
+                    "new_name": new_name,
+                    "old_name": source["filename"],
+                }
+            )
+    return actions, target_exists, sources
+
+
+_NUMERIC_STEM_RE = re.compile(r"^\d{1,2}$")
+
+
+def _episode_mapping(
+    args: argparse.Namespace, sources: list[dict]
+) -> dict[str, tuple[int, int]]:
+    """Resolve one season/episode pair for every TV video and subtitle."""
+
+    videos = [source for source in sources if not source.get("is_subtitle")]
+    subtitles = [source for source in sources if source.get("is_subtitle")]
+    if not videos:
+        raise ValueError("source directory has no video files")
+
+    parsed_videos: dict[str, tuple[int, int]] = {}
+    failed_videos: list[dict] = []
+    numeric_stems: dict[str, list[dict]] = {}
+    for source in videos:
+        episodes = parse_episodes(source["filename"])
+        if len(episodes) == 1:
+            parsed_videos[source["path"]] = episodes[0]
+            continue
+        if len(episodes) > 1:
+            raise ValueError(
+                f"source contains multiple episodes; split before organizing: {source['filename']!r}"
+            )
+        failed_videos.append(source)
+        stem = PurePosixPath(source["filename"]).stem
+        numeric_stems.setdefault(stem, []).append(source)
+
+    if failed_videos:
+        if parsed_videos:
+            raise ValueError("cannot mix parsed SxxEyy and numeric video names")
+        if args.expected_episodes is None:
+            raise ValueError("numeric episode names require --expected-episodes")
+        if not all(_NUMERIC_STEM_RE.fullmatch(stem or "") for stem in numeric_stems):
+            raise ValueError("numeric episode fallback requires pure numeric video stems")
+        values = [int(stem) for stem in numeric_stems for _ in numeric_stems[stem]]
+        expected = args.expected_episodes
+        if len(videos) != expected or sorted(values) != list(range(1, expected + 1)):
+            raise ValueError("numeric episode values must be exactly 1..expected-episodes")
+        if args.season <= 0:
+            raise ValueError("season must be a positive integer")
+        parsed_videos = {
+            source["path"]: (args.season, int(PurePosixPath(source["filename"]).stem))
+            for source in videos
+        }
+
+    mapping = dict(parsed_videos)
+    for source in subtitles:
+        episodes = parse_episodes(source["filename"])
+        if len(episodes) == 1:
+            mapping[source["path"]] = episodes[0]
+            continue
+        if len(episodes) > 1:
+            raise ValueError(
+                f"source contains multiple episodes; split before organizing: {source['filename']!r}"
+            )
+        stem = PurePosixPath(source["filename"]).stem
+        if not _NUMERIC_STEM_RE.fullmatch(stem or ""):
+            raise ValueError(f"could not parse season/episode from {source['filename']!r}")
+        matches = [
+            video
+            for video in videos
+            if PurePosixPath(video["filename"]).stem == stem
+        ]
+        if len(matches) != 1 or matches[0]["path"] not in mapping:
+            raise ValueError(
+                f"numeric subtitle must match exactly one video: {source['filename']!r}"
+            )
+        mapping[source["path"]] = mapping[matches[0]["path"]]
+    return mapping
+
+
+def _build_tv_plan(
+    args: argparse.Namespace, settings
+) -> tuple[list[dict], bool, list[dict]]:
+    source_dir = validate_cloud_path(args.source_dir, settings.bdpan_base)
+    target_dir = validate_cloud_path(args.target_dir, settings.bdpan_base)
+    if source_dir == target_dir:
+        raise ValueError("source-dir and target-dir must be different")
+    if not is_within_cloud_base(source_dir, settings.bdpan_base) or not is_within_cloud_base(
+        target_dir, settings.bdpan_base
+    ):
+        raise ValueError("source and target must stay inside BDPAN_BASE")
+
+    parent_dir = str(PurePosixPath(target_dir).parent)
+    _, parent_exists = _list_target(parent_dir, settings)
+    if not parent_exists:
+        raise ValueError("target-dir parent must already exist")
+    sources = find_source_files(
+        source_dir,
+        args.depth,
+        include_images=False,
+        settings=settings,
+    )
+    if not sources:
+        raise FileNotFoundError(f"source directory has no video files: {source_dir}")
+    _, work_exists = _list_target(target_dir, settings)
+
+    mapping = _episode_mapping(args, sources) if args.mode == "tv" else {}
+    source_names = [source["filename"] for source in sources]
+    try:
+        reject_collisions(source_names)
+    except ValueError as exc:
+        raise ValueError(f"source basename collision: {exc}") from exc
+
+    destinations: dict[int, str] = {}
+    source_destinations: list[tuple[dict, str, str]] = []
+    for source in sources:
+        episode = mapping.get(source["path"]) if args.mode == "tv" else None
+        season = episode[0] if episode else args.season
+        destination = destinations.setdefault(
+            season,
+            safe_cloud_join(target_dir, build_season_folder_name(args.title_en, season)),
+        )
+        source_destinations.append(
+            (source, destination, _new_name(args, source, episode=episode))
+        )
+
+    season_entries: dict[str, tuple[list[dict], bool]] = {}
+    for season, destination in sorted(destinations.items()):
+        season_entries[destination] = _list_target(destination, settings)
+
+    names_by_destination: dict[str, list[str]] = {}
+    for source, destination, new_name in source_destinations:
+        names_by_destination.setdefault(destination, []).append(new_name)
+    final_pairs: set[tuple[str, str]] = set()
+    for destination, planned_names in names_by_destination.items():
+        entries, _ = season_entries[destination]
+        existing_names = {
+            str(item.get("server_filename"))
+            for item in entries
+            if item.get("server_filename")
+        }
+        destination_sources = [
+            source["filename"]
+            for source, target, _ in source_destinations
+            if target == destination
+        ]
+        source_collision = existing_names.intersection(destination_sources)
+        if source_collision:
+            raise ValueError(
+                "target already contains source basename(s): "
+                + ", ".join(sorted(source_collision))
+            )
+        collision = existing_names.intersection(planned_names)
+        if collision:
+            raise ValueError(
+                "target already contains planned filename(s): "
+                + ", ".join(sorted(collision))
+            )
+        for new_name in planned_names:
+            pair = (destination, new_name)
+            if pair in final_pairs:
+                raise ValueError(f"duplicate final destination: {destination}/{new_name}")
+            final_pairs.add(pair)
+
+    actions: list[dict] = []
+    if not work_exists:
+        actions.append({"action": "mkdir", "path": target_dir})
+    for destination in [destinations[season] for season in sorted(destinations)]:
+        if not season_entries[destination][1]:
+            actions.append({"action": "mkdir", "path": destination})
+    for source, destination, new_name in source_destinations:
+        destination_path = safe_cloud_join(destination, source["filename"])
         actions.append(
             {
-                "action": "rename",
-                "from": destination_path,
-                "new_name": new_name,
+                "action": "mv",
+                "from": source["path"],
+                "to": destination,
                 "old_name": source["filename"],
+                "new_name": new_name,
             }
         )
-    return actions, target_exists, sources
+        if source["filename"] != new_name:
+            actions.append(
+                {
+                    "action": "rename",
+                    "from": destination_path,
+                    "new_name": new_name,
+                    "old_name": source["filename"],
+                }
+            )
+    return actions, work_exists, sources
+
+
+def _build_plan(args: argparse.Namespace, settings) -> tuple[list[dict], bool, list[dict]]:
+    if args.mode == "movie":
+        return _build_movie_plan(args, settings)
+    return _build_tv_plan(args, settings)
 
 
 def _run_mutation(action: dict, settings) -> None:
@@ -323,15 +578,19 @@ def _run_mutation(action: dict, settings) -> None:
         raise RuntimeError(err.strip() or out.strip() or f"bdpan {kind} failed")
 
 
-def _fresh_target_entries(target_dir: str, settings) -> list[dict]:
-    entries, exists = _list_target(target_dir, settings)
+def _fresh_target_entries(destination_dir: str, settings) -> list[dict]:
+    entries, exists = _list_target(destination_dir, settings)
     if not exists:
-        raise ValueError("destination conflict: target directory disappeared")
+        raise ValueError("destination conflict: action directory disappeared")
     return entries
 
 
-def _check_destination(action: dict, target_dir: str, settings) -> None:
-    entries = _fresh_target_entries(target_dir, settings)
+def _check_destination(action: dict, settings) -> None:
+    if action["action"] == "mv":
+        destination_dir = action["to"]
+    else:
+        destination_dir = str(PurePosixPath(action["from"]).parent)
+    entries = _fresh_target_entries(destination_dir, settings)
     names = [str(item.get("server_filename")) for item in entries]
     if action["action"] == "mv":
         for candidate in (action["old_name"], action["new_name"]):
@@ -348,20 +607,50 @@ def _check_destination(action: dict, target_dir: str, settings) -> None:
             raise ValueError(f"destination conflict: {new_name}")
 
 
+def _check_source_identity(action: dict, settings) -> None:
+    """Re-read a manifest source basename and bind it to its expected identity."""
+
+    if "expected_size" not in action and "expected_fs_id" not in action:
+        return
+    source_path = PurePosixPath(action["from"])
+    source_parent = str(source_path.parent)
+    entries, exists = _list_target(source_parent, settings)
+    if not exists:
+        raise ValueError(f"source parent disappeared: {source_parent}")
+    matches = [
+        entry
+        for entry in entries
+        if entry.get("server_filename") == action["old_name"]
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"source identity must match exactly once: {action['old_name']}"
+        )
+    source = matches[0]
+    if source.get("isdir"):
+        raise ValueError(f"source must be a regular file: {action['old_name']}")
+    if "expected_size" in action and source.get("size") != action["expected_size"]:
+        raise ValueError(f"source size mismatch: {action['old_name']}")
+    expected_fs_id = action.get("expected_fs_id")
+    actual_fs_id = source.get("fs_id", source.get("fsid"))
+    if expected_fs_id is not None and actual_fs_id != expected_fs_id:
+        raise ValueError(f"source fs_id mismatch: {action['old_name']}")
+
+
 def _execute(
     actions: list[dict],
-    target_dir: str,
     settings,
 ) -> dict:
     completed: list[dict] = []
     for action in actions:
         try:
             if action["action"] == "mkdir":
-                entries, exists = _list_target(target_dir, settings)
+                entries, exists = _list_target(action["path"], settings)
                 if exists:
-                    raise ValueError("destination conflict: target appeared before mkdir")
+                    raise ValueError("destination conflict: action directory appeared before mkdir")
             elif action["action"] in {"mv", "rename"}:
-                _check_destination(action, target_dir, settings)
+                _check_destination(action, settings)
+                _check_source_identity(action, settings)
             _run_mutation(action, settings)
         except Exception as exc:
             raise OperationFailure(action, redact_text(exc), completed) from exc
@@ -370,19 +659,339 @@ def _execute(
     return {"completed": completed}
 
 
+_MANIFEST_LEGACY_FLAGS = {
+    "--mode",
+    "--target-dir",
+    "-t",
+    "--title-en",
+    "--title-zh",
+    "--production-country",
+    "--imdb-id",
+    "--year",
+    "--quality",
+    "--season",
+    "--expected-episodes",
+    "--episode",
+}
+
+
+def _validate_manifest_cli(args: argparse.Namespace, raw_argv: list[str]) -> None:
+    """Validate manifest/legacy option separation before cloud reads."""
+
+    if args.plan_ref is not None and args.manifest_file is None:
+        raise ValueError("plan-ref requires manifest-file")
+    if args.plan_ref is not None and not args.execute:
+        raise ValueError("plan-ref requires --execute")
+    if args.plan_ref is not None and not re.fullmatch(r"[0-9a-f]{64}", args.plan_ref):
+        raise ValueError("plan-ref must be 64 lowercase hexadecimal characters")
+    if args.manifest_file is None:
+        return
+    supplied = []
+    for token in raw_argv:
+        flag = token.split("=", 1)[0]
+        # argparse accepts values attached to a short option (for example,
+        # ``-t/legacy``).  Keep raw-argv validation aligned with that
+        # behavior while not treating unrelated short options as legacy
+        # target-dir input.
+        attached_target = (
+            token.startswith("-t")
+            and not token.startswith("--")
+            and len(token) > 2
+        )
+        legacy_flag = "-t" if attached_target else flag
+        if legacy_flag in _MANIFEST_LEGACY_FLAGS and legacy_flag not in supplied:
+            supplied.append(legacy_flag)
+    if supplied:
+        raise ValueError(
+            "manifest-file is mutually exclusive with legacy option(s): "
+            + ", ".join(supplied)
+        )
+
+
+def _manifest_hierarchy_root(normalized: dict, settings) -> str:
+    library_root = safe_cloud_join(settings.bdpan_base, settings.bdpan_lib)
+    if normalized["universe"] is not None:
+        return safe_cloud_join(
+            library_root,
+            CATEGORY_DIRS["movie"],
+            universe_dir_name(normalized["universe"]),
+        )
+    return safe_cloud_join(library_root, CATEGORY_DIRS[normalized["category"]])
+
+
+def _manifest_directory_chain(target_dir: str, root: str, library_root: str) -> list[str]:
+    try:
+        root_relative = PurePosixPath(root).relative_to(PurePosixPath(library_root))
+    except ValueError as exc:
+        raise ValueError("manifest hierarchy root escapes the configured library") from exc
+    try:
+        relative = PurePosixPath(target_dir).relative_to(PurePosixPath(root))
+    except ValueError as exc:
+        raise ValueError("manifest target escapes its configured hierarchy") from exc
+    if not relative.parts:
+        raise ValueError("manifest target must be an item directory below its hierarchy root")
+    # Include every configured parent from the library root: category (Movies,
+    # TV shows, ...) precedes the optional universe, then collection and item.
+    chain: list[str] = [library_root]
+    current = library_root
+    for part in root_relative.parts + relative.parts:
+        current = safe_cloud_join(current, part)
+        chain.append(current)
+    return chain
+
+
+def _stable_snapshot_entries(entries: list[dict]) -> list[dict]:
+    """Canonicalize target entry order without discarding any identity fields."""
+
+    return sorted(
+        entries,
+        key=lambda entry: json.dumps(
+            entry,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+
+def _manifest_plan(args: argparse.Namespace, settings) -> dict:
+    source_dir = validate_cloud_path(args.source_dir, settings.bdpan_base)
+    sources = find_source_files(
+        source_dir,
+        args.depth,
+        include_images=False,
+        settings=settings,
+    )
+    if not sources:
+        raise FileNotFoundError(f"source directory has no video files: {source_dir}")
+    normalized = load_media_manifest(
+        args.manifest_file,
+        settings=settings,
+        source_dir=source_dir,
+        sources=sources,
+    )
+    root = _manifest_hierarchy_root(normalized, settings)
+    library_root = safe_cloud_join(settings.bdpan_base, settings.bdpan_lib)
+    hierarchy_dirs: list[str] = [library_root]
+    for item in normalized["items"]:
+        for directory in _manifest_directory_chain(item["target_dir"], root, library_root):
+            if directory not in hierarchy_dirs:
+                hierarchy_dirs.append(directory)
+
+    directory_state: dict[str, tuple[list[dict], bool]] = {}
+    for directory in hierarchy_dirs:
+        directory_state[directory] = _list_target(directory, settings)
+
+    source_bindings: dict[tuple[str, str], dict] = {}
+    target_bindings: dict[tuple[str, str], dict] = {}
+    source_names_by_target: dict[str, dict[str, dict]] = {}
+    final_names_by_target: dict[str, dict[str, dict]] = {}
+    for item in normalized["items"]:
+        source_key = (item["target_dir"], PurePosixPath(item["source_path"]).name)
+        if source_key in source_bindings:
+            raise ValueError("duplicate source basename in one target directory")
+        source_bindings[source_key] = item
+        source_names_by_target.setdefault(item["target_dir"], {})[
+            PurePosixPath(item["source_path"]).name
+        ] = item
+        target_key = (item["target_dir"], item["target_name"])
+        if target_key in target_bindings:
+            raise ValueError("duplicate final target in manifest plan")
+        target_bindings[target_key] = item
+        final_names_by_target.setdefault(item["target_dir"], {})[
+            item["target_name"]
+        ] = item
+
+    for destination, source_names in source_names_by_target.items():
+        final_names = final_names_by_target.get(destination, {})
+        for basename in source_names.keys() & final_names.keys():
+            # A source may retain its own basename and therefore omit rename,
+            # but another item's source/final identity would be ambiguous.
+            if source_names[basename]["source_path"] != final_names[basename]["source_path"]:
+                raise ValueError(
+                    "source basename collides with another final filename: "
+                    + basename
+                )
+
+    for item in normalized["items"]:
+        entries, exists = directory_state[item["target_dir"]]
+        if not exists:
+            continue
+        existing_names = {
+            str(entry.get("server_filename"))
+            for entry in entries
+            if entry.get("server_filename")
+        }
+        source_name = PurePosixPath(item["source_path"]).name
+        if source_name in existing_names:
+            raise ValueError(f"target already contains source basename: {source_name}")
+        if item["target_name"] in existing_names:
+            raise ValueError(f"target already contains final filename: {item['target_name']}")
+
+    actions: list[dict] = []
+    for directory in hierarchy_dirs:
+        if not directory_state[directory][1]:
+            actions.append({"action": "mkdir", "path": directory})
+    for item in normalized["items"]:
+        source_path = item["source_path"]
+        source_name = PurePosixPath(source_path).name
+        destination = item["target_dir"]
+        actions.append(
+            {
+                "action": "mv",
+                "from": source_path,
+                "to": destination,
+                "old_name": source_name,
+                "new_name": item["target_name"],
+                "expected_fs_id": item["fs_id"],
+                "expected_size": item["size"],
+            }
+        )
+        if source_name != item["target_name"]:
+            actions.append(
+                {
+                    "action": "rename",
+                    "from": safe_cloud_join(destination, source_name),
+                    "new_name": item["target_name"],
+                    "old_name": source_name,
+                    "expected_fs_id": item["fs_id"],
+                    "expected_size": item["size"],
+                }
+            )
+
+    source_snapshot = [
+        {
+            "path": source["path"],
+            "fs_id": source.get("fs_id"),
+            "size": source.get("size", 0),
+        }
+        for source in sources
+    ]
+    target_snapshot = [
+        {
+            "path": directory,
+            "exists": exists,
+            "entries": _stable_snapshot_entries(entries),
+        }
+        for directory, (entries, exists) in directory_state.items()
+    ]
+    plan_ref = manifest_plan_ref(
+        normalized,
+        {"sources": source_snapshot, "targets": target_snapshot},
+    )
+    return {
+        "source_dir": source_dir,
+        "normalized": normalized,
+        "actions": actions,
+        "plan_ref": plan_ref,
+        "directory_state": directory_state,
+        "sources": sources,
+    }
+
+
+def _manifest_data(plan: dict, *, executed: bool) -> dict:
+    normalized = plan["normalized"]
+    return {
+        "source_dir": plan["source_dir"],
+        "category": normalized["category"],
+        "universe": normalized["universe"],
+        "collection": normalized["collection"],
+        "normalized_manifest": normalized,
+        "targets": [
+            {
+                "target_dir": item["target_dir"],
+                "target_name": item["target_name"],
+            }
+            for item in normalized["items"]
+        ],
+        "actions": plan["actions"],
+        "plan_ref": plan["plan_ref"],
+        "execute_required": True,
+        "executed": executed,
+        "source_count": len(normalized["items"]),
+    }
+
+
+def _verify_manifest_postcondition(plan: dict, settings) -> dict:
+    target_results: list[dict] = []
+    source_parents: dict[str, tuple[list[dict], bool]] = {}
+    for item in plan["normalized"]["items"]:
+        entries, exists = _list_target(item["target_dir"], settings)
+        if not exists:
+            raise ValueError(f"target directory missing after execution: {item['target_dir']}")
+        matches = [
+            entry
+            for entry in entries
+            if entry.get("server_filename") == item["target_name"]
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"target filename must exist exactly once: {item['target_name']}"
+            )
+        target = matches[0]
+        if target.get("isdir"):
+            raise ValueError(f"target must be a regular file: {item['target_name']}")
+        if target.get("size") != item["size"]:
+            raise ValueError(f"target size mismatch: {item['target_name']}")
+        if item["fs_id"] is not None and target.get("fs_id") != item["fs_id"]:
+            raise ValueError(f"target fs_id mismatch: {item['target_name']}")
+        target_results.append(
+            {
+                "target_dir": item["target_dir"],
+                "target_name": item["target_name"],
+                "fs_id": target.get("fs_id"),
+                "size": target.get("size"),
+            }
+        )
+
+        source_path = PurePosixPath(item["source_path"])
+        source_parent = str(source_path.parent)
+        if source_parent not in source_parents:
+            source_parents[source_parent] = _list_target(source_parent, settings)
+        source_entries, source_exists = source_parents[source_parent]
+        if source_exists and any(
+            entry.get("server_filename") == source_path.name
+            for entry in source_entries
+        ):
+            raise ValueError(f"source path still exists after execution: {item['source_path']}")
+
+    return {
+        "status": "verified",
+        "targets": target_results,
+        "sources_absent": [item["source_path"] for item in plan["normalized"]["items"]],
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="把转存后的源文件整理成规范命名（默认只生成计划）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     parser.add_argument("--source-dir", "-s", required=True, help="转存后的源目录")
-    parser.add_argument("--target-dir", "-t", required=True, help="整理后的目标目录")
-    parser.add_argument("--title-en", required=True, help="英文名/中文名")
-    parser.add_argument("--imdb-id", required=True, help="IMDB ID")
-    parser.add_argument("--year", default="", help="年份")
-    parser.add_argument("--quality", required=True, help="清晰度（1080p/2160p 等）")
-    parser.add_argument("--mode", choices=["movie", "tv", "season"], default="movie")
-    parser.add_argument("--season", type=int, default=1, help="季（tv/season 模式）")
+    parser.add_argument("--target-dir", "-t", default=None, help="整理后的目标目录")
+    parser.add_argument("--title-en", default=None, help="英文正式片名；兼容旧调用，国产片请同时提供 --title-zh 与 --production-country")
+    parser.add_argument("--title-zh", default="", help="中文正式片名（国产片必填）")
+    parser.add_argument(
+        "--production-country",
+        action="append",
+        default=[],
+        help="制片国家/地区，可重复；包含 China/中国时自动选中文片名",
+    )
+    parser.add_argument("--imdb-id", default=None, help="IMDB ID")
+    parser.add_argument("--year", default=None, help="年份")
+    parser.add_argument("--quality", default=None, help="清晰度（1080p/2160p 等）")
+    parser.add_argument("--mode", choices=["movie", "tv", "season"], default=None)
+    parser.add_argument("--season", type=int, default=None, help="季（tv/season 模式）")
+    parser.add_argument(
+        "--expected-episodes",
+        type=int,
+        default=None,
+        help="纯数字剧集回退时的严格集数（仅 tv 模式）",
+    )
+    parser.add_argument("--manifest-file", default=None, help="严格媒体 manifest JSON 文件")
+    parser.add_argument("--plan-ref", default=None, help="manifest 计划指纹（仅执行时使用）")
     parser.add_argument("--episode", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--depth", type=int, default=2, help="源目录递归深度（1-8）")
     parser.add_argument("--execute", action="store_true", help="确认后执行云盘写操作")
@@ -393,19 +1002,90 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = _parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = _parser().parse_args(raw_argv)
     if args.remove_empty_source:
         emit_error(
             INVALID_ARG,
             "source deletion is disabled; use panlib-library archive for manual-review cleanup",
         )
     try:
-        validate_arguments(args)
+        _validate_manifest_cli(args, raw_argv)
         settings = load_settings()
+        if args.manifest_file is not None:
+            execute = bool(args.execute and not args.dry_run)
+            if args.execute and args.plan_ref is None:
+                raise ValueError("manifest execute requires --plan-ref")
+            plan = _manifest_plan(args, settings)
+            if execute and args.plan_ref != plan["plan_ref"]:
+                raise ValueError("manifest plan-ref does not match the current plan")
+            if not execute:
+                emit_success(
+                    _manifest_data(plan, executed=False),
+                    meta={"mode": "plan-only", "manifest": True},
+                )
+            try:
+                result = _execute(plan["actions"], settings)
+            except OperationFailure as exc:
+                emit_error(
+                    _error_code(str(exc)),
+                    str(exc),
+                    {"failed_action": exc.action, "completed": exc.completed},
+                )
+            try:
+                postcondition = _verify_manifest_postcondition(plan, settings)
+            except Exception as exc:
+                message = redact_text(exc)
+                emit_error(
+                    NOT_FOUND if _looks_missing(message) else _error_code(message),
+                    message,
+                    {
+                        "failed_action": {"action": "postcondition"},
+                        "completed": result["completed"],
+                        "postcondition": {"status": "unverified"},
+                    },
+                )
+            emit_success(
+                {
+                    **_manifest_data(plan, executed=True),
+                    **result,
+                    "postcondition": postcondition,
+                },
+                meta={"mode": "executed", "manifest": True},
+            )
+
+        if args.mode is None:
+            args.mode = "movie"
+        validate_arguments(args, raw_argv=raw_argv)
         # Path validation happens before the first read-capable bdpan call.
+        settings = load_settings()
         validate_cloud_path(args.source_dir, settings.bdpan_base)
         validate_cloud_path(args.target_dir, settings.bdpan_base)
         actions, target_exists, sources = _build_plan(args, settings)
+        execute = bool(args.execute and not args.dry_run)
+        data = {
+            "source_dir": validate_cloud_path(args.source_dir, settings.bdpan_base),
+            "target_dir": validate_cloud_path(args.target_dir, settings.bdpan_base),
+            "actions": actions,
+            "execute_required": True,
+            "executed": execute,
+            "source_count": len(sources),
+        }
+        if not execute:
+            emit_success(data, meta={"mode": "plan-only", "target_exists": target_exists})
+
+        try:
+            result = _execute(actions, settings)
+        except OperationFailure as exc:
+            emit_error(
+                _error_code(str(exc)),
+                str(exc),
+                {"failed_action": exc.action, "completed": exc.completed},
+            )
+        emit_success(
+            {**data, **result},
+            meta={"mode": "executed", "target_exists": target_exists},
+        )
     except FileNotFoundError as exc:
         emit_error(NOT_FOUND, str(exc))
     except (TypeError, ValueError) as exc:
@@ -413,35 +1093,6 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:
         message = redact_text(exc)
         emit_error(NOT_FOUND if _looks_missing(message) else _error_code(message), message)
-
-    execute = bool(args.execute and not args.dry_run)
-    data = {
-        "source_dir": validate_cloud_path(args.source_dir, settings.bdpan_base),
-        "target_dir": validate_cloud_path(args.target_dir, settings.bdpan_base),
-        "actions": actions,
-        "execute_required": True,
-        "executed": execute,
-        "source_count": len(sources),
-    }
-    if not execute:
-        emit_success(data, meta={"mode": "plan-only", "target_exists": target_exists})
-
-    try:
-        result = _execute(
-            actions,
-            data["target_dir"],
-            settings,
-        )
-    except OperationFailure as exc:
-        emit_error(
-            _error_code(str(exc)),
-            str(exc),
-            {"failed_action": exc.action, "completed": exc.completed},
-        )
-    emit_success(
-        {**data, **result},
-        meta={"mode": "executed", "target_exists": target_exists},
-    )
 
 
 if __name__ == "__main__":
