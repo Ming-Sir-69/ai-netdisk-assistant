@@ -429,6 +429,41 @@ def run_seedhub(
     return None
 
 
+def decode_bdpan_ls(out: str, directory: str) -> tuple[list[dict], bool]:
+    """Decode ``bdpan ls --json`` output into ``(child_entries, exists)``.
+
+    实测真实行为（2026-08-16 沙盒验证）：
+
+    - 目录存在且有内容：返回子项列表，每项带完整 ``path``。
+    - 目录存在但为空：返回一个**只含该目录自身**的列表（其 ``path`` 等于被查询
+      目录）。必须把这个自身条目过滤掉，否则调用方会把它当成子目录并递归进
+      一个不存在的路径，最终报成 NETWORK 错误。
+    - 目录不存在：返回 ``{"code":1,"data":null,"error":"目录不存在"}``，
+      而退出码仍是 0，因此不能只靠退出码判断。
+    """
+
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
+    if isinstance(result, dict):
+        error_text = str(result.get("error") or "")
+        if result.get("code"):
+            if re.search(r"(?i)not found|no such|不存在", error_text):
+                return [], False
+            raise RuntimeError(error_text or "bdpan ls returned an error object")
+        raise RuntimeError("bdpan ls returned an unexpected object")
+    if not isinstance(result, list):
+        raise RuntimeError("bdpan ls returned a non-list result")
+    own = str(PurePosixPath(directory))
+    entries = [
+        item
+        for item in result
+        if isinstance(item, dict) and str(item.get("path") or "") != own
+    ]
+    return entries, True
+
+
 def run_bdpan(
     args: list[str],
     timeout: int | None = None,

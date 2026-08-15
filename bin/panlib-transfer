@@ -29,6 +29,7 @@ from common import (  # noqa: E402
     emit_success,
     load_settings,
     redact_text,
+    decode_bdpan_ls,
     run_bdpan,
     run_subprocess,
     safe_cloud_join,
@@ -518,12 +519,10 @@ def _list_dest(path: str, settings) -> list[dict]:
     if code != 0:
         raise RuntimeError(err.strip() or out.strip() or "bdpan ls failed")
     try:
-        result = json.loads(out)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
-    if not isinstance(result, list):
-        raise RuntimeError("bdpan ls returned a non-list result")
-    return [item for item in result if isinstance(item, dict)]
+        entries, _exists = decode_bdpan_ls(out, path)
+    except RuntimeError:
+        raise
+    return entries
 
 
 def _error_code(message: str) -> str:

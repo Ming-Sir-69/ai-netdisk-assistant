@@ -145,7 +145,19 @@ def _main(argv: list[str]) -> int:
                 return 20
             sys.stderr.write(f"not found: {path}\n")
             return 3
-        sys.stdout.write(json.dumps(state["entries"].get(path, []), ensure_ascii=False))
+        # 真实 bdpan 列一个「存在但为空」的目录时，返回的是**该目录自身**
+        # 的单条记录（path 等于被查询目录），不是空数组。假网盘必须忠于
+        # 这一点，否则调用方把自身条目当子目录递归的 bug 永远测不出来
+        # （2026-08-16 沙盒实测）。
+        listing = state["entries"].get(path, [])
+        if not listing:
+            listing = [{
+                "path": path,
+                "server_filename": PurePosixPath(path).name,
+                "isdir": True,
+                "size": 0,
+            }]
+        sys.stdout.write(json.dumps(listing, ensure_ascii=False))
         trigger = os.environ.get("BDPAN_FAKE_INJECT_AFTER_LS", "")
         try:
             should_inject = int(trigger) == ls_count
@@ -223,6 +235,21 @@ def _main(argv: list[str]) -> int:
             sys.stderr.write(f"destination conflict: {new_name}\n")
             return 17
         entry["server_filename"] = new_name
+    elif command == "cp":
+        source, destination = _path(argv[1]), _path(argv[2])
+        found = _find_entry(state, source)
+        if found is None:
+            sys.stderr.write(f"not found: {source}\n")
+            return 3
+        if destination not in state["directories"] and destination not in state["entries"]:
+            sys.stderr.write(f"not a directory: {destination}\n")
+            return 20
+        source_name = PurePosixPath(source).name
+        if any(_entry_name(item) == source_name for item in state["entries"].get(destination, [])):
+            sys.stderr.write(f"destination conflict: {source_name}\n")
+            return 17
+        # cp 保留源条目，只在目标目录追加一份副本
+        state["entries"].setdefault(destination, []).append(dict(found[1]))
     elif command == "rm":
         target = _path(argv[-1])
         if state["entries"].get(target):

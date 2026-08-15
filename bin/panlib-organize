@@ -33,6 +33,7 @@ from common import (  # noqa: E402
     is_within_cloud_base,
     load_settings,
     redact_text,
+    decode_bdpan_ls,
     run_bdpan,
     safe_cloud_join,
     validate_cloud_path,
@@ -106,13 +107,10 @@ def list_dir(path: str, depth: int = 2, *, settings=None) -> list[dict]:
         if "not a directory" in message.lower():
             raise ValueError(message)
         raise RuntimeError(message)
-    try:
-        result = json.loads(out)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
-    if not isinstance(result, list):
-        raise RuntimeError("bdpan ls returned a non-list result")
-    return [item for item in result if isinstance(item, dict)]
+    entries, exists = decode_bdpan_ls(out, path)
+    if not exists:
+        raise RuntimeError(f"bdpan ls could not find {path}")
+    return entries
 
 
 def _list_target(path: str, settings) -> tuple[list[dict], bool]:
@@ -128,22 +126,7 @@ def _list_target(path: str, settings) -> tuple[list[dict], bool]:
         if _looks_missing(message):
             return [], False
         raise RuntimeError(message)
-    try:
-        result = json.loads(out)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"bdpan ls returned invalid JSON: {exc}") from exc
-    if not isinstance(result, list):
-        # bdpan 对"目录不存在"返回 exit 0 + {"code":1,"data":null,"error":"目录不存在"}
-        # 而不是非零退出码。显式识别这种形态并当作 missing 处理，
-        # 否则目标目录尚不存在的正常场景会被误判为 NETWORK 错误。
-        if isinstance(result, dict):
-            error_text = str(result.get("error") or "")
-            if result.get("code") and _looks_missing(error_text):
-                return [], False
-            if result.get("code"):
-                raise RuntimeError(error_text or "bdpan ls returned an error object")
-        raise RuntimeError("bdpan ls returned a non-list result")
-    return [item for item in result if isinstance(item, dict)], True
+    return decode_bdpan_ls(out, path)
 
 
 def find_source_files(
