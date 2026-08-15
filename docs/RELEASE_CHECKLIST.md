@@ -17,7 +17,8 @@
 - [ ] bootstrap/login/doctor 只读或 fake 验收通过，不输出账号正文。
 - [ ] SeedHub 离线 fixture 只包含 `.example` 保留域名和假提取码。
 - [ ] transfer/organize 默认 plan-only，写前冲突和写后状态测试通过。
-- [ ] organize sidecar 验收通过：SUP 简繁字幕分别得到 `.zh-Hans`/`.zh-Hant`，电影海报得到 `poster.jpg`；`--remove-empty-source` 返回 `INVALID_ARG` 且不调用 rm。
+- [ ] organize 素材验收通过：SUP 简繁字幕分别得到 `.zh-Hans`/`.zh-Hant`；所有图片、NFO/TXT/PDF 都不进入目标；`--remove-empty-source` 返回 `INVALID_ARG` 且不调用 rm。
+- [ ] `./scripts/preflight.sh` 在宿主完全访问下返回 `ready`，受限环境返回 `blocked`。
 - [ ] macOS `panlib-library` 的 Keychain 读取、官方 SDK bridge、list/search/meta 只读测试通过；
       `archive` 只发 `file_move(async=0,ondup=fail)`，plan_ref、写前重检和写后验收测试通过。
 - [ ] 可替换凭证接口测试通过：`external-command` 仅接受绝对可执行路径、`shell=False`、

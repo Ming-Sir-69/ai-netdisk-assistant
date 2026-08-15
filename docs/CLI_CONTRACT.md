@@ -28,7 +28,8 @@
 | `panlib-library list` | `--path` 绝对云端目录 | 是 | 无 |
 | `panlib-library search` | `--keyword`, 可选 `--path`/`--dir` | 是 | 无 |
 | `panlib-library meta` | `--path` 或 `--fsid` | 是 | 无 |
-| `panlib-library archive` | `--source`, `--archive-dir`, 可选 `--new-name` | 是 | `--execute --plan-ref` |
+| `panlib-library archive` | `--source`, 可选 `--archive-dir`/`--new-name` | 是 | `--execute --plan-ref` |
+| `panlib-library migrate` | `--source`, `--target-dir`, `--new-name` | 是 | `--execute --plan-ref` |
 
 `--fixture-dir` 是测试专用的显式离线 seam，在正常 Agent 调用中不使用。`--episode` 与 `--dry-run` 仅保留旧调用兼容性，已从公开 help 隐藏；TV 季集号从源文件名解析。
 
@@ -61,11 +62,74 @@
 2. 需要时创建目标目录。
 3. 每个文件在 `mv` 前重检中间同名，在 `rename` 前重检最终同名。
 4. 第一个失败立即停止，返回已完成动作。
-5. `.ass/.srt/.ssa/.sub/.sup/.vtt/.idx` 字幕随正片移动；简体/繁体标记分别规范为
-   `.zh-Hans`/`.zh-Hant`，电影 `.jpg` 海报统一为 `poster.jpg`。
+5. `.ass/.srt/.ssa/.sub/.sup/.vtt/.idx` 外挂字幕随正片移动；简体/繁体标记分别规范为
+   `.zh-Hans`/`.zh-Hant`。电影整理不接收任何图片、海报、剧照、NFO、TXT、PDF
+   或阅读说明文件；它们不出现在 organize actions 中。
 6. 默认保留源目录；旧版或空残留目录另通过 `panlib-library archive` 生成移动计划。
 
-`target-dir` 的叶子名必须精确等于 naming 模块生成的 `{Name}.{imdb-ttXXXXXXX}`；任意自定义叶子名在第一次 bdpan 读取前被拒绝。
+### 统一影视命名契约
+
+电影、剧集、动漫、纪录片、网剧及配置新增的所有影视类型使用同一决策模型：**类别提供默认类型根目录，
+宇宙和系列决定可选父层，形态只决定内容单元和文件名模板**。`category` 选择 `Movies`、
+`TV shows`、`动漫`、`Documentary`、`网剧` 或显式配置根；`layout` 只能是
+`single`、`episode`、`season` 之一。
+`/我的资源/<类型目录>/...` 与 `/apps/bdpan/片库/<类型目录>/...` 使用相同相对结构。
+
+通用路径公式为 `类别根 / [分组节点 × 任意层] / 内容节点 / 文件`。标准化字段为：
+
+```json
+{
+  "category": "movie | tv | anime | documentary | webdrama | configured",
+  "layout": "single | episode | season",
+  "groups": ["最外层分组名", "…", "最内层分组名"],
+  "item": "内容单元目录名",
+  "canonical_title": "内容规范名",
+  "year": "YYYY",
+  "media_id": "ttXXXXXXX",
+  "season": null,
+  "episode": null,
+  "quality": "2160p",
+  "extension": "mkv"
+}
+```
+
+`groups` 按从外到内的顺序列出每一层分组节点名，**层数不限、无封闭名单**。分组节点以
+`.{series}` 结尾；不带该后缀的是内容节点，其中只放媒体文件与外挂字幕。没有分组时传空数组。
+CLI 根据 `--production-country`、`--title-zh`、`--title-en` 选出**内容规范名**：中国制作选中文，
+非中国制作选英文，所有类别执行同一规则。
+
+- `single`：内容单元 `{内容规范名}.{年份}.{IMDb ID}`；主媒体文件
+  `{内容规范名}.{年份}.{清晰度}.{扩展名}`。
+- `episode`：内容单元 `{作品规范名}.Sxx`；主媒体文件
+  `{内容规范名}.SxxExx.{imdb-IMDb ID}.{清晰度}.{扩展名}`。
+- `season`：内容单元同 `episode`；主媒体文件
+  `{内容规范名}.Sxx.{imdb-IMDb ID}.{清晰度}.{扩展名}`。
+- 外挂字幕与主媒体文件同主名，仅在扩展名前增加可确定的语言标签。
+- Loki 使用 `TV shows/Loki.{series}/Loki.S01/` 与 `TV shows/Loki.{series}/Loki.S02/`，
+  即 `Loki.{series}/Loki.S01`、`Loki.{series}/Loki.S02`；剧集一律进 `TV shows/`。
+  同一层级规则适用于所有影视类型。
+
+#### manifest v1 与严格身份
+
+分组节点没有封闭名单，`groups` 数组的每一项都按普通分组名校验。中国制作使用中文正式片名，
+非中国制作使用英文正式片名。字面例子：`The Batman.2022/` 内为
+`The Batman.2022.{imdb-tt1874999}.1080p.mkv`；`Loki.{series}/Loki.S01/` 内的单集为
+`Loki.S01E01.{imdb-tt1286039}.1080p.mkv`，整季文件为
+`Loki.S02.{imdb-tt1286039}.1080p.mkv`。
+
+新的多条目或拆分目录使用 **manifest v1**。每个 item 至少保留并校验精确
+`source_path`、可用 `fs_id`、`size`、`layout`、规范标题、年份/季集、IMDb 和清晰度；文件名不能确定电影身份。
+`--manifest-file PATH` 的 plan-only 返回 `plan_ref`；执行必须使用相同 manifest、精确 `--plan-ref HASH`
+并在第一次写入前重新读取源/目标。现有平铺目录不静默重排，必须先生成新的 manifest 或 legacy hierarchical plan，
+再按正常 postcondition 验收。
+
+纯数字集名只允许 `--expected-episodes N` 严格契约：视频 stem 必须完整覆盖 `1..N`、季号必须明确、
+不得混入已解析集号；CLI 不按文件顺序猜测季号或集号。用户普通更新/整理请求是端到端任务，不可停在
+`plan-only`；任一计划或执行返回失败或 `partial`，先重新读取当前状态并生成新计划，不能跳过后续整理或归档。
+本契约不引入覆盖、删除、自动重试或自动回滚，也不允许直接调用 `bdpan`。
+
+`target-dir` 叶子名和文件名必须精确符合相应模板；任意自定义叶子名在第一次 bdpan 读取前被拒绝。
+`episode` 缺少季号或集号、`season` 缺少季号、类别根未配置或身份不唯一时返回 `INVALID_ARG`。
 
 `partial` 是发布/上层验收标签，不是 CLI 字段。organize 失败且 `error.details.completed` 非空，表示已产生部分副作用。
 
@@ -117,10 +181,20 @@ JSON stdout。进程使用 `shell=False`、超时与输入/输出大小上限；
 - `search` 调用 `file_keyword_search(dir=<path>,key=<keyword>,page=1,num=100)`；`--path`
   与 `--dir` 等价，默认 `/`。
 - `meta` 只接受 `--path` 或 `--fsid` 其中一个。
-- `archive` 默认 plan-only，要求绝对精确源和归档目录；执行时必须回传 `plan_ref`。写前
+- `archive` 默认 plan-only，要求绝对精确源；`--archive-dir` 可选，省略时由 `--source` 自动推导
+  同根归档目录。`/我的资源/...` 固定映射到 `/我的资源/_已归档_待删除`，
+  `/apps/bdpan/片库/...` 固定映射到 `/apps/bdpan/片库/_已归档_待删除`；显式传入跨根路径
+  返回 `INVALID_ARG`。执行时必须回传 `plan_ref`。写前
   再读源/目标并拒绝目标冲突，唯一写请求必须是
   `file_move(async=0,ondup=fail,filelist=[{path,dest,newname}])`。写后重读父目录和归档目录，
   只有源路径消失、目标名称唯一存在才返回 `postcondition.status=verified`。
+- `migrate` 是唯一允许的**受限跨根迁移**：`--source` 必须是 `/我的资源/Movies` 下的精确媒体文件，
+  `--target-dir` 必须是 `/apps/bdpan/片库/Movies` 下的规范电影容器，`--new-name` 为单个目标文件名。
+  计划不写入；执行必须带回 `plan_ref`，仅在容器缺失时先 `make_dir(rtype=0)`；容器已存在时只能
+  追加一个不重名媒体文件，再
+  `file_move(async=0,ondup=fail,filelist=[{path,dest,newname}])`，最后验证源消失且目标唯一。
+  不移动目录、不覆盖、不删除，**不得开放任意全盘移动**；已整理目录由上层逐项迁移媒体文件，
+  残留目录仍使用同根 `archive`。
 - 不提供 `file_delete`/`delete`；归档目录由用户人工审核后手动删除。任何网络、权限、
   过期或验收失败均停止，不自动重试。
 
