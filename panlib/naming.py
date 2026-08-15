@@ -422,6 +422,29 @@ def is_series_folder(name: str) -> bool:
     return isinstance(name, str) and name.rstrip("/").endswith(_SERIES_MARKER)
 
 
+# --- 递归分组模型（2026-08-15 起） -------------------------------------------
+#
+# 层级不再写死为「类型根/宇宙/作品系列/内容单元」。目录名以 ``{series}`` 结尾
+# 即分组节点，可无限嵌套；不带该后缀的是内容节点，其中只放文件。判定是纯字符
+# 串比较，因此不依赖任何封闭名单——漫威、DC 与任何其它聚合一视同仁。
+
+group_folder_name = series_folder_name
+is_group_folder = is_series_folder
+
+
+def build_group_relative_path(groups: Iterable[str]) -> str:
+    """Join group names into a relative path, outermost first.
+
+    深度不设上限：`["Marvel", "Spider-Man", "Spider-Man.Tobey"]` 会得到
+    `Marvel.{series}/Spider-Man.{series}/Spider-Man.Tobey.{series}`。
+    没有分组时返回空串，调用方直接把内容节点挂在类别根下。
+    每一段都过 :func:`sanitize`，因此路径分隔符、遍历与空段会被拒绝。
+    """
+
+    segments = [group_folder_name(group) for group in groups]
+    return "/".join(segments)
+
+
 def shared_main_title(title_en: str, known_main_titles: Iterable[str] | None = None) -> str:
     """Best-effort extraction of the shared main title for series grouping.
 
@@ -457,7 +480,10 @@ def shared_main_title(title_en: str, known_main_titles: Iterable[str] | None = N
 # 有没有清晰度段都算，避免占位清晰度或缺失清晰度被误判为“待整理”而重复调整。
 # ---------------------------------------------------------------------------
 
-_NORMALIZED_IMDB_RE = re.compile(r"\{imdb-tt\d{7,8}\}")
+# 无 IMDB 编号统一写 ``{imdb-none}``（铭哥 2026-08-15 定，取代旧的「省略该段」）。
+# 占位符必须恰好是 none：任意其它文字（tbd/unknown/空）都不算已规范，
+# 否则「确认没有编号」和「漏写了」又会重新混为一谈。
+_NORMALIZED_IMDB_RE = re.compile(r"\{imdb-(?:tt\d{7,8}|none)\}")
 
 
 def _media_extension_of(name: str) -> str | None:

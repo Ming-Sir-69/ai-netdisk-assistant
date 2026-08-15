@@ -24,7 +24,7 @@ from .naming import (
     build_work_folder_name,
     normalize_movie_title,
     normalize_quality,
-    universe_dir_name,
+    group_folder_name,
     validate_extension,
     validate_imdb_id,
     validate_quality,
@@ -41,7 +41,7 @@ CATEGORY_DIRS = {
     "webdrama": "网剧",
 }
 
-_MANIFEST_KEYS = {"version", "category", "universe", "collection", "items"}
+_MANIFEST_KEYS = {"version", "category", "groups", "items"}
 _ITEM_KEYS = {
     "source_path",
     "fs_id",
@@ -174,7 +174,7 @@ def _format_keys(keys: set[object]) -> str:
     return ", ".join(sorted((str(key) for key in keys)))
 
 
-def _normalise_top_level(payload: dict[str, Any]) -> tuple[int, str, str | None, str | None, list[Any]]:
+def _normalise_top_level(payload: dict[str, Any]) -> tuple[int, str, list[str], list[Any]]:
     unknown = set(payload) - _MANIFEST_KEYS
     if unknown:
         _fail("manifest contains unknown top-level key(s): " + _format_keys(unknown))
@@ -187,21 +187,25 @@ def _normalise_top_level(payload: dict[str, Any]) -> tuple[int, str, str | None,
     if category not in CATEGORY_DIRS:
         _fail(f"unsupported category: {category}")
 
-    universe_value = payload.get("universe")
-    if universe_value is not None:
-        universe_value = _required_text(universe_value, "universe")
-        # The naming primitive is the single source of truth for supported
-        # universe keys and also validates the canonical directory mapping.
-        universe_dir_name(universe_value)
-
-    collection_value = _optional_text(payload.get("collection"), "collection")
-    if collection_value is not None:
-        collection_value = build_work_folder_name(collection_value)
+    # 分组层没有封闭名单：按从外到内的顺序声明即可，层数不限。
+    # 每一段都过命名原语校验，因此路径分隔符、遍历和空段会被拒绝。
+    raw_groups = payload.get("groups", [])
+    if raw_groups is None:
+        raw_groups = []
+    if not isinstance(raw_groups, list):
+        _fail("groups must be a list of group names, outermost first")
+    groups: list[str] = []
+    for index, value in enumerate(raw_groups):
+        name = _required_text(value, f"groups[{index}]")
+        try:
+            groups.append(group_folder_name(name))
+        except ValueError as exc:
+            _fail(f"groups[{index}] is not a valid group name: {exc}")
 
     items = payload.get("items")
     if not isinstance(items, list) or not items:
         _fail("items must be a non-empty list")
-    return 1, category, universe_value, collection_value, items
+    return 1, category, groups, items
 
 
 def _normalise_item(
@@ -211,8 +215,7 @@ def _normalise_item(
     source_root: PurePosixPath,
     discovered: dict[str, list[Mapping[str, Any]]],
     category: str,
-    universe: str | None,
-    collection: str | None,
+    groups: list[str],
 ) -> dict[str, Any]:
     if not isinstance(raw_item, dict):
         _fail("each manifest item must be an object")
@@ -311,32 +314,24 @@ def _normalise_item(
 
     extension = _derive_extension(source_path)
 
-    if universe is not None:
-        root = safe_cloud_join(
-            settings.bdpan_base,
-            settings.bdpan_lib,
-            CATEGORY_DIRS["movie"],
-            universe_dir_name(universe),
-        )
-    else:
-        root = safe_cloud_join(
-            settings.bdpan_base,
-            settings.bdpan_lib,
-            CATEGORY_DIRS[category],
-        )
+    # 类别根始终生效：分组不再覆盖它，因此剧集不会被分组带进 Movies。
+    root = safe_cloud_join(
+        settings.bdpan_base,
+        settings.bdpan_lib,
+        CATEGORY_DIRS[category],
+    )
 
-    parent_parts: list[str] = [root]
+    parent_parts: list[str] = [root, *groups]
     if layout == "single":
-        if collection is not None:
-            parent_parts.append(collection)
         item_dir_name = build_folder_name(canonical_title, imdb_id, year)
         target_dir = safe_cloud_join(*parent_parts, item_dir_name)
         target_name = build_movie_filename(
             canonical_title, year, quality, extension, imdb_id
         )
     else:
-        work_name = collection or build_work_folder_name(canonical_title)
-        parent_parts.append(work_name)
+        # 分季内容天然会增长，所以一律有作品分组层；未显式声明时按作品名建立。
+        if not groups:
+            parent_parts.append(group_folder_name(canonical_title))
         item_dir_name = build_season_folder_name(canonical_title, season)
         target_dir = safe_cloud_join(*parent_parts, item_dir_name)
         if layout == "episode":
@@ -385,7 +380,7 @@ def normalize_media_manifest(
 
     if not isinstance(payload, dict):
         _fail("manifest must be one JSON object")
-    _, category, universe, collection, raw_items = _normalise_top_level(payload)
+    _, category, groups, raw_items = _normalise_top_level(payload)
     _, source_root = _validate_source_dir(source_dir, settings)
     discovered = _validated_sources(sources, base=settings.bdpan_base)
 
@@ -401,8 +396,7 @@ def normalize_media_manifest(
             source_root=source_root,
             discovered=discovered,
             category=category,
-            universe=universe,
-            collection=collection,
+            groups=groups,
         )
         source_path = item["source_path"]
         if source_path in source_paths:
@@ -417,8 +411,7 @@ def normalize_media_manifest(
     return {
         "version": 1,
         "category": category,
-        "universe": universe,
-        "collection": collection,
+        "groups": groups,
         "items": normalized_items,
     }
 

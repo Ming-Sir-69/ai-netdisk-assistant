@@ -174,5 +174,93 @@ class HierarchicalNamingTests(unittest.TestCase):
         )
 
 
+class RecursiveGroupNamingTests(unittest.TestCase):
+    """递归分组契约（2026-08-15 起）：`.{series}` 后缀标识分组节点，层数不限。
+
+    这三个分组函数此前在整个仓库零测试覆盖，且生产代码从未调用——
+    而云端 91 部电影正用这套结构，属于契约与实现脱节。
+    """
+
+    def test_group_folder_name_is_idempotent_and_marks_the_node(self):
+        self.assertEqual(naming.group_folder_name("Spider-Man"), "Spider-Man.{series}")
+        # 已带后缀的不再重复追加
+        self.assertEqual(
+            naming.group_folder_name("Spider-Man.{series}"), "Spider-Man.{series}"
+        )
+        self.assertEqual(
+            naming.group_folder_name("Marvel Cinematic Universe"),
+            "Marvel.Cinematic.Universe.{series}",
+        )
+
+    def test_is_group_folder_separates_groups_from_content_nodes(self):
+        self.assertTrue(naming.is_group_folder("Spider-Man.{series}"))
+        self.assertTrue(naming.is_group_folder("Spider-Man.{series}/"))
+        # 内容节点：单体带年份、分季带 Sxx，都不带后缀
+        self.assertFalse(naming.is_group_folder("Spider-Man.2002"))
+        self.assertFalse(naming.is_group_folder("Loki.S01"))
+        self.assertFalse(naming.is_group_folder(""))
+
+    def test_group_path_supports_unlimited_depth_and_no_group_at_all(self):
+        self.assertEqual(naming.build_group_relative_path([]), "")
+        self.assertEqual(
+            naming.build_group_relative_path(["Marvel"]), "Marvel.{series}"
+        )
+        # 蜘蛛侠的按主演分线：三层分组是合法结构，不再要求拉平
+        self.assertEqual(
+            naming.build_group_relative_path(["Marvel", "Spider-Man", "Spider-Man.Tobey"]),
+            "Marvel.{series}/Spider-Man.{series}/Spider-Man.Tobey.{series}",
+        )
+
+    def test_group_path_rejects_unsafe_or_empty_segments(self):
+        for bad in (["../escape"], [""], ["a/b"], ["ok", ".."]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    naming.build_group_relative_path(bad)
+
+    def test_shared_main_title_prefers_known_titles_over_the_heuristic(self):
+        # 不给已知系列时启发式会切错（这正是它必须由调用方确认的原因）
+        self.assertEqual(
+            naming.shared_main_title("Ant-Man and the Wasp Quantumania"),
+            "Ant-Man.and.the.Wasp",
+        )
+        self.assertEqual(
+            naming.shared_main_title(
+                "Ant-Man and the Wasp Quantumania", ["Ant-Man"]
+            ),
+            "Ant-Man",
+        )
+
+
+class PlaceholderImdbTests(unittest.TestCase):
+    """无 IMDB 编号统一写 {imdb-none}（铭哥 2026-08-15 定）。
+
+    旧规则是「省略该段」，导致这批文件与「漏写了」无法区分，
+    每次扫描都被重新标记为待整理，永远处理不完。
+    """
+
+    def test_placeholder_counts_as_normalized_for_movies_and_episodes(self):
+        self.assertTrue(
+            naming.is_normalized_movie_filename("玉蒲团.1991.{imdb-none}.mkv")
+        )
+        self.assertTrue(
+            naming.is_normalized_movie_filename("玉蒲团.1991.{imdb-none}.1080p.mkv")
+        )
+        self.assertTrue(
+            naming.is_normalized_episode_filename("某剧.S01E01.{imdb-none}.mkv")
+        )
+
+    def test_missing_segment_is_still_not_normalized(self):
+        # 「确认没有编号」写 none；「漏写了」仍必须判为待整理
+        self.assertFalse(naming.is_normalized_movie_filename("玉蒲团.1991.mkv"))
+        self.assertFalse(naming.is_normalized_movie_filename("玉蒲团.1991.1080p.mkv"))
+
+    def test_placeholder_must_be_exactly_none_not_arbitrary_text(self):
+        for bad in ("{imdb-tbd}", "{imdb-}", "{imdb-unknown}", "{imdb-null}"):
+            with self.subTest(bad=bad):
+                self.assertFalse(
+                    naming.is_normalized_movie_filename(f"片.2001.{bad}.mkv")
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

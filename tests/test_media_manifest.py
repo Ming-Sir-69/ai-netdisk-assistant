@@ -45,8 +45,7 @@ class MediaManifestTests(unittest.TestCase):
         payload = {
             "version": 1,
             "category": "movie",
-            "universe": None,
-            "collection": None,
+            "groups": [],
             "items": items,
         }
         payload.update(overrides)
@@ -93,8 +92,7 @@ class MediaManifestTests(unittest.TestCase):
         normalized = self.normalize(
             self.payload(
                 category="tv",
-                universe="marvel",
-                collection="Loki",
+                groups=["Marvel", "Loki"],
                 items=[
                     self.item(
                         source,
@@ -125,7 +123,7 @@ class MediaManifestTests(unittest.TestCase):
                 "episode": 1,
                 "quality": "1080p",
                 "extension": "mkv",
-                "target_dir": "/apps/bdpan/片库/Movies/Marvel Cinematic Universe/Loki/Loki.S01",
+                "target_dir": "/apps/bdpan/片库/TV shows/Marvel.{series}/Loki.{series}/Loki.S01",
                 "target_name": "Loki.S01E01.{imdb-tt1286039}.1080p.mkv",
             },
         )
@@ -151,7 +149,7 @@ class MediaManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             normalized["items"][0]["target_dir"],
-            "/apps/bdpan/片库/TV shows/The Bear/The.Bear.S02",
+            "/apps/bdpan/片库/TV shows/The.Bear.{series}/The.Bear.S02",
         )
         self.assertEqual(
             normalized["items"][0]["target_name"],
@@ -163,8 +161,7 @@ class MediaManifestTests(unittest.TestCase):
         second = self.source("2. X2.2003.mkv", fs_id=202, size=2000)
         normalized = self.normalize(
             self.payload(
-                universe="marvel",
-                collection="X-Men film series",
+                groups=["Marvel", "X-Men film series"],
                 items=[
                     self.item(
                         first,
@@ -189,8 +186,8 @@ class MediaManifestTests(unittest.TestCase):
         self.assertEqual(
             [item["target_dir"] for item in normalized["items"]],
             [
-                "/apps/bdpan/片库/Movies/Marvel Cinematic Universe/X-Men film series/X-Men.2000",
-                "/apps/bdpan/片库/Movies/Marvel Cinematic Universe/X-Men film series/X2.2003",
+                "/apps/bdpan/片库/Movies/Marvel.{series}/X-Men.film.series.{series}/X-Men.2000",
+                "/apps/bdpan/片库/Movies/Marvel.{series}/X-Men.film.series.{series}/X2.2003",
             ],
         )
         self.assertEqual(
@@ -206,7 +203,7 @@ class MediaManifestTests(unittest.TestCase):
         source = self.source("Batman.2022.mkv")
         normalized = self.normalize(
             self.payload(
-                universe="dc",
+                groups=["DC"],
                 items=[
                     self.item(
                         source,
@@ -220,7 +217,7 @@ class MediaManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             normalized["items"][0]["target_dir"],
-            "/apps/bdpan/片库/Movies/DC Cinematic Universe/The.Batman.2022",
+            "/apps/bdpan/片库/Movies/DC.{series}/The.Batman.2022",
         )
 
     def test_load_rejects_malformed_utf8_oversized_and_non_regular_files(self):
@@ -323,7 +320,7 @@ class MediaManifestTests(unittest.TestCase):
         source = self.sources[0]
         cases = (
             {"category": "music"},
-            {"universe": "MCU"},
+            {"groups": ["../escape"]},
             {"layout": "folder"},
             {"canonical_title": "../escape"},
             {"year": "202"},
@@ -390,8 +387,7 @@ class MediaManifestTests(unittest.TestCase):
         normalized = self.normalize(
             self.payload(
                 category="tv",
-                universe="marvel",
-                collection="Loki",
+                groups=["Marvel", "Loki"],
                 items=[
                     self.item(
                         source,
@@ -408,7 +404,7 @@ class MediaManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             normalized["items"][0]["target_dir"],
-            "/apps/bdpan/片库/Movies/Marvel Cinematic Universe/Loki/Loki.S02",
+            "/apps/bdpan/片库/TV shows/Marvel.{series}/Loki.{series}/Loki.S02",
         )
         self.assertEqual(
             normalized["items"][0]["target_name"],

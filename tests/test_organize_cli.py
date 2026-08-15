@@ -853,8 +853,7 @@ class OrganizeCliTests(unittest.TestCase):
         return {
             "version": 1,
             "category": "movie",
-            "universe": "marvel",
-            "collection": "X-Men",
+            "groups": ["Marvel", "X-Men"],
             "items": [
                 {
                     "source_path": "/safe/base/Library/Movies/incoming/1. X-Men.2000.mkv",
@@ -944,11 +943,11 @@ class OrganizeCliTests(unittest.TestCase):
             data["targets"],
             [
                 {
-                    "target_dir": "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X-Men.2000",
+                    "target_dir": "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X-Men.2000",
                     "target_name": "X-Men.2000.{imdb-tt0120903}.1080p.mkv",
                 },
                 {
-                    "target_dir": "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X2.2003",
+                    "target_dir": "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X2.2003",
                     "target_name": "X2.2003.{imdb-tt0290334}.1080p.mkv",
                 },
             ],
@@ -956,17 +955,17 @@ class OrganizeCliTests(unittest.TestCase):
         self.assertEqual(
             [item["path"] for item in data["actions"] if item["action"] == "mkdir"],
             [
-                "/safe/base/Library/Movies/Marvel Cinematic Universe",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X-Men.2000",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X2.2003",
+                "/safe/base/Library/Movies/Marvel.{series}",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X-Men.2000",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X2.2003",
             ],
         )
         self.assertEqual(
             [item["to"] for item in data["actions"] if item["action"] == "mv"],
             [
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X-Men.2000",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X2.2003",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X-Men.2000",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X2.2003",
             ],
         )
         # Numeric source prefixes remain visible in source actions for audit;
@@ -1030,7 +1029,7 @@ class OrganizeCliTests(unittest.TestCase):
             manifest_file = self.write_manifest(Path(manifest_root), self.xmen_manifest())
             plan_ref = self.manifest_plan_ref(manifest_file, self.xmen_state())
             drifted_state = self.xmen_state()
-            universe = "/safe/base/Library/Movies/Marvel Cinematic Universe"
+            universe = "/safe/base/Library/Movies/Marvel.{series}"
             drifted_state["directories"].append(universe)
             drifted_state["entries"][universe] = []
             proc, calls = self.run_cli(
@@ -1143,8 +1142,8 @@ class OrganizeCliTests(unittest.TestCase):
             cases = []
             collision = self.xmen_state()
             target = (
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/"
-                "X-Men/X-Men.2000"
+                "/safe/base/Library/Movies/Marvel.{series}/"
+                "X-Men.{series}/X-Men.2000"
             )
             collision["directories"].append(target)
             collision["entries"][target] = [
@@ -1189,8 +1188,7 @@ class OrganizeCliTests(unittest.TestCase):
         return {
             "version": 1,
             "category": "tv",
-            "universe": None,
-            "collection": "Falcon",
+            "groups": ["Falcon"],
             "items": [
                 {
                     "source_path": "/safe/base/Library/TV/incoming/other.mkv",
@@ -1292,10 +1290,10 @@ class OrganizeCliTests(unittest.TestCase):
             [item["path"] for item in data["actions"] if item["action"] == "mkdir"],
             [
                 "/safe/base/Library/Movies",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X-Men.2000",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X2.2003",
+                "/safe/base/Library/Movies/Marvel.{series}",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X-Men.2000",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X2.2003",
             ],
         )
         self.assertEqual([item[0] for item in calls], ["ls", "ls", "ls", "ls", "ls", "ls", "ls"])
@@ -1324,10 +1322,10 @@ class OrganizeCliTests(unittest.TestCase):
             mkdirs,
             [
                 "/safe/base/Library/Movies",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X-Men.2000",
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/X-Men/X2.2003",
+                "/safe/base/Library/Movies/Marvel.{series}",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X-Men.2000",
+                "/safe/base/Library/Movies/Marvel.{series}/X-Men.{series}/X2.2003",
             ],
         )
         mutation_names = [item[0] for item in calls if item[0] in {"mv", "rename"}]
@@ -1338,8 +1336,8 @@ class OrganizeCliTests(unittest.TestCase):
     def test_manifest_target_entry_order_is_fingerprint_stable_but_content_drift_changes_ref(self):
         with tempfile.TemporaryDirectory() as manifest_root:
             manifest_file = self.write_manifest(Path(manifest_root), self.xmen_manifest())
-            universe = "/safe/base/Library/Movies/Marvel Cinematic Universe"
-            collection = universe + "/X-Men"
+            universe = "/safe/base/Library/Movies/Marvel.{series}"
+            collection = universe + "/X-Men.{series}"
             state_a = self.xmen_state()
             for path in ("/safe/base/Library/Movies", universe, collection):
                 state_a["directories"].append(path)
@@ -1543,7 +1541,7 @@ class OrganizeCliTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         self.assertIsNotNone(spec.loader)
         spec.loader.exec_module(module)
-        target_dir = "/safe/base/Library/Movies/X-Men/X-Men.2000"
+        target_dir = "/safe/base/Library/Movies/X-Men.{series}/X-Men.2000"
         source_path = "/safe/base/Library/Movies/incoming/X-Men.2000.mkv"
         item = {
             "target_dir": target_dir,
@@ -1576,8 +1574,8 @@ class OrganizeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as manifest_root:
             manifest_file = self.write_manifest(Path(manifest_root), self.xmen_manifest())
             target = (
-                "/safe/base/Library/Movies/Marvel Cinematic Universe/"
-                "X-Men/X-Men.2000"
+                "/safe/base/Library/Movies/Marvel.{series}/"
+                "X-Men.{series}/X-Men.2000"
             )
             proc, calls = self.run_cli(
                 [
@@ -1599,9 +1597,9 @@ class OrganizeCliTests(unittest.TestCase):
         self.assertNotIn("mkdir", [item[0] for item in calls])
         self.assertNotIn("mv", [item[0] for item in calls])
 
-    def test_manifest_outside_universe_uses_category_collection_item(self):
+    def test_manifest_without_outer_group_uses_category_root_directly(self):
         manifest = self.xmen_manifest()
-        manifest["universe"] = None
+        manifest["groups"] = ["X-Men"]
         with tempfile.TemporaryDirectory() as manifest_root:
             manifest_file = self.write_manifest(Path(manifest_root), manifest)
             proc, calls = self.run_cli(
@@ -1613,14 +1611,14 @@ class OrganizeCliTests(unittest.TestCase):
         targets = json.loads(proc.stdout)["data"]["targets"]
         self.assertEqual(
             targets[0]["target_dir"],
-            "/safe/base/Library/Movies/X-Men/X-Men.2000",
+            "/safe/base/Library/Movies/X-Men.{series}/X-Men.2000",
         )
         self.assertEqual(
             [item["path"] for item in json.loads(proc.stdout)["data"]["actions"] if item["action"] == "mkdir"],
             [
-                "/safe/base/Library/Movies/X-Men",
-                "/safe/base/Library/Movies/X-Men/X-Men.2000",
-                "/safe/base/Library/Movies/X-Men/X2.2003",
+                "/safe/base/Library/Movies/X-Men.{series}",
+                "/safe/base/Library/Movies/X-Men.{series}/X-Men.2000",
+                "/safe/base/Library/Movies/X-Men.{series}/X2.2003",
             ],
         )
         self.assertNotIn("mkdir", [item[0] for item in calls])
@@ -1629,8 +1627,7 @@ class OrganizeCliTests(unittest.TestCase):
         return {
             "version": 1,
             "category": "tv",
-            "universe": None,
-            "collection": None,
+            "groups": [],
             "items": [
                 {
                     "source_path": "/safe/base/Library/TV/incoming/Falcon.S02.mkv",
@@ -1680,7 +1677,7 @@ class OrganizeCliTests(unittest.TestCase):
             data["targets"],
             [
                 {
-                    "target_dir": "/safe/base/Library/TV shows/Falcon/Falcon.S02",
+                    "target_dir": "/safe/base/Library/TV shows/Falcon.{series}/Falcon.S02",
                     "target_name": "Falcon.S02.{imdb-tt0000001}.1080p.mkv",
                 }
             ],
@@ -1689,8 +1686,8 @@ class OrganizeCliTests(unittest.TestCase):
             [item["path"] for item in data["actions"] if item["action"] == "mkdir"],
             [
                 "/safe/base/Library/TV shows",
-                "/safe/base/Library/TV shows/Falcon",
-                "/safe/base/Library/TV shows/Falcon/Falcon.S02",
+                "/safe/base/Library/TV shows/Falcon.{series}",
+                "/safe/base/Library/TV shows/Falcon.{series}/Falcon.S02",
             ],
         )
         self.assertEqual(calls[0][0], "ls")
@@ -1743,7 +1740,7 @@ class OrganizeCliTests(unittest.TestCase):
         error = json.loads(proc.stdout)["error"]
         self.assertEqual(error["details"]["failed_action"]["action"], "mkdir")
         self.assertEqual([item["path"] for item in error["details"]["completed"]], [
-            "/safe/base/Library/Movies/Marvel Cinematic Universe",
+            "/safe/base/Library/Movies/Marvel.{series}",
         ])
         self.assertEqual([item[0] for item in calls].count("mkdir"), 2)
         self.assertNotIn("mv", [item[0] for item in calls])

@@ -692,13 +692,13 @@ def _validate_manifest_cli(args: argparse.Namespace, raw_argv: list[str]) -> Non
 
 
 def _manifest_hierarchy_root(normalized: dict, settings) -> str:
+    """Return the category root that a manifest's targets hang under.
+
+    类别根始终生效：分组节点不再覆盖它，所以剧集不会被某个电影分组带进
+    Movies（2026-08-15 递归模型）。分组本身由 media_manifest 拼进目标路径。
+    """
+
     library_root = safe_cloud_join(settings.bdpan_base, settings.bdpan_lib)
-    if normalized["universe"] is not None:
-        return safe_cloud_join(
-            library_root,
-            CATEGORY_DIRS["movie"],
-            universe_dir_name(normalized["universe"]),
-        )
     return safe_cloud_join(library_root, CATEGORY_DIRS[normalized["category"]])
 
 
@@ -878,8 +878,7 @@ def _manifest_data(plan: dict, *, executed: bool) -> dict:
     return {
         "source_dir": plan["source_dir"],
         "category": normalized["category"],
-        "universe": normalized["universe"],
-        "collection": normalized["collection"],
+        "groups": normalized["groups"],
         "normalized_manifest": normalized,
         "targets": [
             {
