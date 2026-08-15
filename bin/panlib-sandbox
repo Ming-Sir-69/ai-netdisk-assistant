@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Restricted copy entry that builds a real-netdisk validation sandbox.
+
+Fakes cannot reproduce Baidu's real behaviour, so risky changes are rehearsed
+against a sandbox that lives **outside** 片库 and can therefore never touch the
+library. This CLI does exactly one thing: copy one existing path into that
+sandbox. It is plan-first, binds execution to a ``plan_ref``, refuses every
+destination outside the sandbox root, and reads the destination back before
+reporting success. It never moves, deletes, overwrites or retries.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from panlib.common import (  # noqa: E402
+    add_common_args,
+    decode_bdpan_ls,
+    emit_error,
+    emit_success,
+    load_settings,
+    run_bdpan,
+    validate_cloud_path,
+)
+
+SANDBOX_DIR_NAME = "_沙盒_规范验证"
+
+
+def sandbox_root(settings) -> str:
+    return str(PurePosixPath(settings.bdpan_base) / SANDBOX_DIR_NAME)
+
+
+def _plan_ref(source: str, dest_dir: str, name: str) -> str:
+    canonical = json.dumps(
+        {"action": "cp", "source": source, "dest_dir": dest_dir, "name": name},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _entries(path: str, settings) -> tuple[list[dict], bool]:
+    """Return ``(entries, exists)`` for one cloud directory."""
+
+    code, out, err = run_bdpan(["ls", path, "--json"], timeout=60, settings=settings)
+    if code != 0:
+        message = (err.strip() or out.strip() or "bdpan ls failed").lower()
+        if "not found" in message or "no such" in message:
+            return [], False
+        raise RuntimeError(err.strip() or out.strip() or "bdpan ls failed")
+    # 共用解析：真实 bdpan 对空目录返回 null，空目录是正常状态而非错误。
+    return decode_bdpan_ls(out, path)
+
+
+def _names(entries: list[dict]) -> set[str]:
+    return {
+        str(item.get("server_filename") or item.get("name") or "")
+        for item in entries
+        if item.get("server_filename") or item.get("name")
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="把一个精确路径复制进真实网盘沙盒（默认只生成计划）"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    copy_cmd = sub.add_parser("copy", help="复制一个路径进沙盒")
+    copy_cmd.add_argument("--source", required=True, help="源路径（必须在 BDPAN_BASE 内）")
+    copy_cmd.add_argument("--dest-dir", required=True, help="目标目录（必须在沙盒根内）")
+    copy_cmd.add_argument("--execute", action="store_true", help="确认后执行复制")
+    copy_cmd.add_argument("--plan-ref", default="", help="计划指纹（仅执行时使用）")
+    add_common_args(copy_cmd)
+    mkdir_cmd = sub.add_parser("mkdir", help="在沙盒内建目录")
+    mkdir_cmd.add_argument("--path", required=True, help="目录路径（必须在沙盒根内或即沙盒根）")
+    mkdir_cmd.add_argument("--execute", action="store_true", help="确认后执行建目录")
+    add_common_args(mkdir_cmd)
+    args = parser.parse_args()
+
+    settings = load_settings()
+    root = sandbox_root(settings)
+
+    if args.command == "mkdir":
+        # 沙盒根本身允许建立；其余目标必须落在沙盒根之内。
+        try:
+            target = validate_cloud_path(args.path, settings.bdpan_base)
+        except (TypeError, ValueError) as exc:
+            emit_error("INVALID_ARG", f"path is not valid under BDPAN_BASE: {exc}")
+            return
+        if target != root:
+            try:
+                validate_cloud_path(target, root)
+            except (TypeError, ValueError) as exc:
+                emit_error(
+                    "PERMISSION",
+                    f"mkdir must stay inside the sandbox root {root}: {exc}",
+                )
+                return
+        if not args.execute:
+            emit_success(
+                {
+                    "mode": "plan-only",
+                    "path": target,
+                    "sandbox_root": root,
+                    "execute_required": True,
+                    "actions": [{"action": "mkdir", "path": target}],
+                },
+                {"command": "panlib-sandbox mkdir", "mode": "plan-only"},
+            )
+            return
+        code, out, err = run_bdpan(["mkdir", target], timeout=60, settings=settings)
+        message = (err.strip() or out.strip() or "").lower()
+        if code != 0 and "already exists" not in message:
+            emit_error("NETWORK", err.strip() or out.strip() or "bdpan mkdir failed")
+            return
+        try:
+            _, exists = _entries(target, settings)
+        except RuntimeError as exc:
+            emit_error("NETWORK", str(exc))
+            return
+        emit_success(
+            {
+                "executed": True,
+                "path": target,
+                "postcondition": {
+                    "status": "verified" if exists else "unverified",
+                    "checked_path": target,
+                },
+            },
+            {"command": "panlib-sandbox mkdir", "mode": "execute"},
+        )
+        return
+
+    try:
+        source = validate_cloud_path(args.source, settings.bdpan_base)
+    except (TypeError, ValueError) as exc:
+        emit_error("INVALID_ARG", f"source is not a valid path under BDPAN_BASE: {exc}")
+        return
+
+    # 目标必须落在沙盒根内。这里用沙盒根做基准，任何片库路径、上级路径或
+    # 遍历写法都会在这一步被拒，且发生在任何 bdpan 调用之前。
+    try:
+        dest_dir = validate_cloud_path(args.dest_dir, root)
+    except (TypeError, ValueError) as exc:
+        emit_error(
+            "PERMISSION",
+            f"destination must stay inside the sandbox root {root}: {exc}",
+        )
+        return
+
+    name = PurePosixPath(source).name
+    if not name:
+        emit_error("INVALID_ARG", "source must name a file or directory")
+        return
+    plan_ref = _plan_ref(source, dest_dir, name)
+
+    if not args.execute:
+        emit_success(
+            {
+                "mode": "plan-only",
+                "source": source,
+                "dest_dir": dest_dir,
+                "name": name,
+                "sandbox_root": root,
+                "plan_ref": plan_ref,
+                "execute_required": True,
+                "actions": [{"action": "cp", "source": source, "dest_dir": dest_dir}],
+            },
+            {"command": "panlib-sandbox copy", "mode": "plan-only"},
+        )
+        return
+
+    if args.plan_ref != plan_ref:
+        emit_error(
+            "INVALID_ARG",
+            "copy --execute requires --plan-ref from a matching plan-only run",
+        )
+        return
+
+    try:
+        source_entries, source_parent_exists = _entries(
+            str(PurePosixPath(source).parent), settings
+        )
+        if not source_parent_exists or name not in _names(source_entries):
+            emit_error("NOT_FOUND", "source disappeared before the copy")
+            return
+        before, _ = _entries(dest_dir, settings)
+        if name in _names(before):
+            emit_error("INVALID_ARG", "destination already holds an entry with that name")
+            return
+        code, out, err = run_bdpan(["cp", source, dest_dir], timeout=120, settings=settings)
+        if code != 0:
+            emit_error("NETWORK", err.strip() or out.strip() or "bdpan cp failed")
+            return
+        after, dest_exists = _entries(dest_dir, settings)
+    except RuntimeError as exc:
+        emit_error("NETWORK", str(exc))
+        return
+
+    verified = dest_exists and name in _names(after)
+    emit_success(
+        {
+            "executed": True,
+            "source": source,
+            "dest_dir": dest_dir,
+            "name": name,
+            "plan_ref": plan_ref,
+            "postcondition": {
+                "status": "verified" if verified else "unverified",
+                "checked_path": f"{dest_dir}/{name}",
+            },
+        },
+        {"command": "panlib-sandbox copy", "mode": "execute"},
+    )
+
+
+if __name__ == "__main__":
+    main()
