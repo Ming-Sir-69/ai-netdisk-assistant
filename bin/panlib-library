@@ -34,7 +34,9 @@ from mcp_client import (  # noqa: E402
     MCPBridge,
     MCPBridgeError,
     build_archive_plan,
+    build_migrate_plan,
     execute_archive,
+    execute_migrate,
     list_directory,
     meta_library,
     search_library,
@@ -68,13 +70,39 @@ def _parser() -> argparse.ArgumentParser:
         "archive",
         help="通过官方 MCP file_move 将一个精确旧资源移入归档目录（绝不删除）",
     )
-    archive_cmd.add_argument("--source", required=True, help="绝对源路径，可跨 /apps/bdpan 与全盘")
-    archive_cmd.add_argument("--archive-dir", required=True, help="绝对归档目录")
+    archive_cmd.add_argument(
+        "--source", required=True, help="绝对源路径；归档目标由来源根自动确定"
+    )
+    archive_cmd.add_argument(
+        "--archive-dir",
+        help="可选校验值；必须等于来源根对应的待删除归档目录",
+    )
     archive_cmd.add_argument("--new-name", help="归档后的精确名称；默认沿用源名称")
     archive_cmd.add_argument("--ondup", choices=("fail",), default="fail")
     archive_cmd.add_argument("--async", dest="async_mode", choices=("0",), default="0")
     archive_cmd.add_argument("--execute", action="store_true")
     archive_cmd.add_argument("--plan-ref", help="执行时必须回传 plan-only 的 64 位引用")
+
+    migrate_cmd = sub.add_parser(
+        "migrate",
+        help="将我的资源 Movies 中的单个媒体文件迁移到 Apps 片库规范目录（不删除）",
+    )
+    migrate_cmd.add_argument(
+        "--source",
+        required=True,
+        help="精确媒体文件；仅允许 /我的资源/Movies/**/<文件>",
+    )
+    migrate_cmd.add_argument(
+        "--target-dir",
+        required=True,
+        help="规范电影容器；仅允许 /apps/bdpan/片库/Movies/<canonical>",
+    )
+    migrate_cmd.add_argument(
+        "--new-name",
+        help="目标媒体文件名；省略时沿用源文件名",
+    )
+    migrate_cmd.add_argument("--execute", action="store_true")
+    migrate_cmd.add_argument("--plan-ref", help="执行时必须回传 plan-only 的 64 位引用")
 
     return parser
 
@@ -146,6 +174,25 @@ def main(argv: list[str] | None = None) -> None:
                 args.plan_ref,
             )
             emit_success(result, {"command": "panlib-library archive", "mode": "execute"})
+        if args.command == "migrate":
+            if args.execute and not args.plan_ref:
+                parser.error("migrate --execute requires --plan-ref from a prior plan-only run")
+            if not args.execute:
+                plan = build_migrate_plan(
+                    bridge,
+                    args.source,
+                    args.target_dir,
+                    args.new_name,
+                )
+                emit_success(plan, {"command": "panlib-library migrate", "mode": "plan-only"})
+            result = execute_migrate(
+                bridge,
+                args.source,
+                args.target_dir,
+                args.new_name,
+                args.plan_ref,
+            )
+            emit_success(result, {"command": "panlib-library migrate", "mode": "execute"})
         raise ValueError("unknown command")
     except MCPBridgeError as exc:
         emit_error(_map_bridge_error(exc), str(exc), exc.details)
