@@ -23,7 +23,7 @@ ENDPOINT = "https://query.wikidata.org/sparql"
 USER_AGENT = "panlib-titledb/1.0 (personal media library)"
 TIMEOUT = 60
 
-_QUERY = """SELECT ?imdb ?zh ?en ?year WHERE {{
+_QUERY = """SELECT ?imdb ?zh ?en ?year ?country WHERE {{
   ?item wdt:P345 ?imdb ; wdt:P577 ?date .
   BIND(YEAR(?date) AS ?year)
   FILTER(?year >= {low} && ?year <= {high})
@@ -31,6 +31,7 @@ _QUERY = """SELECT ?imdb ?zh ?en ?year WHERE {{
   FILTER(CONTAINS(?label, "{needle}"))
   OPTIONAL {{ ?item rdfs:label ?zh . FILTER(LANG(?zh) = "zh") }}
   OPTIONAL {{ ?item rdfs:label ?en . FILTER(LANG(?en) = "en") }}
+  OPTIONAL {{ ?item wdt:P495 ?c . ?c rdfs:label ?country . FILTER(LANG(?country) = "en") }}
 }} LIMIT {limit}"""
 
 
@@ -102,6 +103,9 @@ def lookup(
                 "title_zh": row.get("zh", {}).get("value"),
                 "title_en": row.get("en", {}).get("value"),
                 "year": row.get("year", {}).get("value"),
+                # 产地是佐证：单一命中不等于正确命中，中文译名撞名会让一部
+                # 美国片冒充港片。调用方据此判断，本模块不替它否决。
+                "country": row.get("country", {}).get("value"),
             }
         )
 

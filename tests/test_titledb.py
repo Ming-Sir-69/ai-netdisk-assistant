@@ -10,8 +10,10 @@ def _response(rows):
     return json.dumps({"results": {"bindings": rows}})
 
 
-def _row(imdb, year, zh=None, en=None):
+def _row(imdb, year, zh=None, en=None, country=None):
     row = {"imdb": {"value": imdb}, "year": {"value": str(year)}}
+    if country:
+        row["country"] = {"value": country}
     if zh:
         row["zh"] = {"value": zh}
     if en:
@@ -96,6 +98,37 @@ class TitleLookupTests(unittest.TestCase):
 
         titledb.lookup('Say "Hi"', 2000, fetch=fetch)
         self.assertNotIn('"Hi"', seen["query"].split("CONTAINS")[1][:40])
+
+
+class OriginCorroborationTests(unittest.TestCase):
+    """只靠片名匹配会给出「看起来很确定」的错误答案。
+
+    实测：查 1995 年港片《灵与慾》时，唯一命中的是美国电视电影
+    *Alien Nation: Body and Soul*——它恰好有个撞名的中文译名。单一结果并不
+    等于正确结果，所以候选必须带上制片国家供调用方佐证；这个字段命名契约
+    本来也需要（决定用中文名还是英文名）。
+    """
+
+    def test_country_of_origin_is_returned_with_each_candidate(self):
+        fetch = lambda q: _response(
+            [_row("tt0109412", 1992, "赤裸羔羊", "Naked Killer", "Hong Kong")]
+        )
+        result = titledb.lookup("赤裸羔羊", 1992, fetch=fetch)
+        self.assertEqual(result["candidates"][0]["country"], "Hong Kong")
+
+    def test_a_lone_match_from_elsewhere_is_still_surfaced_for_judgement(self):
+        # 不替调用方否决，但必须让「产地不符」这件事可见。
+        fetch = lambda q: _response(
+            [_row("tt0112319", 1995, "靈與慾", "Alien Nation: Body and Soul", "United States")]
+        )
+        result = titledb.lookup("靈與慾", 1995, fetch=fetch)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["candidates"][0]["country"], "United States")
+
+    def test_a_missing_country_does_not_break_the_lookup(self):
+        fetch = lambda q: _response([_row("tt0107565", 1993, "蜜桃成熟時", "Crazy Love")])
+        result = titledb.lookup("蜜桃成熟时", 1993, fetch=fetch)
+        self.assertIsNone(result["candidates"][0]["country"])
 
 
 if __name__ == "__main__":
