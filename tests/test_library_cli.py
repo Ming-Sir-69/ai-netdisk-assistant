@@ -223,7 +223,7 @@ class SearchFallbackTests(unittest.TestCase):
             return {"list": self.search_hits}
 
     def test_children_are_recovered_through_search_when_listing_fails(self):
-        from panlib.mcp_client import MCPBridgeError, list_directory_resilient
+        from panlib.mcp_client import list_directory_resilient
 
         target = "/lib/Mr.&.Mrs.Smith.2005"
         hits = [
@@ -236,6 +236,19 @@ class SearchFallbackTests(unittest.TestCase):
         self.assertEqual(method, "search")
         # 只保留真正属于该目录的子项：目录自身与别处的命中都要排除
         self.assertEqual([item["name"] for item in entries], ["film.mkv"])
+
+    def test_the_group_marker_is_not_used_as_the_search_key(self):
+        # `Dash.&.Lily.{series}` 里最长的 token 是 series——拿它去搜当然搜不到
+        # 子项，于是兜底返回空，目录被报成「空的」。读不到伪装成是空的，
+        # 比读不到本身更危险。
+        from panlib.mcp_client import list_directory_resilient
+
+        target = "/lib/Dash.&.Lily.{series}"
+        hits = [{"server_filename": "Dash.&.Lily.S01", "path": f"{target}/Dash.&.Lily.S01", "isdir": True}]
+        client = self.Client({target}, hits)
+        entries, method = list_directory_resilient(client, target)
+        self.assertEqual(method, "search")
+        self.assertEqual([item["name"] for item in entries], ["Dash.&.Lily.S01"])
 
     def test_a_readable_directory_never_pays_for_the_fallback(self):
         from panlib.mcp_client import list_directory_resilient

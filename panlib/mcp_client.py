@@ -63,6 +63,9 @@ def _classify_error(value: object) -> str:
     return "NETWORK"
 
 
+_SERIES_MARKER = ".{series}"
+
+
 def validate_mcp_path(value: str, *, allow_root: bool = True) -> str:
     """Validate one exact absolute POSIX path for full-drive MCP operations."""
 
@@ -423,7 +426,13 @@ def list_directory_resilient(
 def _search_key(path: str) -> str:
     """Pick the most distinctive token of a directory name to search by."""
 
-    tokens = re.findall(r"[\w\u4e00-\u9fff]+", basename(path))
+    # 先剥掉分组标记：`Dash.&.Lily.{series}` 里最长的 token 是 series，
+    # 拿它去搜什么也搜不到，兜底会静悄悄返回空——「读不到」于是伪装成
+    # 「是空的」，比读不到本身更危险。
+    name = basename(path)
+    if name.endswith(_SERIES_MARKER):
+        name = name[: -len(_SERIES_MARKER)]
+    tokens = re.findall(r"[\w\u4e00-\u9fff]+", name)
     return max(tokens, key=len) if tokens else basename(path)
 
 
