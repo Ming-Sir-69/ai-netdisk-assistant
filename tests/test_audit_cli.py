@@ -29,6 +29,9 @@ if tool == "file_list":
         raise SystemExit(0)
     print(json.dumps({"list": state["tree"].get(directory, [])}, ensure_ascii=False))
 elif tool == "file_keyword_search":
+    if state.get("search_fails"):
+        print(json.dumps({"error": {"code": "NETWORK", "message": "down"}}))
+        raise SystemExit(0)
     print(json.dumps({"list": state.get("search", [])}, ensure_ascii=False))
 else:
     print(json.dumps({"error": {"code": "INVALID_ARG", "message": "unsupported"}}))
@@ -44,7 +47,7 @@ class AuditCliTests(unittest.TestCase):
     它是「批量整理」的第一步——先让人看见要改什么，再决定改不改。
     """
 
-    def run_audit(self, tree: dict, *, unreadable=None, search=None, extra=None):
+    def run_audit(self, tree: dict, *, unreadable=None, search=None, extra=None, search_fails=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -53,7 +56,12 @@ class AuditCliTests(unittest.TestCase):
         state = root / "state.json"
         state.write_text(
             json.dumps(
-                {"tree": tree, "unreadable": unreadable or [], "search": search or []},
+                {
+                    "tree": tree,
+                    "unreadable": unreadable or [],
+                    "search": search or [],
+                    "search_fails": search_fails,
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
@@ -121,11 +129,26 @@ class AuditCliTests(unittest.TestCase):
         issues = [f["issue"] for f in self.findings(self.run_audit(tree))]
         self.assertIn("empty_container", issues)
 
-    def test_an_unreadable_directory_is_reported_not_silently_skipped(self):
-        # 含 & 的路径读不了，但「读不到」必须显式出现在清单里，
-        # 否则会被误当成「已检查且合规」。
-        tree = {"/lib": [self.entry("Mr.&.Mrs", "/lib/Mr.&.Mrs", isdir=True)]}
-        findings = self.findings(self.run_audit(tree, unreadable=["/lib/Mr.&.Mrs"]))
+    def test_a_directory_recovered_by_search_is_audited_and_flagged(self):
+        # 含 & 的路径列表接口读不了，但搜索接口可以。兜底成功也要如实记一笔：
+        # 「读到了」和「读全了」不是一回事。
+        target = "/lib/Mr.&.Mrs.Smith.2005"
+        tree = {"/lib": [self.entry("Mr.&.Mrs.Smith.2005", target, isdir=True)]}
+        search = [self.entry("raw.mkv", f"{target}/raw.mkv")]
+        findings = self.findings(
+            self.run_audit(tree, unreadable=[target], search=search)
+        )
+        issues = [f["issue"] for f in findings]
+        self.assertIn("listed_via_search_fallback", issues)
+        # 兜底读到的内容照常参与校验，不因为走了兜底就跳过
+        self.assertIn("unnormalized_filename", issues)
+
+    def test_a_directory_neither_channel_can_read_is_reported_not_skipped(self):
+        # 「读不到」必须显式出现在清单里，否则会被误当成「已检查且合规」。
+        tree = {"/lib": [self.entry("Broken", "/lib/Broken", isdir=True)]}
+        findings = self.findings(
+            self.run_audit(tree, unreadable=["/lib/Broken"], search_fails=True)
+        )
         self.assertEqual([f["issue"] for f in findings], ["unreadable_directory"])
 
     def test_the_audit_never_issues_a_write_call(self):

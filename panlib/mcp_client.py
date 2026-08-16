@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -393,6 +394,37 @@ def search_library(
         {"dir": directory, "key": keyword.strip(), "page": 1, "num": 100},
     )
     return normalize_entries(payload, directory)
+
+
+def list_directory_resilient(
+    client: MCPBridge, directory: str
+) -> tuple[list[dict[str, Any]], str]:
+    """Return ``(entries, channel)`` for a directory, falling back to search.
+
+    `file_list` 对路径里含 ``&`` 的目录直接失败（errno 1002），而
+    `file_keyword_search` 读得好好的。**坏的是接口不是数据**——改文件名去迁就
+    一个有 bug 的接口，会让片库和真实片名（《史密斯夫妇》《傲慢与偏见》官方名
+    本就带 ``&``）永久脱节，所以兜底做在工具这一侧。
+
+    两条通道都失败时抛出原始错误：读不到必须显式暴露，不能静悄悄当成空目录。
+    """
+
+    path = validate_mcp_path(directory)
+    try:
+        return list_directory(client, path), "list"
+    except MCPBridgeError as listing_error:
+        try:
+            hits = search_library(client, _search_key(path), parent_path(path))
+        except MCPBridgeError:
+            raise listing_error from None
+        return [item for item in hits if parent_path(str(item.get("path") or "")) == path], "search"
+
+
+def _search_key(path: str) -> str:
+    """Pick the most distinctive token of a directory name to search by."""
+
+    tokens = re.findall(r"[\w\u4e00-\u9fff]+", basename(path))
+    return max(tokens, key=len) if tokens else basename(path)
 
 
 def meta_library(client: MCPBridge, *, path: str | None = None, fsid: str | None = None) -> Any:

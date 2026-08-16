@@ -200,6 +200,62 @@ class ListDirectoryPaginationTests(unittest.TestCase):
         self.assertLess(len(client.calls), 5)
 
 
+class SearchFallbackTests(unittest.TestCase):
+    """列表接口读不了的目录，改用搜索接口枚举。
+
+    `file_list` 遇到路径里的 `&` 直接失败（errno 1002），而 `file_keyword_search`
+    读得好好的。坏的是接口不是数据，所以兜底应该做在工具这一侧——
+    改文件名去迁就一个有 bug 的接口，会让片库和真实片名永久脱节。
+    """
+
+    class Client:
+        def __init__(self, listing_fails, search_hits):
+            self.listing_fails = listing_fails
+            self.search_hits = search_hits
+            self.tools = []
+
+        def call(self, tool, arguments):
+            self.tools.append(tool)
+            if tool == "file_list":
+                if arguments["dir"] in self.listing_fails:
+                    raise MCPBridgeError("INVALID_ARG", "params error")
+                return {"list": []}
+            return {"list": self.search_hits}
+
+    def test_children_are_recovered_through_search_when_listing_fails(self):
+        from panlib.mcp_client import MCPBridgeError, list_directory_resilient
+
+        target = "/lib/Mr.&.Mrs.Smith.2005"
+        hits = [
+            {"server_filename": "Mr.&.Mrs.Smith.2005", "path": target, "isdir": True},
+            {"server_filename": "film.mkv", "path": f"{target}/film.mkv", "isdir": False},
+            {"server_filename": "other.mkv", "path": "/lib/Elsewhere/other.mkv", "isdir": False},
+        ]
+        client = self.Client({target}, hits)
+        entries, method = list_directory_resilient(client, target)
+        self.assertEqual(method, "search")
+        # 只保留真正属于该目录的子项：目录自身与别处的命中都要排除
+        self.assertEqual([item["name"] for item in entries], ["film.mkv"])
+
+    def test_a_readable_directory_never_pays_for_the_fallback(self):
+        from panlib.mcp_client import list_directory_resilient
+
+        client = self.Client(set(), [])
+        entries, method = list_directory_resilient(client, "/lib/Normal")
+        self.assertEqual(method, "list")
+        self.assertNotIn("file_keyword_search", client.tools)
+
+    def test_when_both_channels_fail_the_error_is_raised_not_hidden(self):
+        from panlib.mcp_client import MCPBridgeError, list_directory_resilient
+
+        class Broken(self.Client):
+            def call(self, tool, arguments):
+                raise MCPBridgeError("NETWORK", "down")
+
+        with self.assertRaises(MCPBridgeError):
+            list_directory_resilient(Broken(set(), []), "/lib/X")
+
+
 class LibraryCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

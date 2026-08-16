@@ -15,6 +15,10 @@ _EXTENSIONS = {
     "mkv", "mp4", "ts", "avi", "iso", "rmvb", "webm",
     "ass", "srt", "ssa", "sub", "sup", "vtt", "idx",
 }
+# 对外暴露唯一真源，避免各处再抄一份（抄一份就会漂移一份）。
+MEDIA_EXTENSIONS = _EXTENSIONS
+SUBTITLE_EXTENSIONS = {"ass", "srt", "ssa", "sub", "sup", "vtt", "idx"}
+
 _QUALITIES = {"2160p", "1080p", "1080p.REMUX", "1080p.BluRay", "720p", "WEB-DL"}
 _INVALID_NAME_CHARS = set('/\\:*?"<>|')
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -20,18 +21,21 @@ from panlib.common import add_common_args, emit_error, emit_success  # noqa: E40
 from panlib.mcp_client import (  # noqa: E402
     MCPBridge,
     MCPBridgeError,
-    list_directory,
+    list_directory_resilient,
     validate_mcp_path,
 )
 from panlib.media_manifest import CATEGORY_DIRS  # noqa: E402
 from panlib.naming import (  # noqa: E402
+    MEDIA_EXTENSIONS,
+    SUBTITLE_EXTENSIONS,
     is_group_folder,
     is_normalized_episode_filename,
     is_normalized_movie_filename,
 )
 
-VIDEO_EXTENSIONS = {"mkv", "mp4", "ts", "avi", "iso"}
-SUBTITLE_EXTENSIONS = {"ass", "srt", "ssa", "sub", "sup", "vtt", "idx"}
+# 扩展名只有一份真源：抄第二份必然漂移——本轮就发生过，naming 补了
+# rmvb/webm，审计这边没跟上，10 个规范文件继续被报成「非媒体」。
+VIDEO_EXTENSIONS = MEDIA_EXTENSIONS - SUBTITLE_EXTENSIONS
 MAX_DEPTH = 8
 
 # 类别根与归档区本来就装目录，空着也不算整理残留。按名字识别而不是按深度，
@@ -71,18 +75,30 @@ def audit(client: MCPBridge, root: str) -> list[dict]:
             )
             return 0
         try:
-            entries = list_directory(client, directory)
+            entries, channel = list_directory_resilient(client, directory)
         except MCPBridgeError as exc:
             findings.append(
                 _finding(
                     directory,
                     "unreadable_directory",
-                    f"读取失败（{exc.code}）",
-                    "改用搜索接口枚举后重新校验",
+                    f"两条通道都读取失败（{exc.code}）",
+                    "人工确认该目录是否仍存在",
                     "high",
                 )
             )
             return 0
+        if channel == "search":
+            # 走了兜底也要如实记一笔：搜索枚举的完整性弱于列表，
+            # 「读到了」和「读全了」不是一回事。
+            findings.append(
+                _finding(
+                    directory,
+                    "listed_via_search_fallback",
+                    "列表接口失败，已改用搜索枚举",
+                    "结果可能不完整，重要操作前人工复核",
+                    "low",
+                )
+            )
 
         subdirectories = [item for item in entries if item.get("isdir")]
         files = [item for item in entries if not item.get("isdir")]
@@ -105,7 +121,15 @@ def audit(client: MCPBridge, root: str) -> list[dict]:
         leaf_name = PurePosixPath(directory).name
         # 片库根与其直接子目录（Movies / TV shows / 动漫 / 归档区…）是容器，
         # 不是内容节点：它们本来就该装目录，空着也不算整理残留。
-        is_container_root = directory == root or leaf_name in CONTAINER_DIRS
+        # 根若本身就是一个内容节点（直接审计单部影片时），不能当成容器，
+        # 否则它内部的媒体文件会被误报成「分组里直接放媒体」。
+        looks_like_content = bool(
+            re.match(r"^.+\.(?:18|19|20|21)\d{2}$", leaf_name)
+            or re.match(r"^.+\.S\d{2}$", leaf_name)
+        )
+        is_container_root = leaf_name in CONTAINER_DIRS or (
+            directory == root and not looks_like_content
+        )
         is_group = is_group_folder(leaf_name) or is_container_root
 
         if is_group and media:
