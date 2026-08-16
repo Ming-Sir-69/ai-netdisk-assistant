@@ -10,7 +10,9 @@ from collections.abc import Iterable
 _IMDB_RE = re.compile(r"^tt\d{7,8}$")
 _YEAR_RE = re.compile(r"^(?:18|19|20|21)\d{2}$")
 _EXTENSIONS = {
-    "mkv", "mp4", "ts", "avi", "iso",
+    # rmvb / webm 是存量库里真实存在的视频容器；漏掉它们只会让一批命名
+    # 已经规范的文件被永久误判成「非媒体」（2026-08-16 全库审计发现）。
+    "mkv", "mp4", "ts", "avi", "iso", "rmvb", "webm",
     "ass", "srt", "ssa", "sub", "sup", "vtt", "idx",
 }
 _QUALITIES = {"2160p", "1080p", "1080p.REMUX", "1080p.BluRay", "720p", "WEB-DL"}

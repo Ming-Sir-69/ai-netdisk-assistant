@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import json
+import unittest
+
+from panlib import titledb
+
+
+def _response(rows):
+    return json.dumps({"results": {"bindings": rows}})
+
+
+def _row(imdb, year, zh=None, en=None):
+    row = {"imdb": {"value": imdb}, "year": {"value": str(year)}}
+    if zh:
+        row["zh"] = {"value": zh}
+    if en:
+        row["en"] = {"value": en}
+    return row
+
+
+class TitleLookupTests(unittest.TestCase):
+    """按片名与年份查官方名称与 IMDB 编号。
+
+    走 Wikidata 的公开 SPARQL 端点——它是为程序化查询设计的结构化接口，
+    无需 API key，也不存在反爬挑战，因此**不触碰 IMDb 与豆瓣的网页层**
+    （那两处才是 2026-08 之前被拦死的地方）。
+
+    最重要的约束：**候选不唯一时绝不替调用方挑一个**。撞名在中文译名里极其
+    常见（《蜜桃成熟时》同时命中 1977 年德国片和 1993 年港片），猜错会把
+    错误的编号永久写进文件名。
+    """
+
+    def test_a_single_candidate_is_reported_as_confident(self):
+        fetch = lambda query: _response([_row("tt0109412", 1992, "赤裸羔羊", "Naked Killer")])
+        result = titledb.lookup("赤裸羔羊", 1992, fetch=fetch)
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["candidates"][0]["imdb_id"], "tt0109412")
+        self.assertEqual(result["candidates"][0]["title_en"], "Naked Killer")
+        self.assertEqual(result["candidates"][0]["title_zh"], "赤裸羔羊")
+
+    def test_duplicate_rows_for_one_film_collapse_to_one_candidate(self):
+        # SPARQL 的多语言 OPTIONAL 会让同一部片出现多行，那不是歧义。
+        rows = [
+            _row("tt0107565", 1993, "蜜桃成熟時", "Crazy Love"),
+            _row("tt0107565", 1993, "蜜桃成熟時", "Crazy Love"),
+        ]
+        result = titledb.lookup("蜜桃成熟时", 1993, fetch=lambda q: _response(rows))
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(len(result["candidates"]), 1)
+
+    def test_several_distinct_films_are_returned_as_ambiguous_without_picking(self):
+        rows = [
+            _row("tt0108609", 1993, "香港奇案之強姦", "Raped by an Angel"),
+            _row("tt0107399", 1993, "警花肉搏強姦黨", "Beyond the Copline"),
+        ]
+        result = titledb.lookup("強姦", 1993, fetch=lambda q: _response(rows))
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(len(result["candidates"]), 2)
+        self.assertNotIn("imdb_id", result)
+
+    def test_no_match_is_reported_plainly_so_none_can_be_justified(self):
+        # 「查过且没有」才是写 {imdb-none} 的依据；「没能力查」不是。
+        result = titledb.lookup("查无此片", 1996, fetch=lambda q: _response([]))
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["candidates"], [])
+
+    def test_the_year_window_is_bounded_and_appears_in_the_query(self):
+        seen = {}
+
+        def fetch(query):
+            seen["query"] = query
+            return _response([])
+
+        titledb.lookup("X", 2000, slack=2, fetch=fetch)
+        self.assertIn("1998", seen["query"])
+        self.assertIn("2002", seen["query"])
+
+    def test_a_transport_failure_is_surfaced_not_swallowed_as_not_found(self):
+        def fetch(query):
+            raise OSError("connection reset")
+
+        with self.assertRaises(titledb.LookupError):
+            titledb.lookup("X", 2000, fetch=fetch)
+
+    def test_an_unparsable_response_is_not_treated_as_an_empty_result(self):
+        with self.assertRaises(titledb.LookupError):
+            titledb.lookup("X", 2000, fetch=lambda q: "<html>blocked</html>")
+
+    def test_titles_are_escaped_so_a_quote_cannot_break_the_query(self):
+        seen = {}
+
+        def fetch(query):
+            seen["query"] = query
+            return _response([])
+
+        titledb.lookup('Say "Hi"', 2000, fetch=fetch)
+        self.assertNotIn('"Hi"', seen["query"].split("CONTAINS")[1][:40])
+
+
+if __name__ == "__main__":
+    unittest.main()

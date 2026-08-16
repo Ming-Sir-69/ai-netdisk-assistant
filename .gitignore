@@ -102,3 +102,6 @@ tests/.cache/
 
 # 运行时台账与中间产物，不随仓库分发
 runtime/
+
+# 本地开发记录，不对外发布
+docs/_local/

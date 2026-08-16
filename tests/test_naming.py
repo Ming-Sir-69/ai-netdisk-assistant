@@ -231,6 +231,27 @@ class RecursiveGroupNamingTests(unittest.TestCase):
         )
 
 
+class LegacyContainerExtensionTests(unittest.TestCase):
+    """rmvb / webm 也是视频容器。
+
+    片库里有 9 个 rmvb 和 1 个 webm，命名都已经规范，却因为不在扩展名清单里
+    被判成「非媒体文件」——一个纯粹由清单遗漏造成的误报。
+    """
+
+    def test_legacy_video_containers_are_recognised(self):
+        for ext in ("rmvb", "webm"):
+            with self.subTest(ext=ext):
+                self.assertTrue(naming.validate_extension(ext))
+                self.assertTrue(
+                    naming.is_normalized_movie_filename(f"Home.Alone.1990.{{imdb-tt0099785}}.{ext}")
+                )
+
+    def test_images_and_notes_remain_out_of_scope(self):
+        for ext in ("jpg", "nfo", "txt", "pdf"):
+            with self.subTest(ext=ext):
+                self.assertFalse(naming.validate_extension(ext))
+
+
 class OptionalQualityTests(unittest.TestCase):
     """清晰度拿不到就不写（铭哥 2026-08-15 定）。
 
