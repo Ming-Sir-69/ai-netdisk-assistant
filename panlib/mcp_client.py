@@ -789,6 +789,73 @@ def _archive_snapshot(
     }
 
 
+def inplace_rename_plan_ref(path: str, new_name: str) -> str:
+    """Fingerprint an in-place rename so execution cannot drift from its plan."""
+
+    canonical = json.dumps(
+        {"action": "inplace_rename", "path": path, "new_name": new_name},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def execute_inplace_rename(
+    client: MCPBridge, path: str, new_name: str, plan_ref: str
+) -> dict[str, Any]:
+    """Rename one file in place through ``file_move``.
+
+    这是 MCP 写入的第三个窄例外，只为一种 bdpan 根本无法寻址的情况存在：
+    文件名里含连续点时，bdpan 会把它判成路径穿越并拒绝**任何**操作——连只读
+    的 ls 也拒绝。这类文件名合法且真实存在，不能因为一个工具的误判就永远
+    改不了名。
+
+    边界与 archive 同样严：**同一个父目录内、只改名、不移动、不覆盖、不删除**，
+    绑定 plan_ref，写前重读确认源在且新名未被占用，写后验收源消失、目标唯一。
+    """
+
+    path = validate_mcp_path(path, allow_root=False)
+    name = validate_new_name(new_name)
+    parent = parent_path(path)
+    entries, _channel = list_directory_resilient(client, parent)
+    matches = _exact_path_matches(entries, path, basename(path))
+    if len(matches) != 1:
+        raise MCPBridgeError("NOT_FOUND", "rename source was not found exactly once")
+    existing = {str(item.get("name")) for item in entries}
+    if name in existing:
+        raise MCPBridgeError("INVALID_ARG", f"parent already holds an entry named {name}")
+    if inplace_rename_plan_ref(path, name) != plan_ref:
+        raise MCPBridgeError("INVALID_ARG", "rename plan changed; regenerate plan")
+
+    filelist = [{"path": path, "dest": parent, "newname": name}]
+    client.call(
+        "file_move",
+        {
+            "async": 0,
+            "ondup": "fail",
+            "filelist": json.dumps(filelist, ensure_ascii=False, separators=(",", ":")),
+        },
+    )
+
+    after, _channel = list_directory_resilient(client, parent)
+    names_after = [str(item.get("name")) for item in after]
+    verified = names_after.count(name) == 1 and basename(path) not in names_after
+    if not verified:
+        raise MCPBridgeError("PARSE", "rename postcondition could not be verified")
+    return {
+        "mode": "execute",
+        "source": path,
+        "renamed_to": f"{parent.rstrip('/')}/{name}",
+        "plan_ref": plan_ref,
+        "postcondition": {
+            "status": "verified",
+            "source_absent": True,
+            "target_present": True,
+            "operation": "file_move",
+        },
+    }
+
+
 def build_archive_plan(
     client: MCPBridge,
     source: str,

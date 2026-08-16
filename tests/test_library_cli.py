@@ -269,6 +269,79 @@ class SearchFallbackTests(unittest.TestCase):
             list_directory_resilient(Broken(set(), []), "/lib/X")
 
 
+class InplaceRenameTests(unittest.TestCase):
+    """MCP 原地改名：只为 bdpan 根本无法寻址的文件名存在。
+
+    文件名含连续点时 bdpan 判其为路径穿越并拒绝**任何**操作，连只读的 ls
+    也拒绝（实测 `Along.Came.A.Spider...720p.mp4`）。这类文件名合法且真实
+    存在，不能因为一个工具的误判就永远改不了名。
+    """
+
+    class Client:
+        def __init__(self, entries, *, after=None):
+            self.entries = entries
+            self.after = after if after is not None else entries
+            self.moves = []
+            self._listed = 0
+
+        def call(self, tool, arguments):
+            if tool == "file_list":
+                self._listed += 1
+                page = arguments.get("page", 1)
+                if page > 1:
+                    return {"list": []}
+                source = self.entries if self.moves == [] else self.after
+                return {"list": source}
+            if tool == "file_move":
+                self.moves.append(json.loads(arguments["filelist"]))
+                return {"errno": 0}
+            raise AssertionError(f"unexpected tool {tool}")
+
+    @staticmethod
+    def item(name, parent="/lib/S02"):
+        return {"server_filename": name, "path": f"{parent}/{name}", "isdir": False}
+
+    def test_the_rename_moves_within_the_same_parent_only(self):
+        from panlib.mcp_client import execute_inplace_rename, inplace_rename_plan_ref
+
+        old_name, new_name = "A...720p.mp4", "A.S02E13.{imdb-tt1}.720p.mp4"
+        client = self.Client([self.item(old_name)], after=[self.item(new_name)])
+        ref = inplace_rename_plan_ref(f"/lib/S02/{old_name}", new_name)
+        result = execute_inplace_rename(client, f"/lib/S02/{old_name}", new_name, ref)
+        self.assertEqual(result["postcondition"]["status"], "verified")
+        move = client.moves[0][0]
+        self.assertEqual(move["dest"], "/lib/S02")
+        self.assertEqual(move["newname"], new_name)
+
+    def test_a_stale_plan_ref_stops_before_any_write(self):
+        from panlib.mcp_client import MCPBridgeError, execute_inplace_rename
+
+        client = self.Client([self.item("A...720p.mp4")])
+        with self.assertRaises(MCPBridgeError):
+            execute_inplace_rename(client, "/lib/S02/A...720p.mp4", "B.mp4", "0" * 64)
+        self.assertEqual(client.moves, [])
+
+    def test_an_occupied_name_is_refused_before_any_write(self):
+        from panlib.mcp_client import MCPBridgeError, execute_inplace_rename, inplace_rename_plan_ref
+
+        entries = [self.item("A...720p.mp4"), self.item("taken.mp4")]
+        client = self.Client(entries)
+        ref = inplace_rename_plan_ref("/lib/S02/A...720p.mp4", "taken.mp4")
+        with self.assertRaises(MCPBridgeError):
+            execute_inplace_rename(client, "/lib/S02/A...720p.mp4", "taken.mp4", ref)
+        self.assertEqual(client.moves, [])
+
+    def test_an_unverifiable_result_is_not_reported_as_success(self):
+        from panlib.mcp_client import MCPBridgeError, execute_inplace_rename, inplace_rename_plan_ref
+
+        old_name, new_name = "A...720p.mp4", "B.mp4"
+        # 写后读回仍是旧名：不能宣称成功
+        client = self.Client([self.item(old_name)], after=[self.item(old_name)])
+        ref = inplace_rename_plan_ref(f"/lib/S02/{old_name}", new_name)
+        with self.assertRaises(MCPBridgeError):
+            execute_inplace_rename(client, f"/lib/S02/{old_name}", new_name, ref)
+
+
 class LibraryCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

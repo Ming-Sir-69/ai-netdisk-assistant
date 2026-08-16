@@ -24,6 +24,12 @@ sys.path.insert(0, str(_REPO_ROOT / "panlib"))
 sys.path.insert(0, str(_REPO_ROOT))
 
 import journal  # noqa: E402
+from mcp_client import (  # noqa: E402
+    MCPBridge,
+    MCPBridgeError,
+    execute_inplace_rename,
+    inplace_rename_plan_ref,
+)
 from common import (  # noqa: E402
     INVALID_ARG,
     NOT_FOUND,
@@ -38,6 +44,14 @@ from common import (  # noqa: E402
 )
 
 _ILLEGAL_NAME_CHARS = set('/\\:*?"<>|')
+
+# bdpan 对含连续点的路径的固定说法；它同时用于只读操作，所以是「无法寻址」
+# 而不是「这次写失败」。
+_REJECTION_MARKERS = ("路径穿越", "traversal", "路径无效")
+
+
+def _looks_rejected(text: str) -> bool:
+    return any(marker in (text or "") for marker in _REJECTION_MARKERS)
 
 
 def _validated_name(value: str) -> str:
@@ -164,8 +178,42 @@ def main() -> None:
     }
 
     code, out, err = run_bdpan(["rename", target, new_name], timeout=120, settings=settings)
+    message = (err.strip() or out.strip() or "").strip()
+    if code == 0 and _looks_rejected(out):
+        # bdpan 对这类路径返回退出码 0 加一个错误对象，不能只看退出码。
+        code = 1
+    if code != 0 and _looks_rejected(message + out):
+        # bdpan 把文件名里的连续点判成路径穿越，并拒绝**任何**操作——连只读的
+        # ls 也拒绝，所以它根本无法寻址这个文件。文件名本身合法，不该因为一个
+        # 工具的误判就永远改不了名，因此改走 MCP 做同一父目录内的原地改名。
+        try:
+            bridge = MCPBridge.from_environment()
+            result = execute_inplace_rename(
+                bridge, target, new_name, inplace_rename_plan_ref(target, new_name)
+            )
+        except (MCPBridgeError, ValueError) as exc:
+            emit_error("PERMISSION", f"bdpan rejected the path and MCP could not rename it: {exc}")
+            return
+        try:
+            journal.append_event({**base_event, "status": "executed", "completed_actions": 1,
+                                  "channel": "mcp-file-move"})
+        except Exception as exc:  # pragma: no cover
+            print(f"journal unavailable: {exc}", file=sys.stderr)
+        emit_success(
+            {
+                "executed": True,
+                "path": target,
+                "renamed_to": result["renamed_to"],
+                "plan_ref": plan_ref,
+                "run_id": run_id,
+                "channel": "mcp-file-move",
+                "postcondition": result["postcondition"],
+            },
+            {"command": "panlib-container rename", "mode": "execute", "fallback": "mcp"},
+        )
+        return
     if code != 0:
-        message = err.strip() or out.strip() or "bdpan rename failed"
+        message = message or "bdpan rename failed"
         try:
             journal.append_event(
                 {
