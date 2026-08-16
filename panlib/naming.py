@@ -113,10 +113,29 @@ def validate_imdb_id(imdb_id: str) -> bool:
     return isinstance(imdb_id, str) and bool(_IMDB_RE.fullmatch(imdb_id.strip()))
 
 
+# 「查过且确无条目」写成 none；它必须恰好是 none，任意其它文字（tbd/unknown）
+# 都不接受，否则「确认没有」又会和「还没查」混为一谈。
+NO_IMDB_PLACEHOLDER = "none"
+
+
+def validate_media_id(value: str) -> bool:
+    """Return whether a media id is a real IMDB id or the confirmed-absent mark.
+
+    这是**唯一**的媒体编号判定：此前 manifest、organize、transfer 各写了一份
+    只认 tt 的检查，于是「查过且确无」这条规则写得出来却落不了地。
+    """
+
+    if not isinstance(value, str):
+        return False
+    return value.strip() == NO_IMDB_PLACEHOLDER or validate_imdb_id(value)
+
+
 def _checked_imdb_id(imdb_id: str) -> str:
     value = _require_text(imdb_id, "imdb_id")
+    if value == NO_IMDB_PLACEHOLDER:
+        return value
     if not validate_imdb_id(value):
-        raise ValueError("imdb_id must match tt followed by 7-8 digits")
+        raise ValueError("imdb_id must match tt followed by 7-8 digits, or be 'none'")
     return value
 
 

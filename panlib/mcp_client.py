@@ -497,8 +497,9 @@ def _source_entry(client: MCPBridge, source: str) -> dict[str, Any]:
     if len(matches) != 1:
         raise MCPBridgeError("NOT_FOUND", "archive source was not found exactly once")
     item = matches[0]
-    if not item["isdir"]:
-        raise MCPBridgeError("INVALID_ARG", "archive source must be a directory")
+    # 目录和单个文件都可归档：「同片多版本留一个、另一版归档」这类场景里，
+    # 被归档的本来就是文件；只收目录会逼调用方先造临时目录，凭空多两次写操作。
+    # file_move 对两者一视同仁，其余保护（同根、ondup=fail、写后验收）不变。
     return item
 
 

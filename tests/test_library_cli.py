@@ -428,6 +428,29 @@ class LibraryCliTests(unittest.TestCase):
             {"dir": "/我的资源/Movies", "key": "云中漫步", "page": 1, "num": 100},
         )
 
+    def test_archive_accepts_a_single_file_not_only_a_directory(self):
+        # 「同片多版本留一个、另一版归档」是真实场景：被归档的是一个文件。
+        # 只收目录会逼调用方先造一个临时目录，凭空多出两次写操作。
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        state["source_items"] = [
+            {
+                "fsid": "file-1",
+                "name": "旧版.mp4",
+                "path": "/apps/bdpan/片库/Movies/旧版.mp4",
+                "isdir": False,
+                "size": 123,
+            }
+        ]
+        self.state.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        proc, calls = self.run_cli(
+            ["archive", "--source", "/apps/bdpan/片库/Movies/旧版.mp4",
+             "--new-name", "旧版_待删除.mp4"]
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["meta"]["mode"], "plan-only")
+        self.assertEqual(payload["data"]["source"], "/apps/bdpan/片库/Movies/旧版.mp4")
+
     def test_archive_is_plan_first_and_binds_execute_to_plan_ref(self):
         base = [
             "archive",

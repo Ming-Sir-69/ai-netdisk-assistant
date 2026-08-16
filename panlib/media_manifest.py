@@ -27,6 +27,7 @@ from .naming import (
     group_folder_name,
     validate_extension,
     validate_imdb_id,
+    validate_media_id,
     validate_quality,
     validate_year,
 )
@@ -283,8 +284,8 @@ def _normalise_item(
         _fail("year must be a four-digit value between 1800 and 2199")
 
     imdb_id = _required_text(raw_item["imdb_id"], "imdb_id")
-    if not validate_imdb_id(imdb_id):
-        _fail("imdb_id must match tt followed by 7-8 digits")
+    if not validate_media_id(imdb_id):
+        _fail("imdb_id must match tt followed by 7-8 digits, or be 'none'")
 
     season = _optional_positive_integer(raw_item.get("season"), "season")
     episode = _optional_positive_integer(raw_item.get("episode"), "episode")

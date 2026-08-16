@@ -39,6 +39,7 @@ from naming import (  # noqa: E402
     sanitize,
     select_movie_title,
     validate_imdb_id,
+    validate_media_id,
     validate_year,
 )
 
@@ -674,8 +675,8 @@ def main(argv: list[str] | None = None) -> None:
         elif args.title_zh:
             raise ValueError("title-zh requires at least one production-country")
         sanitize(args.title_en)
-        if not validate_imdb_id(args.imdb_id):
-            raise ValueError("imdb_id must match tt followed by 7-8 digits")
+        if not validate_media_id(args.imdb_id):
+            raise ValueError("imdb_id must match tt followed by 7-8 digits, or be 'none'")
         if args.year and not validate_year(args.year):
             raise ValueError("year must be a four-digit value between 1800 and 2199")
         # Build the expected source folder only as a collision key.  The

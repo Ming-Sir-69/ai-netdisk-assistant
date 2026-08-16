@@ -231,6 +231,36 @@ class RecursiveGroupNamingTests(unittest.TestCase):
         )
 
 
+class BuildWithPlaceholderTests(unittest.TestCase):
+    """构造文件名时也要能写出占位符，否则「查过且无」这条规则无法执行。
+
+    判定函数早就认 {imdb-none} 了，但构造函数只认真实编号——规则写得出来、
+    落不了地。红灯区(1996) 查过确无条目，正是卡在这里。
+    """
+
+    def test_movie_filename_can_be_built_with_the_placeholder(self):
+        self.assertEqual(
+            naming.build_movie_filename("红灯区", "1996", None, "mp4", "none"),
+            "红灯区.1996.{imdb-none}.mp4",
+        )
+
+    def test_episode_filename_can_be_built_with_the_placeholder(self):
+        self.assertEqual(
+            naming.build_episode_filename("某剧", 1, 2, "none", None, "mkv"),
+            "某剧.S01E02.{imdb-none}.mkv",
+        )
+
+    def test_what_it_builds_is_recognised_as_normalized(self):
+        built = naming.build_movie_filename("红灯区", "1996", None, "mp4", "none")
+        self.assertTrue(naming.is_normalized_movie_filename(built))
+
+    def test_arbitrary_placeholder_text_is_still_rejected(self):
+        for bad in ("tbd", "unknown", "null", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    naming.build_movie_filename("片", "2001", None, "mkv", bad)
+
+
 class LegacyContainerExtensionTests(unittest.TestCase):
     """rmvb / webm 也是视频容器。
 

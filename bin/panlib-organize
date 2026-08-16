@@ -52,6 +52,7 @@ from naming import (  # noqa: E402
     select_movie_title,
     universe_dir_name,
     validate_imdb_id,
+    validate_media_id,
     validate_quality,
     validate_year,
 )
@@ -216,8 +217,8 @@ def validate_arguments(
     elif args.title_zh:
         raise ValueError("title-zh requires at least one production-country")
     sanitize(args.title_en)
-    if not validate_imdb_id(args.imdb_id):
-        raise ValueError("imdb_id must match tt followed by 7-8 digits")
+    if not validate_media_id(args.imdb_id):
+        raise ValueError("imdb_id must match tt followed by 7-8 digits, or be 'none'")
     if args.mode == "movie":
         expected_target_leaf = build_folder_name(args.title_en, args.imdb_id, args.year)
     else:
