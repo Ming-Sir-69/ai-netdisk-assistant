@@ -40,7 +40,11 @@ MAX_DEPTH = 8
 
 # 类别根与归档区本来就装目录，空着也不算整理残留。按名字识别而不是按深度，
 # 因为片库根之下未必只有类别根。
-CONTAINER_DIRS = set(CATEGORY_DIRS.values()) | {"_已归档_待删除", "_待整理"}
+CONTAINER_DIRS = set(CATEGORY_DIRS.values()) | {"_待整理"}
+
+# 归档区整棵跳过：里面的内容正等着人工删除，刻意不受命名契约约束。
+# 去挑它们的毛病只会用必然存在的噪音淹没真正的问题。
+EXCLUDED_DIRS = {"_已归档_待删除"}
 
 
 def _extension(name: str) -> str:
@@ -63,6 +67,8 @@ def audit(client: MCPBridge, root: str) -> list[dict]:
     def visit(directory: str, depth: int) -> int:
         """Return the number of media files at or below ``directory``."""
 
+        if PurePosixPath(directory).name in EXCLUDED_DIRS:
+            return 0
         if depth > MAX_DEPTH:
             findings.append(
                 _finding(

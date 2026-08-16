@@ -177,5 +177,24 @@ class AuditCliTests(unittest.TestCase):
         self.assertEqual(self.findings(self.run_audit(tree)), [])
 
 
+    def test_the_archive_area_is_left_out_of_the_audit(self):
+        # 归档区是刻意放在契约之外的：里面的东西正等着人工删除，
+        # 按命名契约去挑它们的毛病只会用必然存在的噪音淹没真正的问题。
+        tree = {
+            "/lib": [
+                self.entry("Movies", "/lib/Movies", isdir=True),
+                self.entry("_已归档_待删除", "/lib/_已归档_待删除", isdir=True),
+            ],
+            "/lib/Movies": [self.entry("A.2020", "/lib/Movies/A.2020", isdir=True)],
+            "/lib/Movies/A.2020": [
+                self.entry("A.2020.{imdb-tt1234567}.mkv", "/lib/Movies/A.2020/A.2020.{imdb-tt1234567}.mkv")
+            ],
+            "/lib/_已归档_待删除": [
+                self.entry("旧版_待删除.mp4", "/lib/_已归档_待删除/旧版_待删除.mp4")
+            ],
+        }
+        self.assertEqual(self.findings(self.run_audit(tree)), [])
+
+
 if __name__ == "__main__":
     unittest.main()
