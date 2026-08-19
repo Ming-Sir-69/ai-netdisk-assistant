@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""panlib-imdb - IMDB ID 解析器（已知表 + 格式验证）
+"""panlib-imdb - IMDB ID 解析器（默认联网查询）
 
-外部 IMDB/豆瓣 API 被反爬拦截，本 CLI 改为「已知表 + 验证 + AI 询问」模式：
+查询默认联网（Wikidata 结构化数据），这是唯一的真实查询路径：
 - 优先用 --imdb-id 参数（AI 已知的 ID）
-- 回退查内置已知表
-- 都没有 → 返回 NOT_FOUND，由 AI 询问用户
+- --title 必须配 --year，直接联网消歧
+- 内置已知表只是测试夹具，仅 --known-table 显式启用，离线也不用
 
-扩展已知表：在 IMDB_KNOWN 字典里添加条目。
+已知表不再扩展：真实查询一律走网络。
 """
 
 import argparse
@@ -106,17 +106,22 @@ def main() -> None:
         epilog="""
 示例:
   panlib-imdb --imdb-id tt1219289
-  panlib-imdb --title "永无止境"
-  panlib-imdb --title "赤裸羔羊" --year 1992 --online
+  panlib-imdb --title "永无止境" --year 2011
+  panlib-imdb --title "永无止境" --year 2011 --known-table   # 仅测试用
         """,
     )
     parser.add_argument("--imdb-id", help="已知 IMDB ID (ttXXX) — 优先使用")
-    parser.add_argument("--title", "-t", help="影视名称，查内置已知表")
-    parser.add_argument("--year", type=int, help="发行年份，联网查询时用于消歧")
+    parser.add_argument("--title", "-t", help="影视名称，默认联网查询（需配 --year）")
+    parser.add_argument("--year", type=int, help="发行年份，联网查询时用于消歧（必填）")
     parser.add_argument(
         "--online",
         action="store_true",
-        help="内置表无结果时，查 Wikidata 结构化数据（不触碰 IMDb/豆瓣网页）",
+        help="已废弃：联网查询现在是默认行为，保留仅为兼容旧调用",
+    )
+    parser.add_argument(
+        "--known-table",
+        action="store_true",
+        help="仅测试用：查内置已知表（测试夹具），真实查询与离线场景都禁用",
     )
     parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
     args = parser.parse_args()
@@ -131,47 +136,47 @@ def main() -> None:
                      meta={"source": "user-provided", "validated": True})
         return
 
-    # 路径 2: 查内置已知表
+    # 路径 2: --title 查询（默认联网；已知表仅 --known-table 测试用）
     if args.title:
-        result = lookup_known(args.title)
-        if result:
-            emit_success(result, meta={"source": "known-table", "query": args.title})
-            return
-        if args.online:
-            if args.year is None:
-                emit_error(INVALID_ARG, "--online 需要 --year 才能消歧（中文译名撞名很常见）")
-                return
-            try:
-                found = titledb_lookup(args.title, args.year)
-            except TitleLookupError as exc:
-                # 查不通 ≠ 查过且没有。前者绝不能被当成写 {imdb-none} 的依据。
-                emit_error(NETWORK, str(exc))
-                return
-            if found["status"] == "found":
-                candidate = found["candidates"][0]
-                emit_success(
-                    candidate,
-                    meta={"source": "wikidata", "query": args.title, "year": args.year},
-                )
-                return
-            if found["status"] == "ambiguous":
-                # 不替调用方挑：撞名猜错会把错误编号永久写进文件名。
-                emit_error(
-                    INVALID_ARG,
-                    f"'{args.title}' ({args.year}) 命中多个候选，需人工或 AI 裁决",
-                    details={"candidates": found["candidates"]},
-                )
+        if args.known_table:
+            result = lookup_known(args.title)
+            if result:
+                emit_success(result, meta={"source": "known-table", "query": args.title})
                 return
             emit_error(
                 NOT_FOUND,
-                f"Wikidata 中查无 '{args.title}' ({args.year})",
-                details={"searched": "wikidata", "meaning": "查过且没有，可据此写 {imdb-none}"},
+                f"内置已知表（测试夹具）无 '{args.title}'",
+                details={"hint": "真实查询请去掉 --known-table，用 --title + --year 联网查询；或用 --imdb-id 显式提供"},
+            )
+            return
+        if args.year is None:
+            emit_error(INVALID_ARG, "联网查询需要 --year 用于消歧（中文译名撞名很常见）")
+            return
+        try:
+            found = titledb_lookup(args.title, args.year)
+        except TitleLookupError as exc:
+            # 查不通 ≠ 查过且没有。前者绝不能被当成写 {imdb-none} 的依据。
+            emit_error(NETWORK, str(exc))
+            return
+        if found["status"] == "found":
+            candidate = found["candidates"][0]
+            emit_success(
+                candidate,
+                meta={"source": found.get("source", "wikidata"), "query": args.title, "year": args.year},
+            )
+            return
+        if found["status"] == "ambiguous":
+            # 不替调用方挑：撞名猜错会把错误编号永久写进文件名。
+            emit_error(
+                INVALID_ARG,
+                f"'{args.title}' ({args.year}) 命中多个候选，需人工或 AI 裁决",
+                details={"candidates": found["candidates"]},
             )
             return
         emit_error(
             NOT_FOUND,
-            f"内置已知表无 '{args.title}'，可加 --year 与 --online 联网查询",
-            details={"hint": "或用 --imdb-id 显式提供"},
+            f"Wikidata 中查无 '{args.title}' ({args.year})",
+            details={"searched": "wikidata", "meaning": "查过且没有，可据此写 {imdb-none}"},
         )
         return
 

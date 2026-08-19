@@ -82,8 +82,48 @@ class TitleLookupTests(unittest.TestCase):
         def fetch(query):
             raise OSError("connection reset")
 
+        def fallback_fetch(title):
+            raise OSError("fallback down")
+
         with self.assertRaises(titledb.LookupError):
-            titledb.lookup("X", 2000, fetch=fetch)
+            titledb.lookup("X", 2000, fetch=fetch, fallback_fetch=fallback_fetch)
+
+    def test_primary_failure_falls_back_to_imdb_suggestion(self):
+        """主源网络失败时自动走 IMDb suggestion API,并标注来源。"""
+
+        def fetch(query):
+            raise OSError("timeout")
+
+        fallback_payload = json.dumps(
+            {
+                "d": [
+                    {"id": "tt0097165", "l": "Dead Poets Society", "y": 1989},
+                    {"id": "tt0097166", "l": "Out-of-window film", "y": 1970},
+                    {"id": "nm1234567", "l": "A person, not a film", "y": 1989},
+                ]
+            }
+        )
+
+        result = titledb.lookup(
+            "Dead Poets Society", 1989, fetch=fetch, fallback_fetch=lambda title: fallback_payload
+        )
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["source"], "imdb-suggestion")
+        self.assertEqual(result["candidates"][0]["imdb_id"], "tt0097165")
+        # 降级源没有中文名与产地,调用方需要知道这一点
+        self.assertIsNone(result["candidates"][0]["title_zh"])
+        self.assertIsNone(result["candidates"][0]["country"])
+
+    def test_an_empty_fallback_is_not_absence_proof(self):
+        """降级源对中文片名覆盖弱:空结果只能算「查不通」,不能算「查过且没有」。"""
+
+        def fetch(query):
+            raise OSError("timeout")
+
+        with self.assertRaises(titledb.LookupError):
+            titledb.lookup(
+                "死亡诗社", 1989, fetch=fetch, fallback_fetch=lambda title: json.dumps({"d": []})
+            )
 
     def test_an_unparsable_response_is_not_treated_as_an_empty_result(self):
         with self.assertRaises(titledb.LookupError):

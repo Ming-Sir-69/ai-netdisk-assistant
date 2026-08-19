@@ -18,7 +18,7 @@
 |---|---|---:|---|
 | `panlib-doctor` | 无 | 是 | 无 |
 | `panlib-search` | `--keyword`, `--type`, `--limit` | 是 | 无 |
-| `panlib-imdb` | `--title` 或 `--imdb-id` | 是 | 无 |
+| `panlib-imdb` | `--title` + `--year`（默认联网），或 `--imdb-id`；`--known-table` 仅测试夹具用 | 是 | 无 |
 | `panlib-extract` | `--resource-id`, `--limit` | 是 | 无 |
 | `panlib-verify` | canonical Baidu `--url` | 是 | 无 |
 | `panlib-transfer` | resource-id/type/title/IMDb/year/quality；人工兼容 share URL | 是 | `--execute` |

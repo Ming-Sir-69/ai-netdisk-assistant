@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-08-19
+
+- `panlib-imdb` 改为默认联网查询（Wikidata）：`--title` 必须配 `--year`；内置已知表降为测试夹具，仅 `--known-table` 显式启用；`--online` 保留但废弃。
+- 联网查询增加降级源：Wikidata 不可达时自动走 IMDb suggestion API；降级源空候选不算「查过且没有」，两路都不通才报 NETWORK。
+- 全部网盘读取解析点改走 resilient 通道：`file_list` 对含 `&` 或全角括号【】的路径会失败（errno 1002），现在自动降级到关键词搜索，且搜索 key 支持多候选重试（规格词如"1080P蓝光原盘"排最后，优先中文片名 token）。
+- SKILL.md 新增：参数纪律（以 --help 与 CLI_CONTRACT.md 为唯一事实源，禁止脑补参数名）、合集分享处理流程、无百度候选降级表、"验收用直读不用搜索"规则。
+
 ## 0.1.0 - 2026-08-09
 
 - 新增搜索、IMDb 本地解析、链接提取、链接验证、转存、整理和环境诊断 7 个 CLI。
