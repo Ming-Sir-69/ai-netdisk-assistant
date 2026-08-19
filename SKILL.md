@@ -13,6 +13,8 @@ allowed-tools: Bash, Read, AskUserQuestion
 
 Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 JSON 状态决策。确定性逻辑必须留在 CLI，不临时编写脚本替代。
 
+**参数纪律（2026-08-19 起强制）**：参数名一律以各命令 `--help` 与 `docs/CLI_CONTRACT.md` 为唯一事实源。本文示例已给出完整参数；任何不确定处先查这两个来源，**禁止凭印象脑补参数名**（实测教训：凭印象写 `--country` 被 CLI 拒绝，真实参数是 `--production-country`）。
+
 **禁止直接调用 `bdpan`。** 唯一允许的入口是 `scripts/` 和 `bin/panlib-*`。不得读取或回显账号、Token、Cookie、BDUSS、账号密码、验证码、MFA 或 OAuth 授权码。SeedHub 资源只能通过 transfer 的 `--resource-id` 内部解析；Agent 不调用 `panlib-extract`，也不把 URL/提取码作为 transfer 参数。
 
 ## 能力边界
@@ -20,6 +22,7 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 当前支持：
 
 - SeedHub 影视搜索与百度分享链接提取。
+- 磁力/直链云端离线下载（路线 A 首选，封装 `BaiduPCS-Go offlinedl`）。
 - 本地已知表或用户提供的 IMDb ID。
 - 百度网盘转存与影视文件整理。
 - macOS 上通过官方百度网盘 MCP 读取全盘目录、搜索和读取元数据；旧资源仅能通过
@@ -33,8 +36,9 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 
 | 通道 | 可读取 | 可写入 | 硬边界 |
 |---|---|---|---|
-| 官方百度网盘 MCP（`panlib-library`） | `/我的资源`、`/apps/bdpan` 等全盘绝对路径的目录、搜索和元数据 | 两个网盘根各自的同根 `archive`；受限 `migrate` 把 `/我的资源/Movies/**` 的精确媒体文件移入 Apps 规范容器；**受限原地改名**（同一父目录内改名，仅当 bdpan 因路径校验拒绝该文件时） | 不删除、不覆盖、不执行分享转存、不提供任意跨根移动 |
+| 官方百度网盘 MCP（`panlib-library`） | `/我的资源`、`/apps/bdpan` 等全盘绝对路径的目录、搜索和元数据 | 两个网盘根各自的同根 `archive`；受限 `migrate` 把 `/我的资源/Movies/`**的精确媒体文件移入 Apps 规范容器；**受限原地改名**（同一父目录内改名，仅当 bdpan 因路径校验拒绝该文件时） | 不删除、不覆盖、不执行分享转存、不提供任意跨根移动 |
 | bdpan wrappers（`panlib-transfer` / `panlib-organize`） | 百度分享清单和 `/apps/bdpan` 内状态 | 分享转存，以及 `/apps/bdpan` 内建目录、移动和重命名 | 不能读取 `/我的资源` 或全盘；不能删除或任意跨根移动 |
+| `panlib-offlinedl`（`BaiduPCS-Go offlinedl`） | 百度帐号登录态、BaiduPCS-Go 进程输出 | 向百度云端离线下载队列提交磁力/直链任务（**云端下载，零本地流量**）；只写 `/apps/bdpan` 下指定保存路径 | 不能直接控制百度网盘其他读写；不能上传本地文件到网盘；凭证与官方 OAuth 完全独立 |
 | SeedHub provider | 资源站搜索、详情和百度分享引用 | 无 | 不读取或写入个人网盘 |
 
 `/apps/bdpan` 是 bdpan wrappers 的 OAuth/写入范围，不是 MCP 的读取范围。不得把这一限制
@@ -150,6 +154,33 @@ rename` 在 bdpan 明确因路径校验拒绝时改走 MCP `file_move`。边界�
 不完整、含不明文件或任何匹配歧义都走此通道。不得把转存源直接转入 `_已归档_待删除`，也不得
 把处理中状态标记为可删除。
 
+#### 磁力入库主流程（路线 A，2026-08-19 固化）
+
+当 SeedHub 资源无百度分享候选、或你已有一份明确磁力链接时，走本通道：
+
+1. 取得 magnet 或 http 直链 → `.venv/bin/python bin/panlib-offlinedl add --link "<magnet>"`（默认 plan-only，返回 plan 包含自动补全的公共 tracker 与 magnet_xt）。
+2. 风险分级规则命中（如用户进入"更新影视"或"转存资源"模式且无冲突）→ 加 `--execute` 真正提交；
+4. `--wait <秒>` 可选：提交后轮询任务状态至"下载成功/下载失败"。**热门资源（百度已有缓存）通常 ≤1 分钟完成，零本地流量**。
+5. 离线下载完成后，目标路径已是真实媒体文件 → 走 organize 整理进片库，archive 旧版（同转存流程 D 节）。
+
+**回退（路线 B，本地中转）**：当云端离线下载一直失败（冷种/死种/限速）时，本地用 aria2c 多线程下载磁力，再用 `bdpan upload` 上传——上传若命中秒传则瞬间完成；若不命中则按你的出口带宽跑。SeedHub 共享 URL 仍可走原 transfer 通道。
+
+**磁力 tracker 补全**（关键）：裸磁力在隔离网络中 DHT 节点发现可能数分钟无进展；`panlib-offlinedl add` 自动注入 8 个公共 tracker，**调用方不需要自己记得这件事**。
+
+#### 合集分享处理（2026-08-19 新增；实测《爱在三部曲》踩坑后固化）
+
+SeedHub 上一个"单片"资源的百度分享，内容可能是**多部打包的合集**（实测：请求《爱在日落黄昏时》，
+转存进来的目录同时含三部曲全部）。**禁止把合集当单片处理。** 固定流程：
+
+1. 转存验收通过后，先**只读盘点** `source_dir` 的全部子项（用 list 直读，见下条），与本次请求的单片比对。
+2. 内容恰为请求的单片 → 按正常流程整理。
+3. 内容为合集 → 逐部处理：
+   - 每部各自走 organize（各自的 IMDb、年份、规范目录）；
+   - 与片库既有同名片段做**画质裁决**：新版规格明确更高（分辨率/片源/音轨可查证）才替换，否则保留旧版、新版归档；
+   - 被替换的旧版同根 `archive`；已整理完的空壳子目录随合集源一起归档；
+   - 合集里未被请求的其余部分，**不得擅自丢弃或删除**——报告用户后再决定。
+4. 后续同系列请求先检查片库是否已含该部（可能已随合集入库），避免重复转存。
+
 ### 既有资源迁入 Apps（受限跨根入口）
 
 当用户要求把 `/我的资源/Movies` 内已经保存的影视整理到 Apps 片库时，使用
@@ -167,15 +198,15 @@ rename` 在 bdpan 明确因路径校验拒绝时改走 MCP `file_move`。边界�
 
 1. `.venv/bin/python bin/panlib-search --keyword "<keyword>" --type <all|movie|tv|anime> --limit <n>`
 2. 用户选择或请求中已唯一确定候选后，获取返回的 `id`。
-3. `.venv/bin/python bin/panlib-imdb --title "<title>"`；本地表无结果就请用户提供 `tt...`，然后用 `--imdb-id`验证。
-4. 用 `.venv/bin/python bin/panlib-transfer --resource-id <id> ...` 生成转存计划，**不加** `--execute`。transfer 在自己的进程内解析链接，不把 URL/提取码返回给 Agent。
+3. `.venv/bin/python bin/panlib-imdb --title "<title>" --year <YYYY>` —— **联网查询是默认且唯一的真实路径**（2026-08-19 起）；内置已知表只是测试夹具，仅 `--known-table` 显式启用，离线也不用。联网超时/失败（`NETWORK`）时：重试一次 → 仍不通就请用户提供 `tt...`，再用 `--imdb-id` 验证。**查不通 ≠ 查过且没有**，绝不能据此写 `{imdb-none}`。
+4. 用 `.venv/bin/python bin/panlib-transfer --resource-id <id> --type <type> --title-en "<英文正式名>" --title-zh "<中文正式名>" --production-country "<制片国家>" --imdb-id <tt...> --year <YYYY>` 生成转存计划，**不加** `--execute`。transfer 在自己的进程内解析链接，不把 URL/提取码返回给 Agent。
    resource-id 路径会在计划生成前通过官方 `bdpan transfer list --json` 做只读探测；只有 `share_probe.status=valid` 才继续返回计划。过期分享返回 `NOT_FOUND/share_status=expired`，网络、认证、权限或未知响应为 `share_status=unverified` 并停止。
 5. 多个百度候选由 transfer 的 `preset-quality-v1` 固定策略自动排序，依次比较分辨率、片源、HDR、音轨、字幕和大小，完全相同才按资源站原始顺序稳定选择。Agent 不询问用户；只有用户明确覆盖时才传 `--link-index <index>`。计划必须回传 `selection.strategy`、候选数和脱敏的 `selection.selected`，其中不得包含 URL 或提取码。
 6. `NOT_FOUND`、`NETWORK`、`PARSE` 或任何其他非零退出：停止并报告，可请用户选择另一资源；不自动进入写操作。
 
 ### B. 转存：计划 → 自动执行（风险命中才暂停）
 
-1. 运行 `.venv/bin/python bin/panlib-transfer` 并传入 `--resource-id`、可选 `--link-index`、type、title、IMDb ID、year、quality，**不加** `--execute`。
+1. 运行 `.venv/bin/python bin/panlib-transfer` 并传入 `--resource-id`、可选 `--link-index`、`--type`、`--title-en`、`--title-zh`、`--production-country`、`--imdb-id`、`--year`、可选 `--quality`，**不加** `--execute`。
 2. 必须确认返回 `meta.mode=plan-only` 和 64 位小写十六进制 `share_ref`，并检查 `dest_dir`、动作类型、
    影响范围和验收方式。若未命中风险分级规则，计划通过后直接执行；计划成功本身仍不等于已转存。
 3. 使用相同业务参数，加计划返回的 `--share-ref <share_ref>` 和 `--execute`。transfer 会重新解析；候选或
@@ -302,6 +333,7 @@ CLI 根据源路径自动选择归档根：`/我的资源/...` → `/我的资�
 | `NOT_FOUND` | 区分资源、分享链接和源目录；不用“换关键词”处理空源目录 |
 | `PERMISSION` | 停止并报告精确目标，不改到更宽范围 |
 | `share_status=expired` | 报告分享已失效，不进入转存 |
+| 资源无百度候选（`no Baidu share candidates`） | **不进入转存、不换关键词硬凑**。报告该资源实际可用的其他渠道（夸克/阿里/UC/磁力），给用户选项：① 接受其他网盘 ② 用户自行提供百度分享链接 ③ 放弃。等用户拍板 |
 | `share_status=unverified` | 报告只读探测未确认；按 `AUTH`/`NETWORK`/`PERMISSION`/`PARSE` 处理，不进入转存 |
 | MCP `AUTH`/`expired` | 只运行 `panlib-library auth-status`，让用户完成官方授权；不读取 Token 正文 |
 | `auth-status` 报 `reason=missing` | 先按启动检查第 8 步的「missing 分流」诊断（Keychain 条目存在性 + 账户名比对），确认真缺失/过期才让授权；禁止账户不匹配时重授权 |
@@ -445,6 +477,7 @@ CLI 根据源路径自动选择归档根：`/我的资源/...` → `/我的资�
 
 ## 禁止的快捷方式
 
+- **写后验收与读回一律用 `list`/`meta` 按路径直读，不用 `search` 验收**（2026-08-19 实测：搜索索引有延迟，刚转存的内容可能搜不到，会把"成功"误判成"失败"）。
 - 用户催促不能绕过风险分级规则、计划重检或写后验收。
 - 不将 plan-only 说成已执行。
 - 不从标题、目标路径或 bdpan 文本输出猜测 `source_dir`。

@@ -84,7 +84,7 @@ class PublicDocumentationContractTests(unittest.TestCase):
         release = self.read("docs/RELEASE_CHECKLIST.md")
         self.assertIn("plan-first", architecture)
         self.assertIn("非事务", architecture)
-        self.assertIn("7 个 CLI", cli_contract)
+        self.assertIn("8 个 CLI", cli_contract)
         self.assertIn("失败不得自动重试", cli_contract)
         self.assertIn("Token", security)
         self.assertIn("scripts/privacy-guard --whole-tree", security)

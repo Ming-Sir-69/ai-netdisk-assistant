@@ -38,6 +38,7 @@ from mcp_client import (  # noqa: E402
     execute_archive,
     execute_migrate,
     list_directory,
+    list_directory_resilient,
     meta_library,
     search_library,
 )
@@ -143,7 +144,7 @@ def main(argv: list[str] | None = None) -> None:
         bridge = MCPBridge.from_environment()
         if args.command == "list":
             emit_success(
-                {"path": args.path, "entries": list_directory(bridge, args.path)},
+                {"path": args.path, "entries": list_directory_resilient(bridge, args.path)[0]},
                 {"command": "panlib-library list", "mode": "read-only"},
             )
         if args.command == "search":

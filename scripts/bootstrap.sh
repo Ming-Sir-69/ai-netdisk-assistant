@@ -163,6 +163,11 @@ if ! command -v "$bdpan_cmd" >/dev/null 2>&1 && [ ! -x "$bdpan_cmd" ]; then
     add_next "bdpan 未安装；请从官方页面人工确认安装：${OFFICIAL_INSTALLER_PAGE}"
 fi
 
+offlinedl_cmd="${PANLIB_PCSGO_BIN:-BaiduPCS-Go}"
+if ! command -v "$offlinedl_cmd" >/dev/null 2>&1 && [ ! -x "$offlinedl_cmd" ] && [ ! -x "$HOME/.local/bin/BaiduPCS-Go" ]; then
+    add_next "BaiduPCS-Go 未安装（路线 A 首选通道，磁力云端离线下载依赖）。从 https://github.com/qjfoidnh/BaiduPCS-Go/releases 下载 darwin-arm64 包，解压后把二进制放到 PATH 里或 ~/.local/bin/BaiduPCS-Go（或设置 PANLIB_PCSGO_BIN 指向绝对路径）。脚本仅检测，不自动安装。"
+fi
+
 overall="not_ready"
 if { [ "$venv_status" = "existing" ] || [ "$venv_status" = "created" ]; } \
     && [ "$dependency_status" = "ready" ] && [ "$bdpan_status" = "present" ]; then

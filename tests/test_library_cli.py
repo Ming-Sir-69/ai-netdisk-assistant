@@ -268,6 +268,34 @@ class SearchFallbackTests(unittest.TestCase):
         with self.assertRaises(MCPBridgeError):
             list_directory_resilient(Broken(set(), []), "/lib/X")
 
+    def test_noisy_spec_tokens_are_skipped_for_cjk_title_keys(self):
+        """规格词(1080P蓝光原盘)命中面太宽搜不到子项时,自动换中文片名 token 重试。
+
+        2026-08-19 实测:SeedHub 转存目录 `【爱在三部曲】【4K + 1080P蓝光原盘】...`
+        的最长 token 是规格词,搜索返回一堆无关文件,子项一个都不在里面。
+        """
+        from panlib.mcp_client import list_directory_resilient
+
+        target = "/lib/【爱在三部曲】【4K + 1080P蓝光原盘】【收藏版】"
+
+        class KeyAware(self.Client):
+            def call(self, tool, arguments):
+                if tool == "file_list":
+                    raise MCPBridgeError("INVALID_ARG", "params error")
+                if arguments.get("key") == "1080P蓝光原盘":
+                    # 规格词搜索:返回一堆无关文件,没有目标目录的子项
+                    return {"list": [
+                        {"server_filename": "unrelated.mkv", "path": "/lib/Elsewhere/unrelated.mkv", "isdir": False},
+                    ]}
+                # 中文片名 token 才搜得到真正的子项
+                return {"list": [
+                    {"server_filename": "爱在黎明破晓前（1995）", "path": f"{target}/爱在黎明破晓前（1995）", "isdir": True},
+                ]}
+
+        entries, method = list_directory_resilient(KeyAware(set(), []), target)
+        self.assertEqual(method, "search")
+        self.assertEqual([item["name"] for item in entries], ["爱在黎明破晓前（1995）"])
+
 
 class InplaceRenameTests(unittest.TestCase):
     """MCP 原地改名：只为 bdpan 根本无法寻址的文件名存在。

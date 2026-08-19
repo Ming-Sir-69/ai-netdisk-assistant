@@ -404,8 +404,9 @@ def list_directory_resilient(
 ) -> tuple[list[dict[str, Any]], str]:
     """Return ``(entries, channel)`` for a directory, falling back to search.
 
-    `file_list` 对路径里含 ``&`` 的目录直接失败（errno 1002），而
-    `file_keyword_search` 读得好好的。**坏的是接口不是数据**——改文件名去迁就
+    `file_list` 对路径里含 ``&`` 或全角括号（``【】``）的目录直接失败（errno 1002），而
+    `file_keyword_search` 读得好好的（后者 2026-08-19 实测：SeedHub 分享目录名几乎必带
+    ``【】``）。**坏的是接口不是数据**——改文件名去迁就
     一个有 bug 的接口，会让片库和真实片名（《史密斯夫妇》《傲慢与偏见》官方名
     本就带 ``&``）永久脱节，所以兜底做在工具这一侧。
 
@@ -416,24 +417,51 @@ def list_directory_resilient(
     try:
         return list_directory(client, path), "list"
     except MCPBridgeError as listing_error:
-        try:
-            hits = search_library(client, _search_key(path), parent_path(path))
-        except MCPBridgeError:
-            raise listing_error from None
-        return [item for item in hits if parent_path(str(item.get("path") or "")) == path], "search"
+        search_reachable = False
+        for key in _search_keys(path):
+            try:
+                hits = search_library(client, key, parent_path(path))
+            except MCPBridgeError:
+                continue
+            search_reachable = True
+            children = [
+                item for item in hits if parent_path(str(item.get("path") or "")) == path
+            ]
+            if children:
+                return children, "search"
+        if search_reachable:
+            # 搜索通道可达、所有候选 key 都无子项命中:按空目录处理(与原语义一致)
+            return [], "search"
+        raise listing_error from None
 
 
-def _search_key(path: str) -> str:
-    """Pick the most distinctive token of a directory name to search by."""
+# 规格词命中面太宽(实测 2026-08-19:`1080P蓝光原盘` 会命中全库无关文件),
+# 搜索 key 里把它们排到最后。
+_NOISY_TOKEN = re.compile(
+    r"(?i)\d{3,4}p|4k|8k|蓝光|原盘|remux|web-?dl|bluray|hdr|杜比|字幕|音轨|双语"
+    r"|无水印|未删减|收藏版|珍藏版|高码|可剪辑|特效|修复版|完整版"
+)
 
-    # 先剥掉分组标记：`Dash.&.Lily.{series}` 里最长的 token 是 series，
-    # 拿它去搜什么也搜不到，兜底会静悄悄返回空——「读不到」于是伪装成
-    # 「是空的」，比读不到本身更危险。
+
+def _search_keys(path: str) -> list[str]:
+    """Candidate search keys for one directory, most distinctive first.
+
+    剥掉分组标记(`series` 不做 key);规格词排到最后;优先含中文的长 token。
+    返回多个候选,由调用方逐个尝试——单个最长 token 可能是规格词而搜不到子项。
+    """
     name = basename(path)
     if name.endswith(_SERIES_MARKER):
         name = name[: -len(_SERIES_MARKER)]
-    tokens = re.findall(r"[\w\u4e00-\u9fff]+", name)
-    return max(tokens, key=len) if tokens else basename(path)
+    tokens = set(re.findall(r"[\w\u4e00-\u9fff]+", name))
+    if not tokens:
+        return [basename(path)]
+
+    def _rank(token: str) -> tuple:
+        noisy = bool(_NOISY_TOKEN.search(token))
+        cjk = bool(re.search(r"[\u4e00-\u9fff]", token))
+        return (noisy, not cjk, -len(token))
+
+    return sorted(tokens, key=_rank)
 
 
 def meta_library(client: MCPBridge, *, path: str | None = None, fsid: str | None = None) -> Any:
@@ -453,7 +481,7 @@ def meta_library(client: MCPBridge, *, path: str | None = None, fsid: str | None
     if path:
         target = validate_mcp_path(path, allow_root=False)
         matches = _exact_path_matches(
-            list_directory(client, parent_path(target)), target, basename(target)
+            list_directory_resilient(client, parent_path(target))[0], target, basename(target)
         )
         identifiers = {
             str(item["fsid"]) for item in matches if item.get("fsid") is not None
@@ -497,7 +525,7 @@ def _exact_path_matches(
 def _source_entry(client: MCPBridge, source: str) -> dict[str, Any]:
     source = validate_mcp_path(source, allow_root=False)
     parent = parent_path(source)
-    entries = list_directory(client, parent)
+    entries = list_directory_resilient(client, parent)[0]
     matches = _exact_path_matches(entries, source, basename(source))
     if not matches:
         # file_list is page-bounded; use the official keyword search scoped to
@@ -520,7 +548,7 @@ def _migration_source_entry(client: MCPBridge, source: str) -> dict[str, Any]:
     if suffix not in _MIGRATION_MEDIA_EXTENSIONS:
         raise ValueError("migration source must be a supported video or subtitle file")
     parent = parent_path(source)
-    entries = list_directory(client, parent)
+    entries = list_directory_resilient(client, parent)[0]
     matches = _exact_path_matches(entries, source, basename(source))
     if not matches:
         matches = _exact_path_matches(
@@ -538,7 +566,7 @@ def _postcondition_matches(client: MCPBridge, path: str) -> list[dict[str, Any]]
     """Find an exact post-write path beyond the first list page when needed."""
 
     name = basename(path)
-    matches = _exact_path_matches(list_directory(client, parent_path(path)), path, name)
+    matches = _exact_path_matches(list_directory_resilient(client, parent_path(path))[0], path, name)
     if not matches:
         matches = _exact_path_matches(
             search_library(client, name, parent_path(path)), path, name
@@ -552,7 +580,7 @@ def _migration_target_matches(client: MCPBridge, target_dir: str) -> list[dict[s
     target_dir = validate_migration_target(target_dir)
     name = basename(target_dir)
     matches = _exact_path_matches(
-        list_directory(client, APPS_LIBRARY_MOVIES_ROOT), target_dir, name
+        list_directory_resilient(client, APPS_LIBRARY_MOVIES_ROOT)[0], target_dir, name
     )
     if not matches:
         matches = _exact_path_matches(
@@ -582,7 +610,7 @@ def _migration_snapshot(
         raise MCPBridgeError("INVALID_ARG", "migration target must be a directory")
     target_children: list[dict[str, Any]] = []
     if target_matches:
-        target_children = list_directory(client, target_dir)
+        target_children = list_directory_resilient(client, target_dir)[0]
     target_path = target_dir.rstrip("/") + "/" + new_name
     target_child_matches = _exact_path_matches(target_children, target_path, new_name)
     if not target_child_matches and target_matches:
@@ -760,7 +788,7 @@ def _archive_snapshot(
     if new_name in {".", ".."} or any(ord(char) < 32 or ord(char) == 127 for char in new_name):
         raise ValueError("new-name contains an unsafe character")
     source_item = _source_entry(client, source)
-    target_items = list_directory(client, archive_dir)
+    target_items = list_directory_resilient(client, archive_dir)[0]
     target_path = archive_dir.rstrip("/") + "/" + new_name
     target_matches = _exact_path_matches(target_items, target_path, new_name)
     if not target_matches:

@@ -2,7 +2,7 @@
 
 ## 通用 I/O
 
-本项目原有 **7 个 CLI**：`panlib-doctor`、`panlib-search`、`panlib-imdb`、`panlib-extract`、`panlib-verify`、`panlib-transfer`、`panlib-organize`；另提供 `panlib-library` 全盘 MCP 入口。
+本项目原有 **8 个 CLI**：`panlib-doctor`、`panlib-search`、`panlib-imdb`、`panlib-offlinedl`（磁力云端离线下载，路线 A 首选）、`panlib-extract`、`panlib-verify`、`panlib-transfer`、`panlib-organize`；另提供 `panlib-library` 全盘 MCP 入口。
 
 - Python 业务 CLI 进入主逻辑后，stdout 为机器可读 JSON：成功为 `{"data": ..., "meta": ...}`，失败为 `{"error": {"code": ..., "message": ..., "details": ...}}`。
 - `panlib-doctor` 是独立诊断契约：`{"status": ..., "checks": ..., "next_steps": [...]}`。只有顶层 `status=ready` 可继续。
@@ -18,7 +18,10 @@
 |---|---|---:|---|
 | `panlib-doctor` | 无 | 是 | 无 |
 | `panlib-search` | `--keyword`, `--type`, `--limit` | 是 | 无 |
-| `panlib-imdb` | `--title` 或 `--imdb-id` | 是 | 无 |
+| `panlib-imdb` | `--title` + `--year`（默认联网），或 `--imdb-id`；`--known-table` 仅测试夹具用 | 是 | 无 |
+| `panlib-offlinedl add` | `--link`（magnet/直链，自动补 tracker），可选 `--save-path` | 是 | `--execute`（可选 `--wait <秒>` 轮询） |
+| `panlib-offlinedl status` | `--task-id` | 是 | 无 |
+| `panlib-offlinedl who` | 无 | 是 | 无 |
 | `panlib-extract` | `--resource-id`, `--limit` | 是 | 无 |
 | `panlib-verify` | canonical Baidu `--url` | 是 | 无 |
 | `panlib-transfer` | resource-id/type/title/IMDb/year/quality；人工兼容 share URL | 是 | `--execute` |
