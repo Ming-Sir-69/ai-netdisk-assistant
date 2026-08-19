@@ -4,8 +4,9 @@
 
 - `panlib-imdb` 改为默认联网查询（Wikidata）：`--title` 必须配 `--year`；内置已知表降为测试夹具，仅 `--known-table` 显式启用；`--online` 保留但废弃。
 - 联网查询增加降级源：Wikidata 不可达时自动走 IMDb suggestion API；降级源空候选不算「查过且没有」，两路都不通才报 NETWORK。
-- 全部网盘读取解析点改走 resilient 通道：`file_list` 对含 `&` 或全角括号【】的路径会失败（errno 1002），现在自动降级到关键词搜索，且搜索 key 支持多候选重试（规格词如"1080P蓝光原盘"排最后，优先中文片名 token）。
-- SKILL.md 新增：参数纪律（以 --help 与 CLI_CONTRACT.md 为唯一事实源，禁止脑补参数名）、合集分享处理流程、无百度候选降级表、"验收用直读不用搜索"规则。
+- 全部网盘读取解析点改走 resilient 通道：`file_list` 对含 `&` 或全角括号（``【】``）的目录直接失败（errno 1002），现在自动降级到关键词搜索，且搜索 key 支持多候选重试（规格词如"1080P蓝光原盘"排最后，优先中文片名 token）。
+- 新增 `panlib-offlinedl` CLI：路线 A 首选通道，封装 `BaiduPCS-Go offlinedl` 做磁力/直链云端离线下载（零本地流量）；自动补全公共 tracker（实测裸磁力在隔离网络里 3 分钟零进展，补 tracker 后 45 秒开下）；独立凭证（cookie 通道，与官方 OAuth 分开管）。
+- SKILL.md 新增：参数纪律（以 --help 与 CLI_CONTRACT.md 为唯一事实源，禁止脑补参数名）、合集分享处理流程、无百度候选降级表、"验收用直读不用搜索"规则、磁力入库主流程。
 
 ## 0.1.0 - 2026-08-09
 

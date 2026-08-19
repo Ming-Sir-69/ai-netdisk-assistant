@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""panlib-offlinedl - 磁力/直链云端离线下载（包装 BaiduPCS-Go offlinedl）
+
+路线 A（首选）：云端离线下载，零本地流量；热门资源百度有缓存时「秒下」。
+路线 B（本地下载+上传）是回退，不在本 CLI 内。
+
+纪律与 panlib-transfer 一致：默认 plan-only，加 --execute 才提交任务。
+任务提交后轮询状态由本 CLI 的 status 子命令负责；写入台账沿用 panlib.journal。
+
+凭证边界：本命令只调用 BaiduPCS-Go 二进制，不读取、不回显其 cookie 配置；
+登录态由用户本人在终端完成（参考 SKILL.md 的浏览器扫码流）。
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+
+from common import (
+    AUTH,
+    INVALID_ARG,
+    NETWORK,
+    NOT_FOUND,
+    emit_error,
+    emit_success,
+    log,
+)
+
+# 裸磁力在部分网络里 DHT 永远找不到节点（2026-08-19 实测：不挂 tracker 三分钟零进展，
+# 挂上公共 tracker 约 45 秒拿到元数据）。统一补全，不让调用方记住这件事。
+DEFAULT_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "https://tracker.tamersunion.org:443/announce",
+]
+
+DEFAULT_SAVE_PATH = "/apps/bdpan/片库/Movies"
+
+_PCSGO_CANDIDATES = [
+    os.environ.get("PANLIB_PCSGO_BIN", ""),
+    shutil.which("BaiduPCS-Go") or "",
+    str(Path.home() / ".local" / "bin" / "BaiduPCS-Go"),
+]
+
+
+def find_binary() -> str | None:
+    for candidate in _PCSGO_CANDIDATES:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def normalize_magnet(link: str) -> str:
+    """磁力链接补全公共 tracker；已是完整链接则原样返回。"""
+    link = link.strip()
+    if not link.startswith("magnet:"):
+        raise ValueError("not a magnet link")
+    if "&tr=" in link or "?tr=" in link:
+        return link
+    from urllib.parse import quote
+
+    suffix = "".join("&tr=" + quote(t, safe="") for t in DEFAULT_TRACKERS)
+    return link + suffix
+
+
+def run_pcsco(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    binary = find_binary()
+    if binary is None:
+        raise FileNotFoundError("BaiduPCS-Go binary not found")
+    return subprocess.run(
+        [binary, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def parse_task_id(output: str) -> str | None:
+    m = re.search(r"任务ID\(task_id\):\s*(\d+)", output)
+    return m.group(1) if m else None
+
+
+def parse_task_status(output: str, task_id: str) -> dict:
+    """从 offlinedl query 的表格输出里提取目标任务的状态。"""
+    for line in output.splitlines():
+        if task_id in line:
+            status = "unknown"
+            for marker in ("下载成功", "下载失败", "下载中", "等待", "进行中"):
+                if marker in line:
+                    status = marker
+                    break
+            size_m = re.search(r"([\d.]+)\s*(GB|MB|GiB|MiB)", line)
+            name_m = re.search(rf"{task_id}\s+(.+?)\s+[\d.]+\s*(?:GB|MB|GiB|MiB)", line)
+            return {
+                "task_id": task_id,
+                "status": status,
+                "size": size_m.group(0) if size_m else None,
+                "name": name_m.group(1).strip() if name_m else None,
+            }
+    return {"task_id": task_id, "status": "not_in_list"}
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    try:
+        link = normalize_magnet(args.link)
+    except ValueError as exc:
+        emit_error(INVALID_ARG, str(exc))
+        return
+
+    save_path = args.save_path or DEFAULT_SAVE_PATH
+    plan = {
+        "action": "offlinedl_add",
+        "save_path": save_path,
+        "magnet_xt": re.search(r"xt=urn:btih:([0-9a-fA-F]+)", link).group(1)
+        if re.search(r"xt=urn:btih:([0-9a-fA-F]+)", link)
+        else None,
+        "trackers_injected": "&tr=" in link and "&tr=" not in args.link,
+    }
+
+    if not args.execute:
+        plan["mode"] = "plan-only"
+        emit_success(plan, meta={"command": "panlib-offlinedl add", "mode": "plan-only"})
+        return
+
+    result = run_pcsco(["offlinedl", "add", "-path=" + save_path, link], timeout=180)
+    output = (result.stdout or "") + (result.stderr or "")
+    task_id = parse_task_id(output)
+    if task_id is None:
+        lowered = output.lower()
+        if any(m in output for m in ("登录", "未登录")) or "auth" in lowered:
+            emit_error(AUTH, "BaiduPCS-Go 未登录或登录态失效，请用户在终端完成登录")
+        else:
+            emit_error(NETWORK, f"离线下载任务提交失败: {output.strip()[:200]}")
+        return
+
+    data = dict(plan)
+    data.update({"executed": True, "task_id": task_id})
+
+    if args.wait > 0:
+        deadline = time.time() + args.wait
+        final = None
+        while time.time() < deadline:
+            time.sleep(5)
+            q = run_pcsco(["offlinedl", "query", task_id], timeout=60)
+            final = parse_task_status((q.stdout or "") + (q.stderr or ""), task_id)
+            if final["status"] in ("下载成功", "下载失败"):
+                break
+        if final:
+            data["final_status"] = final
+            if final["status"] == "下载失败":
+                emit_error(
+                    NETWORK,
+                    "离线下载失败（冷种/死种或缓存未命中）",
+                    details=data,
+                )
+                return
+    emit_success(data, meta={"command": "panlib-offlinedl add", "mode": "execute"})
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    result = run_pcsco(["offlinedl", "query", args.task_id], timeout=60)
+    output = (result.stdout or "") + (result.stderr or "")
+    status = parse_task_status(output, args.task_id)
+    if status["status"] == "not_in_list":
+        emit_error(NOT_FOUND, f"任务 {args.task_id} 不在离线下载列表中")
+        return
+    emit_success(status, meta={"command": "panlib-offlinedl status", "mode": "read-only"})
+
+
+def cmd_who(args: argparse.Namespace) -> None:
+    result = run_pcsco(["who"], timeout=30)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if "uid" in output:
+        emit_success({"logged_in": True}, meta={"command": "panlib-offlinedl who", "mode": "read-only"})
+    else:
+        emit_error(AUTH, "BaiduPCS-Go 未登录")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="磁力/直链云端离线下载（路线 A 首选通道）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  panlib-offlinedl add --link "magnet:?xt=urn:btih:..."            # 计划
+  panlib-offlinedl add --link "magnet:?xt=..." --execute --wait 120
+  panlib-offlinedl status --task-id 12345
+  panlib-offlinedl who
+        """,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="提交离线下载任务（默认 plan-only）")
+    p_add.add_argument("--link", required=True, help="magnet 链接（自动补公共 tracker）")
+    p_add.add_argument("--save-path", default=None, help=f"保存路径（默认 {DEFAULT_SAVE_PATH}）")
+    p_add.add_argument("--execute", action="store_true", help="真正提交任务")
+    p_add.add_argument("--wait", type=int, default=0, help="提交后轮询等待秒数（0=不等待）")
+    p_add.set_defaults(func=cmd_add)
+
+    p_status = sub.add_parser("status", help="查询任务状态（只读）")
+    p_status.add_argument("--task-id", required=True)
+    p_status.set_defaults(func=cmd_status)
+
+    p_who = sub.add_parser("who", help="检查 BaiduPCS-Go 登录态（只读）")
+    p_who.set_defaults(func=cmd_who)
+
+    args = parser.parse_args()
+    if find_binary() is None:
+        emit_error(
+            NOT_FOUND,
+            "找不到 BaiduPCS-Go 二进制。设 PANLIB_PCSGO_BIN 环境变量，或参考 SKILL.md 安装",
+        )
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
