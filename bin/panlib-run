@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""韧性执行器：把重试、断点续跑、manifest 生成收进 CLI，模型只需下达意图。
+
+这条链路上有三个环节是间歇性失败的（实测）：
+  1. SeedHub 探测      —— unverified/NETWORK，重试 3-5 次后通常转 valid
+  2. 百度 mv/list      —— HTTP 403 errno=20013，中途断，但不丢文件，重跑即继续
+  3. plan→execute      —— 候选列表每次重排，share_ref 需定向重找
+
+轻量模型很难自行推导出"应该重试"和"重试到什么条件为止"，因此这些韧性策略
+必须是 CLI 的责任，而不是模型的责任。本命令的每个子命令都自带收敛判据：
+跑完即达成目标，或明确报告卡在哪一步。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+PY = str(REPO / ".venv/bin/python")
+sys.path.insert(0, str(REPO / "panlib"))
+from common import emit_success, emit_error, INVALID_ARG, NETWORK  # noqa: E402
+
+SUBS = {".ass", ".srt", ".ssa", ".sub", ".sup", ".vtt", ".idx"}
+VIDEO = {".mkv", ".mp4", ".ts", ".avi", ".m2ts", ".mov"}
+
+
+def sh(args: list[str], timeout: int = 900) -> tuple[int, str]:
+    r = subprocess.run([PY] + args, cwd=REPO, capture_output=True,
+                       text=True, timeout=timeout)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def cloud_list(path: str) -> list[dict] | None:
+    code, out = sh(["bin/panlib-library", "list", "--path", path], timeout=180)
+    if code != 0:
+        return None
+    try:
+        return json.loads(out[out.index("{"):])["data"]["entries"]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- probe
+def cmd_probe(a) -> int:
+    """多轮探测分享健康度。单次失败不是结论——这是本仓库最常见的误判来源。"""
+    results, valid = [], 0
+    for i in range(1, a.rounds + 1):
+        argv = ["bin/panlib-transfer", "--resource-id", a.resource_id, "--type", a.type,
+                "--title-en", a.title_en, "--imdb-id", a.imdb_id, "--year", a.year]
+        if a.link_index is not None:
+            argv += ["--link-index", str(a.link_index)]
+        _, out = sh(argv, timeout=180)
+        ok = '"share_status": "valid"' in out
+        ref = re.search(r'"share_ref": "([0-9a-f]{64})"', out)
+        desc = re.search(r'"description": "([^"]{0,70})', out)
+        code = re.search(r'"code": "([A-Z_]+)"', out)
+        results.append({"round": i, "valid": ok,
+                        "share_ref": ref.group(1) if ref else None,
+                        "code": None if ok else (code.group(1) if code else "UNKNOWN"),
+                        "description": desc.group(1) if desc else None})
+        valid += ok
+        if ok and a.stop_on_valid:
+            break
+        if i < a.rounds:
+            time.sleep(a.interval)
+    healthy = valid > 0
+    emit_success({
+        "resource_id": a.resource_id, "rounds": len(results),
+        "valid_count": valid, "healthy": healthy,
+        "verdict": ("分享可用——只要有一次 valid 就说明活着，失败是探测抖动"
+                    if healthy else
+                    f"{len(results)} 轮全失败，可判定该分享确实不可用；换资源或走磁力通道"),
+        "usable_share_ref": next((r["share_ref"] for r in results if r["valid"]), None),
+        "rounds_detail": results,
+    }, {"command": "panlib-run probe", "mode": "read-only"})
+    return 0 if healthy else 1
+
+
+# ------------------------------------------------------- transfer-select
+def cmd_transfer_select(a) -> int:
+    """精准转存，自动跨越候选列表重排与长度波动。"""
+    fsids = ",".join(x.strip() for c in a.fsid for x in str(c).split(",") if x.strip())
+    base = ["bin/panlib-share", "select", "-r", a.resource_id,
+            "--type", a.type, "--dest-dir", a.dest_dir, "--fsid", fsids]
+    _, plan = sh(base, timeout=300)
+    ref = re.search(r'"share_ref": "([0-9a-f]{64})"', plan)
+    if not ref:
+        emit_error(NETWORK, "could not obtain a plan share_ref",
+                   {"hint": "先用 panlib-run probe 确认该分享是否可用"})
+        return 1
+    share_ref = ref.group(1)
+    for i in range(1, a.max_rounds + 1):
+        _, out = sh(base + ["--share-ref", share_ref, "--execute"], timeout=900)
+        if '"executed": true' in out:
+            # 转存已经发生。此处再 or [] 会把"验收读不到"谎报成"落地 0 个"，
+            # 诱导调用方重复转存——与 panlib-lib 修过的是同一个 bug。
+            got = cloud_list(a.dest_dir)
+            want = len(fsids.split(","))
+            if got is None:
+                emit_error(NETWORK,
+                           "BLOCKED：转存已执行，但目标目录读取失败，落地情况未知",
+                           {"status": "BLOCKED", "executed": True,
+                            "dest_dir": a.dest_dir, "requested": want,
+                            "landed": None, "rounds_used": i,
+                            "next_action": "先用 panlib-library list 确认目标目录，"
+                                           "再决定是否补转；不要直接重跑转存"})
+                return 2
+            files = [e for e in got if not e.get("isdir")]
+            complete = len(files) >= want
+            emit_success({
+                # 转存动作成功 ≠ 文件都到齐了。数量不符必须以非零退出码告知下游，
+                # 否则脚本化调用会把残缺结果当成功继续往下走。
+                "status": "DONE" if complete else "CONTINUE",
+                "executed": True, "rounds_used": i, "dest_dir": a.dest_dir,
+                "requested": want, "landed": len(files), "complete": complete,
+                "next_action": ("可进入整理" if complete else
+                                f"只落地 {len(files)}/{want}，需补齐后再整理"),
+                "entries": [e["name"] for e in files],
+            }, {"command": "panlib-run transfer-select", "mode": "executed"})
+            return 0 if complete else 1
+        if i < a.max_rounds:
+            time.sleep(a.interval)
+    emit_error(NETWORK, f"transfer-select failed after {a.max_rounds} rounds",
+               {"share_ref": share_ref,
+                "hint": "候选列表可能处于退化窗口；稍后重试或换 resource_id"})
+    return 1
+
+
+# ------------------------------------------------------ organize-season
+def build_manifest(entries, season, title_en, imdb_id, quality, numeric, out_path) -> int:
+    items = []
+    for e in entries:
+        if e.get("isdir"):
+            continue
+        name = e["name"]
+        ext = Path(name).suffix.lower()
+        if ext not in VIDEO and ext not in SUBS:
+            continue
+        if numeric:
+            m = re.fullmatch(r"(\d{1,3})\." + ext[1:], name, re.IGNORECASE)
+            if not m:
+                continue
+            ep = int(m.group(1))
+        else:
+            m = re.search(r"S(\d{1,2})E(\d{1,3})", name, re.IGNORECASE)
+            if not m or int(m.group(1)) != season:
+                continue
+            ep = int(m.group(2))
+        items.append({
+            "source_path": e["path"], "fs_id": int(e["fsid"]), "size": e["size"],
+            "layout": "episode", "canonical_title": title_en, "year": None,
+            "imdb_id": imdb_id, "season": season, "episode": ep, "quality": quality,
+        })
+    Path(out_path).write_text(json.dumps(
+        {"version": 1, "category": "tv", "groups": [], "items": items},
+        ensure_ascii=False, indent=1))
+    return len(items)
+
+
+def cmd_organize_season(a) -> int:
+    """整理一季进规范容器，403 中断自动断点续跑至源目录清空。"""
+    rounds, stalled, prev_left = [], 0, None
+    tmp = REPO / "runtime" / f"_run-s{a.season:02d}.json"
+    tmp.parent.mkdir(exist_ok=True)
+    moved_any = False          # 本次运行是否真的搬动过文件
+    for i in range(1, a.max_rounds + 1):
+        entries = cloud_list(a.source_dir)
+        if entries is None:
+            rounds.append({"round": i, "note": "list failed, retrying"})
+            stalled += 1
+            if stalled >= 4:
+                emit_error(NETWORK, "连续 4 轮无法读取源目录",
+                           {"status": "BLOCKED", "rounds_detail": rounds,
+                            "next_action": "排查授权/网络后重跑本命令"})
+                return 2
+            time.sleep(a.interval); continue
+        left = [e for e in entries if not e.get("isdir")]
+        if not left:
+            # 首轮就为空有两种可能：真的已整理完，或路径写错/内容从未转存。
+            # 底层 list 对不存在路径也返回空+exit 0，无法区分，因此绝不能宣称完成。
+            if i == 1 and not moved_any:
+                emit_error(INVALID_ARG,
+                           "BLOCKED：源目录首次读取即为空，无法区分'已整理完'与'路径错/未转存'",
+                           {"status": "BLOCKED", "source_dir": a.source_dir,
+                            "next_action": "用 panlib-library list 确认该路径确实存在且为空；"
+                                           "若内容尚未转存，先执行 transfer-select"})
+                return 2
+            emit_success({
+                "status": "DONE", "done": True, "rounds_used": i,
+                "source_dir": a.source_dir,
+                "note": "SOURCE EMPTY — 该季全部文件已迁入规范容器",
+                "rounds_detail": rounds,
+            }, {"command": "panlib-run organize-season", "mode": "executed"})
+            return 0
+
+        # 真实进展只看剩余文件数是否下降。仅凭子命令返回码判断会漏掉
+        # "报成功但一个文件都没搬动"的空转，白耗满 max_rounds。
+        if prev_left is not None and len(left) >= prev_left:
+            stalled += 1
+        else:
+            stalled = 0
+        prev_left = len(left)
+        if stalled >= 3:
+            emit_error(NETWORK, "连续 3 轮剩余文件数无下降，判定空转",
+                       {"status": "BLOCKED", "remaining": len(left),
+                        "remaining_names": [e["name"] for e in left][:10],
+                        "rounds_detail": rounds,
+                        "next_action": "已迁移文件不会丢失；排查后可重跑本命令继续"})
+            return 2
+
+        n = build_manifest(left, a.season, a.title_en, a.imdb_id,
+                           a.quality, a.numeric, tmp)
+        if n == 0:
+            emit_error(INVALID_ARG, "源目录剩余文件无法解析集号",
+                       {"status": "BLOCKED",
+                        "remaining": [e["name"] for e in left][:20],
+                        "next_action": "纯数字命名请加 --numeric；季号存疑时先 ffprobe 实证"})
+            return 2
+        _, plan = sh(["bin/panlib-organize", "--source-dir", a.source_dir,
+                      "--manifest-file", str(tmp)], timeout=300)
+        pr = re.search(r'"plan_ref": "([0-9a-f]{64})"', plan)
+        if not pr:
+            rounds.append({"round": i, "items": n, "remaining": len(left),
+                           "note": "plan failed"})
+            time.sleep(a.interval); continue
+        _, ex = sh(["bin/panlib-organize", "--source-dir", a.source_dir,
+                    "--manifest-file", str(tmp), "--plan-ref", pr.group(1),
+                    "--execute"], timeout=1500)
+        ok = '"executed": true' in ex
+        if ok:
+            moved_any = True
+        rounds.append({"round": i, "items": n, "remaining_before": len(left),
+                       "result": "OK" if ok else "PARTIAL"})
+        time.sleep(a.interval if not ok else 3)
+    emit_error(NETWORK, f"organize 在 {a.max_rounds} 轮后仍未清空源目录",
+               {"status": "CONTINUE", "rounds_detail": rounds,
+                "next_action": "已迁移文件不会丢失；再次运行本命令可继续"})
+    return 1
+
+
+# ---------------------------------------------------------------- archive
+def cmd_archive(a) -> int:
+    for i in range(1, a.max_rounds + 1):
+        _, plan = sh(["bin/panlib-library", "archive", "--source", a.source,
+                      "--new-name", a.new_name], timeout=180)
+        pr = re.search(r"\b([0-9a-f]{64})\b", plan)
+        if not pr:
+            time.sleep(a.interval); continue
+        _, out = sh(["bin/panlib-library", "archive", "--source", a.source,
+                     "--new-name", a.new_name, "--plan-ref", pr.group(1),
+                     "--execute"], timeout=300)
+        if '"status": "verified"' in out:
+            emit_success({"archived": True, "rounds_used": i,
+                          "source": a.source, "new_name": a.new_name},
+                         {"command": "panlib-run archive", "mode": "executed"})
+            return 0
+        time.sleep(a.interval)
+    emit_error(NETWORK, "archive 未能在重试内完成", {"source": a.source})
+    return 1
+
+
+def cmd_selfcheck(a) -> int:
+    """自检：确认三个高层算子齐备可用。新机器或换模型后先跑一次。"""
+    need = ["panlib-plan", "panlib-run", "panlib-lib", "panlib-share",
+            "panlib-transfer", "panlib-organize", "panlib-library"]
+    rows, ok_all = [], True
+    for n in need:
+        p = REPO / "bin" / n
+        exists = p.exists()
+        runs = False
+        if exists:
+            r = subprocess.run([PY, str(p), "--help"], cwd=REPO,
+                               capture_output=True, text=True, timeout=60)
+            runs = r.returncode == 0
+        ok_all &= exists and runs
+        rows.append({"tool": n, "exists": exists, "runnable": runs})
+    emit_success({
+        "ready": ok_all, "tools": rows,
+        "next": ("环境完整。任何任务的第一步：panlib-plan list" if ok_all
+                 else "缺失或不可运行的工具见上表；先修复再执行业务流程"),
+    }, {"command": "panlib-run selfcheck", "mode": "read-only"})
+    return 0 if ok_all else 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="韧性执行器：内建重试与断点续跑，模型无需自行处理间歇性失败。\n"
+                    "【只读】probe / selfcheck —— 不触碰网盘，可随意重跑\n"
+                    "【写网盘】transfer-select / organize-season / archive —— "
+                    "会真实修改网盘，但均为可恢复操作（不删除、不覆盖）",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--interval", type=int, default=8)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("probe", help="[只读] 多轮探测分享健康度（单次失败不是结论）")
+    pr.add_argument("-r", "--resource-id", required=True)
+    pr.add_argument("--type", default="tv")
+    pr.add_argument("--title-en", default="Probe")
+    pr.add_argument("--imdb-id", default="tt0000000")
+    pr.add_argument("--year", default="2020")
+    pr.add_argument("--link-index", type=int, default=None)
+    pr.add_argument("--rounds", type=int, default=5)
+    pr.add_argument("--stop-on-valid", action="store_true", default=True)
+
+    ts = sub.add_parser("transfer-select", help="[写网盘] 精准转存，自动跨越候选摆动")
+    ts.add_argument("-r", "--resource-id", required=True)
+    ts.add_argument("--fsid", action="append", required=True)
+    ts.add_argument("--dest-dir", required=True)
+    ts.add_argument("--type", default="tv")
+    ts.add_argument("--max-rounds", type=int, default=12)
+
+    og = sub.add_parser("organize-season", help="[写网盘] 整理一季，403 中断自动续跑")
+    og.add_argument("--source-dir", required=True)
+    og.add_argument("--season", type=int, required=True)
+    og.add_argument("--title-en", required=True)
+    og.add_argument("--imdb-id", required=True)
+    og.add_argument("--quality", required=True)
+    og.add_argument("--numeric", action="store_true", help="源为纯数字文件名（季号须已实证）")
+    og.add_argument("--max-rounds", type=int, default=10)
+
+    ar = sub.add_parser("archive", help="[写网盘] 归档目录，不删除（自动重试）")
+    ar.add_argument("--source", required=True)
+    ar.add_argument("--new-name", required=True)
+    ar.add_argument("--max-rounds", type=int, default=5)
+
+    sub.add_parser("selfcheck", help="[只读] 自检：确认算子齐备（换机器/换模型后先跑）")
+
+    a = p.parse_args()
+    for sp in (a,):
+        if not hasattr(sp, "interval"):
+            sp.interval = 8
+    a.interval = getattr(a, "interval", 8) or 8
+    return {"probe": cmd_probe, "transfer-select": cmd_transfer_select,
+            "organize-season": cmd_organize_season, "archive": cmd_archive,
+            "selfcheck": cmd_selfcheck}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

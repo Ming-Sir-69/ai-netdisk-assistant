@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""片库审计：查已有内容、验收命名合规。
+
+存在的理由：本仓库实测中最大的一次浪费，是反复重试转存一部**已经在网盘里**的内容
+（37 轮全败，文件其实早就随合集转存进来了）。因此"先查已有"必须是一条
+零思考成本的命令，而不是指望模型想起来去 list 一遍。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+PY = str(REPO / ".venv/bin/python")
+sys.path.insert(0, str(REPO / "panlib"))
+from common import emit_success, emit_error, NOT_FOUND  # noqa: E402
+
+ROOTS = {
+    "tv": "/apps/bdpan/片库/TV shows",
+    "movie": "/apps/bdpan/片库/Movies",
+    "anime": "/apps/bdpan/片库/Animation",
+    "documentary": "/apps/bdpan/片库/Documentary",
+}
+EP_RE = re.compile(r"^(?P<t>.+)\.S(?P<s>\d{2})E(?P<e>\d{2})\.\{imdb-(?P<i>tt\d+|none)\}"
+                   r"\.(?P<q>\d+p)\.(?P<x>mkv|mp4|ts|ass|srt|ssa|sub|sup|vtt|idx)$")
+VIDEO_EXT = {"mkv", "mp4", "ts"}
+
+
+def cloud_list(path: str):
+    """返回 entries；读取失败返回 None——调用方必须区分 None(读不到) 与 []（确实为空）。"""
+    r = subprocess.run([PY, "bin/panlib-library", "list", "--path", path],
+                       cwd=REPO, capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout[r.stdout.index("{"):])["data"]["entries"]
+    except Exception:
+        return None
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", s.lower())
+
+
+def find_containers(root: str, title: str):
+    """返回 (containers, readable)。readable=False 表示根目录读取失败，
+    此时"没找到"是无信息的，绝不能当作"不存在"。"""
+    entries = cloud_list(root)
+    if entries is None:
+        return [], False
+    key = norm(title)
+    return [e for e in entries if e.get("isdir") and key and key in norm(e["name"])], True
+
+
+def season_report(season_path: str):
+    entries = cloud_list(season_path)
+    if entries is None:
+        return {"readable": False, "episodes": 0, "subtitles": 0,
+                "episode_numbers": [], "missing_episodes": [], "qualities": [],
+                "size_gb": 0, "compliant": False,
+                "issues": [{"name": season_path, "issue": "目录读取失败，内容未知"}]}
+    vids, subs, bad, eps, quals = [], [], [], set(), set()
+    for e in entries:
+        if e.get("isdir"):
+            bad.append({"name": e["name"], "issue": "内容节点内不应有子目录"})
+            continue
+        m = EP_RE.match(e["name"])
+        if not m:
+            bad.append({"name": e["name"], "issue": "文件名不符合规范模板"})
+            continue
+        if m.group("x") in VIDEO_EXT:
+            vids.append(e); eps.add(int(m.group("e"))); quals.add(m.group("q"))
+        else:
+            subs.append(e)
+    gaps = []
+    if eps:
+        gaps = [n for n in range(1, max(eps) + 1) if n not in eps]
+    size = sum(e["size"] for e in vids) / 1024 ** 3
+    return {"readable": True, "episodes": len(vids), "subtitles": len(subs),
+            "episode_numbers": sorted(eps), "missing_episodes": gaps,
+            "qualities": sorted(quals),
+            # 清晰度取自文件名，不是 ffprobe 实测；命名错则此判定跟着错。
+            "quality_source": "filename",
+            "quality_mixed_within_season": len(quals) > 1,
+            "size_gb": round(size, 1),
+            "compliant": not bad and not gaps, "issues": bad}
+
+
+def cmd_find(a) -> int:
+    root = ROOTS[a.type]
+    hits, readable = find_containers(root, a.title)
+
+    # 读不到 ≠ 不存在。把"不知道"报告成"没有"，会让下游重复获取已存在的内容，
+    # 这与用布尔值当停机判据是同一类错误：把不确定伪装成确定。
+    # 必须走 emit_error：emit_success 硬编码 exit 0，脚本化调用会读成成功。
+    if not readable:
+        emit_error(NOT_FOUND, f"BLOCKED：无法读取片库根 {root}，本次检查无结论",
+                   {"status": "BLOCKED", "found": None, "satisfied": False,
+                    "reasons": ["library_unreadable"],
+                    "next_action": "先排查授权/网络；不要据此判定内容不存在，"
+                                   "更不要重新获取"})
+        return 2
+
+    out, unreadable = [], []
+    for c in hits:
+        subs = cloud_list(c["path"])
+        if subs is None:
+            unreadable.append(c["name"])
+            continue
+        for s in [x for x in subs if x.get("isdir")]:
+            m = re.search(r"S(\d{1,2})$", s["name"])
+            if a.season and (not m or int(m.group(1)) != int(a.season)):
+                continue
+            rep = season_report(s["path"])
+            if not rep.get("readable", True):
+                unreadable.append(s["name"])
+                continue
+            out.append({"container": c["name"], "season_dir": s["name"],
+                        "path": s["path"], **rep})
+
+    if unreadable:
+        emit_error(NOT_FOUND, "BLOCKED：部分目录读取失败，本次检查无结论",
+                   {"status": "BLOCKED", "found": bool(out), "satisfied": False,
+                    "reasons": [f"unreadable_paths={unreadable}"],
+                    "partial_seasons": [s["season_dir"] for s in out],
+                    "next_action": "排查后重跑；不要基于残缺读数做获取决策"})
+        return 2
+
+    # 三态停机判定：found=true 只说明"有"，不等于"够"。
+    # 混淆这两者会漏判残缺入库和画质不达标——这是本命令存在的主要理由。
+    want_q = a.want_quality
+    want_eps = int(a.want_episodes) if a.want_episodes else None
+    reasons: list[str] = []
+    if not out:
+        status, action = "CONTINUE", "片库没有该内容，进入获取流程"
+        reasons.append("no_container")
+    else:
+        gaps = [n for s in out for n in s["missing_episodes"]]
+        noncompliant = [s["season_dir"] for s in out if not s["compliant"]]
+        quals = sorted({q for s in out for q in s["qualities"]})
+        mixed = [s["season_dir"] for s in out
+                 if s.get("quality_mixed_within_season")]
+        short = [s["season_dir"] for s in out
+                 if want_eps and s["episodes"] < want_eps]
+        qual_bad = bool(want_q) and any(q != want_q for q in quals)
+        if gaps:
+            reasons.append(f"missing_episodes={sorted(set(gaps))}")
+        if short:
+            reasons.append(f"episode_count_below_expected={short}")
+        if noncompliant:
+            reasons.append(f"noncompliant_naming={noncompliant}")
+        if mixed:
+            reasons.append(f"quality_mixed_within_season={mixed}")
+        if qual_bad:
+            reasons.append(f"quality_mismatch: got={quals} want={want_q}")
+        if reasons:
+            status = "CONTINUE"
+            action = ("已有内容但不满足要求，需补齐/升级——"
+                      "不要当作已完成而停止")
+        else:
+            status, action = "DONE", "已有且完整合规，无需重新获取"
+
+    emit_success({
+        "status": status,                 # DONE | CONTINUE | BLOCKED
+        "found": bool(out),               # 仅表示"存在"，不表示"完成"
+        "satisfied": status == "DONE",    # 真正的完成判据
+        "reasons": reasons,
+        "next_action": action,
+        "quality_source": "filename",     # 非 ffprobe 实测，命名错则判定跟着错
+        "title": a.title, "root": root,
+        "containers": [c["name"] for c in hits], "seasons": out,
+        "verdict": f"{status}：{action}",
+    }, {"command": "panlib-audit find", "mode": "read-only"})
+    return 0
+
+
+def cmd_verify(a) -> int:
+    root = ROOTS[a.type]
+    hits, readable = find_containers(root, a.title)
+    if not readable:
+        emit_error(NOT_FOUND, f"片库根不可读: {root}",
+                   {"status": "BLOCKED",
+                    "next_action": "排查授权/网络后重跑；本次验收无结论"})
+        return 2
+    if not hits:
+        emit_error(NOT_FOUND, f"片库中未找到匹配容器: {a.title}", {"root": root})
+        return 1
+    report, all_ok, unreadable = [], True, []
+    for c in hits:
+        subs = cloud_list(c["path"])
+        if subs is None:
+            unreadable.append(c["name"]); continue
+        for s in [x for x in subs if x.get("isdir")]:
+            rep = season_report(s["path"])
+            if not rep.get("readable", True):
+                unreadable.append(s["name"]); continue
+            all_ok &= rep["compliant"]
+            report.append({"container": c["name"], "season": s["name"], **rep})
+    if unreadable:
+        emit_error(NOT_FOUND, "部分目录读取失败，验收无结论",
+                   {"status": "BLOCKED", "unreadable": unreadable,
+                    "next_action": "排查后重跑，不要据此宣称合规"})
+        return 2
+    quals = sorted({q for r in report for q in r["qualities"]})
+    mixed = [r["season"] for r in report if r.get("quality_mixed_within_season")]
+    emit_success({
+        "status": "DONE" if (all_ok and len(quals) <= 1 and not mixed) else "CONTINUE",
+        "title": a.title, "all_compliant": all_ok,
+        "quality_consistent": len(quals) <= 1 and not mixed,
+        "qualities_present": quals,
+        "quality_mixed_seasons": mixed,
+        "quality_source": "filename",
+        "seasons": report,
+        "verdict": ("全部合规" if all_ok else "存在不合规项，见各季 issues") +
+                   ("" if len(quals) <= 1 else f"；跨季清晰度不统一：{quals}") +
+                   ("" if not mixed else f"；季内混装清晰度：{mixed}"),
+    }, {"command": "panlib-audit verify", "mode": "read-only"})
+    return 0 if all_ok else 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="片库审计：查已有 + 验收合规")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("find", help="[只读] 查片库是否已有（获取前必跑，返回三态）")
+    f.add_argument("--title", required=True)
+    f.add_argument("--season", default=None)
+    f.add_argument("--type", choices=sorted(ROOTS), default="tv")
+    f.add_argument("--want-quality", default=None,
+                   help="期望清晰度（如 2160p）；不满足则判 CONTINUE 而非 DONE")
+    f.add_argument("--want-episodes", default=None,
+                   help="期望集数；不足则判 CONTINUE")
+    v = sub.add_parser("verify", help="[只读] 验收命名合规与清晰度一致性")
+    v.add_argument("--title", required=True)
+    v.add_argument("--type", choices=sorted(ROOTS), default="tv")
+    a = p.parse_args()
+    return cmd_find(a) if a.cmd == "find" else cmd_verify(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

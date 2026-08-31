@@ -9,6 +9,83 @@ allowed-tools: Bash, Read, AskUserQuestion
 
 # AI 网盘助手
 
+## 第一步永远是问路由器（强制，2026-08-31 起）
+
+**不要凭记忆规划步骤。** 收到任何影视获取/升级/整理请求，第一条命令固定是：
+
+```bash
+cd <仓库根> && .venv/bin/python bin/panlib-plan list
+.venv/bin/python bin/panlib-plan show --task <匹配的task> --title "<片名>" --season <N>
+```
+
+它会返回**逐条可直接执行的命令**，每步自带 `why`（为什么不能跳）、`expect`（成功判据）、`on_fail`（唯一下一步）。照着执行即可，不需要自行推理顺序、不需要记住踩过的坑。
+
+| 用户说 | task |
+|---|---|
+| 找/下/存某剧某季 | `acquire-season` |
+| 画质不一致、想换更清晰的 | `upgrade-quality` |
+| 整理网盘里已有的乱结构 | `organize-existing` |
+| 反复失败、报"资源失效" | `diagnose-failure` |
+
+**这条规则存在的原因**：本仓库实测中最贵的几次失败，全部源于"不知道有某个工具"或"不知道该按什么顺序做"，而不是推理能力不足。路由器把这类知识从"需要模型记住"变成"查一下就有"。
+
+## 四个高层算子（优先用它们，而不是裸调底层命令）
+
+> 完整契约表（副作用 / 停机语义 / 退出码 / 分层）见 `references/operators.md`。
+> **读写边界看 help 里的 `[只读]` / `[写网盘]` 标注**，不要靠命令名猜。
+
+底层命令（`panlib-transfer` / `panlib-organize` / `panlib-library`）是**单次、无重试**的原语。
+这条链路上三个环节都是间歇性失败的，裸用原语必然踩坑。**默认使用下面三个封装**：
+
+| 算子 | 作用 | 替代了什么 |
+|---|---|---|
+| `bin/panlib-lib` | 查片库已有 / 验收命名合规 | 手工 list + 肉眼比对 |
+| `bin/panlib-share` | 浏览分享内部 / 按 fs_id 精准转存 | 整包 `panlib-transfer` |
+| `bin/panlib-run` | 带重试与断点续跑地执行写操作 | 裸调 transfer/organize/archive |
+
+```bash
+# 获取前必跑：确认片库是否已有（最高频的浪费来源）
+.venv/bin/python bin/panlib-lib find --title "<片名>" [--season N]
+# 交付前必跑：一条命令验完所有季的命名合规与清晰度一致性
+.venv/bin/python bin/panlib-lib verify --title "<片名>"
+
+# 分享健康度：单次失败不是结论，probe 多轮取证
+.venv/bin/python bin/panlib-run probe -r <id> --title-en "<名>" --imdb-id <tt> --year <年> --rounds 5
+# 精准转存：自动跨越候选列表重排/长度波动
+.venv/bin/python bin/panlib-run transfer-select -r <id> --fsid <a>,<b> --dest-dir "<隔离区>"
+# 整理一季：403 中断自动断点续跑至源目录清空
+.venv/bin/python bin/panlib-run organize-season --source-dir "<源>" --season N \
+  --title-en "<英文名>" --imdb-id <tt> --quality <2160p> [--numeric]
+# 归档：自动重试
+.venv/bin/python bin/panlib-run archive --source "<路径>" --new-name "<名>_待删除"
+```
+
+**韧性是 CLI 的责任，不是模型的责任。** 看到 `unverified`、`NETWORK`、`403/errno=20013`、
+`share changed since the plan` 时，**不要自己写重试循环，也不要判定资源失效**——
+换用对应的 `panlib-run` 子命令，它内建了实测收敛的重试策略。
+
+环境自检（换机器或换模型后先跑一次）：
+
+```bash
+.venv/bin/python bin/panlib-run selfcheck
+```
+
+### 为什么是这四个算子（设计依据）
+
+本仓库实测中的四次代价最高的失败，根因**全部是信息缺失，不是推理能力不足**——
+因此对策必须是确定性封装，而不是更详细的文档（文档会被跳过，命令不会）：
+
+| 实测失败 | 代价 | 现在由谁兜住 |
+|---|---|---|
+| 不知道有 `transfer select`，整包转存 400GB 还漏掉 4K 目录 | 拿错版本 | `panlib-share browse` 是配方第 4 步，标了 ★ |
+| 用 legacy 参数建出 `Stranger Things`（应为 `Stranger.Things.{series}`） | 全库返工 | `panlib-run organize-season` 只走 manifest 路径 |
+| 单次探测失败就判"分享已失效" | 结论错误 | `panlib-run probe --rounds N` 多轮取证 |
+| 反复转存一部**已在网盘里**的内容 | 白跑 37 轮 | `panlib-lib find` 是配方第 1 步，标了不可跳过 |
+
+**判断新增能力该放哪一层**：一次性排查 → 临时脚本；会重复出现的判断 → 写进配方的
+`expect`/`on_fail`；会重复出现的**动作** → 做成 `panlib-run` 子命令。
+不要把需要重复执行的东西留在 SKILL.md 的散文里。
+
 ## 核心原则
 
 Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 JSON 状态决策。确定性逻辑必须留在 CLI，不临时编写脚本替代。
@@ -31,6 +108,12 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
   片库的规范电影目录；它不是通用全盘移动。
 - 可替换凭证接口默认使用 macOS Keychain；其他系统只能显式接入受控
   `external-command` 安全代理，不提供明文文件回退。
+
+### Keychain 写入 128 字节截断（2026-08-30 实测修复，铁律）
+
+`security add-generic-password -w` 走**交互式 stdin**（不带值、走隐藏两次输入提示）在 macOS 上会**静默截断到 128 字节，且返回码为 0、不报错**——用 178 字节的 MCP JSON 凭证和更长的 bdpan 凭证反复实测复现（50/100/120/127/128 字节写入无损，129 字节起精确截到 128 字节）。MCP 的 JSON payload、bdpan 的 access+refresh token 组合几乎总会超过 128 字节，这条路径此前一直在**悄悄丢数据**而不报任何错误。
+
+修复：`panlib/keychain_store.py::MacOSKeychain.set()` 已改为 `security add-generic-password ... -w <value>`（值作为 argv 尾随参数直传，而不是走隐藏输入），实测 500 字节无损。代价是该值在这个短生命周期子进程运行期间对本机同用户的其他进程通过 `ps` 可见——铭哥已明确对单用户个人机场景接受此权衡（比静默丢数据更安全）。**任何未来改动都不得把 `set()` 改回走 `secret_input`/交互式 stdin 传参**，这是已验证过的真实回归点，不是理论顾虑。
 
 ### 通道能力矩阵（唯一权限判定）
 
@@ -91,7 +174,21 @@ Agent 只把用户意图翻译为结构化参数、调用本仓库 CLI、根据 
 5. 缺少 bdpan：展示并打开 `https://github.com/baidu-netdisk/bdpan-storage` 或官方 `skills/baidu-drive/scripts/install.sh` 页，停止等待用户安装。不静默下载或执行外部安装器。
 6. 未授权：运行 `./scripts/login.sh`。用户自行阅读提示、在百度官方页登录、将 32 位授权码粘贴到终端并回车。Agent 不索要授权码。
 7. 运行 `./bin/panlib-doctor`。仅顶层 `status=ready` 可继续；其他状态按 `next_steps` 停止或交给用户。
-8. 运行 `.venv/bin/python bin/panlib-library auth-status`。macOS 已有有效授权（保存在 Keychain）时继续，且不得再次打开浏览器。仅当 Keychain 未配置或过期时，给用户 `scripts/authorize_mcp_macos.py` 的绝对路径和唯一命令，让用户在自己可见的终端手动运行；完整回调只粘贴到脚本的隐藏输入，不发送给 Agent。其他系统只有在用户已配置 `external-command` 安全代理时继续；仓库不创建明文凭证文件。授权后非交互检查由 Agent 执行。
+8. 运行 `.venv/bin/python bin/panlib-library auth-status`。macOS 已有有效授权（保存在 Keychain）时继续。仅当 Keychain 未配置或过期时，进入下方「WebBridge 自动续期通道」（用户已明确授权此模式为个人单机场景默认路径）；用户明确拒绝或 WebBridge 不可用时才退回 `scripts/authorize_mcp_macos.py` 人工终端方式。其他系统只有在用户已配置 `external-command` 安全代理时继续；仓库不创建明文凭证文件。授权后非交互检查由 Agent 执行。
+
+### WebBridge 自动续期通道（2026-08-30 铭哥定，个人单机场景默认路径）
+
+MCP（简化模式，30 天硬限，无 refresh_token）与 bdpan（授权码模式，refresh_token 有效期 10 年但需定期触发刷新）都需要偶尔重新走一次浏览器授权页。铭哥已明确：这是他自己的账号仅供个人使用，Kimi WebBridge 驱动他本机已登录的真实浏览器（非无头爬虫、非新建干净会话）去读取官方 OAuth 回调，风险等同于他自己手动点击，可自动化、无需每次人工确认。
+
+**判断入口**：`curl http://127.0.0.1:10086/status` 查 `extension_connected`；为 `false` 时先 `~/.kimi-webbridge/bin/kimi-webbridge start` 再复查一次，仍未连接则该次跳过并记录日志，不报错、不催用户去手动点插件——浏览器插件不常驻是预期状态，下个 cron 周期自然会重试。
+
+**统一入口脚本**：`scripts/webbridge_reauth.py`（新增，2026-08-30）：
+- `--check`：仅在 MCP/bdpan 任一方剩余天数 < 5 天时触发对应续期，否则原样跳过。
+- `--force-mcp` / `--force-bdpan`：无视剩余天数强制续期一次，用于验证或紧急处理。
+- 内部流程：`navigate` 到官方 OAuth 授权页 → `snapshot` 读取页面（MCP 读重定向 URL 里的 `access_token`/`expires_in`/`scope`；bdpan 读页面正文里的一次性授权码）→ 写回 Keychain（MCP）或调用 `bdpan login --set-code`（bdpan）→ 写后用 `auth-status`/`whoami` 验证。
+- 每次尝试（成功或失败）都追加一行到 `runtime/reauth_journal.jsonl`，字段含 `target`、`error_code`（失败时）、`next_action`、`status`（成功时），复用仓库既有台账规范，不新造格式。
+
+**cron 化**：已建 Hermes cron job「网盘MCP+bdpan凭证自动续期」，`0 10 */5 * *`（每 5 天一次，30 天窗口留足冗余），`deliver=local` 静默运行，只有真正续期失败且临近过期时才提醒用户；正常续期成功或本次因插件未连接而跳过都不打扰。用户新开一台机器或重建 cron 时，照此 schedule 与 prompt 重建即可，不必每次重新设计。
 
    **`reason=missing` 分流（先诊断，不要让用户重授权）**：自 2026-08-11 起账户解析用 `_current_user()`（`$USER` → `pwd.getpwuid` → getuser 兜底），WorkBuddy 沙盒 `LOGNAME=root` 不再误判。若仍报 missing，按序只读排查：
    1. `security find-generic-password -a "$USER" -s "ai-netdisk-manager.baidu-mcp.oauth"`（不带 `-w`）——有条目输出 = 凭证存在，是账户名不匹配；
@@ -225,7 +322,7 @@ SeedHub 上一个"单片"资源的百度分享，内容可能是**多部打包�
 1. **只有两种节点，靠后缀区分**：目录名以 `.{series}` 结尾即**分组节点**，其中可继续放分组节点或
    内容节点，**层数不限**；不带该后缀即**内容节点**，其中只允许媒体文件与外挂字幕，**不得再有子目录**。
    该判定是纯字符串判断——不看年份、不查名单、不依赖 Agent 常识，因此程序不会认错。
-2. **类别根由配置提供**：`movie → Movies`、`tv → TV shows`、`anime → 动漫`、
+2. **类别根由配置提供**：`movie → Movies`、`tv → TV shows`、`anime → Animation`（2026-08-30 起，见下方「类别根命名统一」）、
    `documentary → Documentary`、`webdrama → 网剧`。新增类别只改配置，不改代码，也不临时猜路径。
 3. **不存在“宇宙”这一特殊层**：漫威、DC 及任何其他聚合都只是普通分组节点，命名同样是
    `{分组名}.{series}`。**不得再维护“只允许两个宇宙”的封闭名单**——那是 2026-08-15 之前的僵化规则，已废止。
@@ -334,10 +431,135 @@ CLI 根据源路径自动选择归档根：`/我的资源/...` → `/我的资�
 | `PERMISSION` | 停止并报告精确目标，不改到更宽范围 |
 | `share_status=expired` | 报告分享已失效，不进入转存 |
 | 资源无百度候选（`no Baidu share candidates`） | **不进入转存、不换关键词硬凑**。报告该资源实际可用的其他渠道（夸克/阿里/UC/磁力），给用户选项：① 接受其他网盘 ② 用户自行提供百度分享链接 ③ 放弃。等用户拍板 |
+| `NETWORK`（SeedHub 侧）连续出现 | **先怀疑自己把站点打限流了**，不要判定"资源失效"。见下方「分享健康度分诊」 |
 | `share_status=unverified` | 报告只读探测未确认；按 `AUTH`/`NETWORK`/`PERMISSION`/`PARSE` 处理，不进入转存 |
 | MCP `AUTH`/`expired` | 只运行 `panlib-library auth-status`，让用户完成官方授权；不读取 Token 正文 |
 | `auth-status` 报 `reason=missing` | 先按启动检查第 8 步的「missing 分流」诊断（Keychain 条目存在性 + 账户名比对），确认真缺失/过期才让授权；禁止账户不匹配时重授权 |
 | `ambiguous` / `unverified` 或上层验收标为 `partial` | 停止，不继续整理，不宣称完成 |
+
+### 分享健康度分诊（2026-08-31 实测固化，铭哥《怪奇物语》案例）
+
+**核心教训：单次探测结果不可作为判据。** 实测同一批 resource-id 连跑三轮，同一条链接出现 valid / expired / unverified 三种结果轮换——不是分享状态在变，是**探测本身不可靠**。据单次失败就向用户报告"分享已失效"是错误结论。
+
+失败分两个独立层，必须先分层再决策：
+
+| 现象 | 层 | 判据 | 处置 |
+|---|---|---|---|
+| `NETWORK`、`PARSE`（SeedHub 取详情失败） | 资源站层 | 裸 `curl` 资源页返回 **429**（限流）或 **403**（Cloudflare 挑战） | **我们自己打的**。停手冷却 ≥5 分钟再试，不是资源问题 |
+| `share_status=unverified` + `errno=13001` | 百度分享层 | 冷却后**多次**探测仍稳定失败 | 该百度分享真的坏了（已取消/已删除/已失效），换资源或换通道 |
+| 探测结果在多次间跳变 | 探测层 | 同一 id 出现 valid↔expired↔unverified | 判据不足，**必须冷却后重测**，不得据此下结论 |
+
+**强制流程**：任何 `NETWORK`/`unverified` 结论，都要求「冷却 + 至少 3 次复测 + 结果一致」才能写进给用户的报告。**禁止串行连打多个 resource-id**——实测连打 15 次即触发 429，之后所有探测结果全部失真，会把好资源误判成坏资源。批量处理时每次探测间隔 ≥3 秒。
+
+**健康度优先选源**：同一部剧的多个季条目，先各探 1 次做健康度排序，优先转存 `valid` 的条目；一个 `valid` 的合集分享（常含全系列）胜过五个逐季探测。实测 S05 条目的分享内含 S01–S05 全集，一次转存解决四个季。
+
+### 通道选择判据（不要盲目换方案）
+
+四条通道解决的是**不同层**的问题，换通道只在对应层失败时才有意义：
+
+| 通道 | 绕过什么 | 什么时候换过去 |
+|---|---|---|
+| 分享链接转存（默认） | —— | 默认 |
+| QR→HTML 提取 | 页面无明文直链 | **已内置在 `link_start` 解析里**，不是独立方案，无需人工切换 |
+| 磁力云端离线（`panlib-offlinedl`） | 绕过 SeedHub 分享 + 百度分享**两层** | 百度分享确认坏死（冷却后稳定 13001）时的唯一有效替代 |
+| 本地下载再上传 | 绕过百度云端离线（冷/死种） | 云端离线也失败时的兜底，有本地流量成本 |
+
+**关键判断**：分享坏死是**源的问题**，不是传输方式的问题。换 QR、换解析路径都无效——它们取的是同一条已经死掉的链接。只有磁力通道换了源，才真正有效。
+
+### 重试是一等公民（2026-08-31 实测固化）
+
+这条链路上**三个独立环节都是间歇性失败**，单次失败一律不构成结论：
+
+| 环节 | 症状 | 实测 | 对策 |
+|---|---|---|---|
+| SeedHub 探测 | `unverified` / `NETWORK` | S01/S03/S04 都在第 3–4 次重试后拿到 `valid` | 探测重试 ≥5 次，间隔 8–12 秒 |
+| 百度 `mv`/`list` | HTTP 403 `errno=20013` | S01、S02 迁移中途各断一次，重跑即继续 | **循环重跑至源目录清空**，不是权限问题 |
+| plan→execute | `share changed since the plan` | 候选 ref 在两个值间摆动 | 见下方「候选摆动」 |
+
+**批量写操作必须写成"重跑到源目录为空"的循环**，而不是单次执行 + 失败报错。已固化为 `panlib-run organize-season`（每轮重新 list → 重新生成 manifest → plan → execute），实测 S01 两轮、S02 两轮收敛。403 中断**不会丢文件**，已迁移的留在目标、未迁移的留在源，重跑即补齐。
+
+**候选摆动（根因已查明，2026-08-31）**：**SeedHub 的候选列表每次请求都会重排，`--link-index` 不是稳定标识符。** 实测同一 resource-id 连探三轮，`idx=0` 返回了两个完全不同的资源，`idx=3`/`idx=4` 同样各返回两个。因此：
+
+- `--share-ref` 在 execute 重解析时对不上是**必然**，不是偶发；
+- **缩短 plan→execute 间隔无效**（实测 12 轮全败）；
+- **锁 `--link-index` 也无效**（实测 25 轮全败）；
+- 用 description 内容指纹匹配同样无法稳定拿到 valid。
+
+**正确对策：不要跟这个摆动硬拼。** 转存一个资源时，SeedHub 上同一部作品往往有 5–12 个候选，且**大量候选是"全系列合集"**——转存任意一个成功的合集，往往就同时拿到了其他所有季。本次 S01–S05 全部来自**一次**成功的 S05 转存，S04 也在同一个合集里。
+
+**关键认知转变：先在已转存内容里找，再考虑新转存。** 遇到某一季转存不下来时，第一步应该是 `panlib-library list` 检查已有合集里是不是已经有了，而不是反复重试转存。本次 S04 卡了 37 轮转存，最后发现文件早就躺在网盘里。
+
+### 精准转存：`panlib-share`（2026-08-31 新增，铭哥提议）
+
+**能力**：先看清分享内部结构，再只转存需要的文件，不必整包吞下几百 GB。
+
+```bash
+# 1) 只读浏览分享根层
+.venv/bin/python bin/panlib-share browse -r <resource_id>
+# 2) 逐层深入（用上一步返回的 path）
+.venv/bin/python bin/panlib-share browse -r <resource_id> --source-dir "/某目录/子目录"
+# 3) 精准转存指定 fs_id（plan-only）
+.venv/bin/python bin/panlib-share select -r <resource_id> --type tv \
+  --dest-dir "/apps/bdpan/片库/TV shows/_待整理_<标签>" --fsid <id1>,<id2>,...
+# 4) 回传 share_ref 执行
+.venv/bin/python bin/panlib-share select ... --share-ref <64hex> --execute
+```
+
+安全边界与 `panlib-transfer` 一致：URL/提取码只在进程内解析，输出全脱敏；plan-only 默认；execute 必须回传 `share_ref`；写前后各读一次目标目录做验收。
+
+**实测价值**：S05 合集分享共 400+ GB，其中「4K HDR 杜比视界」子目录 85 GB 是想要的。整包转存会拖进大量无关内容并淹没目标；`browse` 三层定位 + `select` 八个 fs_id，**一轮成功，只落 85 GB**。之前整包转存时恰恰漏掉了这个 4K 目录，只拿到同级的 1080p 版本——**不 browse 就不知道分享里还有更好的版本**。
+
+**必读坑**：`bdpan transfer list --json` 的字段是 `items` 和 `is_dir`（不是 `list`/`isdir`），用错会把目录全判成文件、或报 "no recognizable file list"。
+
+**share_ref 定向重找（候选摆动的正解）**：`panlib-share select --execute` 在首次解析 ref 失配时，会遍历候选集按 `share_ref` 定向重找目标分享。因为 ref 绑定的是 URL+提取码本身，无论这次它排在第几位都能锁定，而 ref 不匹配的分享依然被拒绝——**安全边界没放宽，只是不再被顺序抖动误伤**。`panlib-run transfer-select` 已内建该重试，可跨越候选列表的长度波动（实测同一分钟内候选数在 1 和 9 之间跳）。
+
+### 让"不小心存到"变成"刻意存到"（确定性提升）
+
+本次 S01–S04 能成，一半靠运气：合集恰好被整包转存进来了。**下次没有这个运气时，正确顺序是：**
+
+1. **先 `browse`，不要先 `transfer`。** 用 `panlib-share browse` 逐层看清分享里到底有什么、各版本画质如何、目标内容的 fs_id 是多少。这一步是**只读**的，不消耗网盘空间，也不产生需要清理的残留。
+2. **按需 `select`，落到隔离区。** 转存到 `/apps/bdpan/片库/TV shows/_待整理_<标签>`，而不是直接落到类别根——避免与片库既有内容混在一起难以分辨本次转存了什么。
+3. **`organize` 进规范容器，再归档隔离区。** 隔离区清空后随即 archive，保持根目录干净。
+
+这条路径把"整包转存 + 事后大海捞针"换成了"先看清 + 精准取 + 隔离落地"，每一步的产出都可预期、可验收、可回滚。**整包 `panlib-transfer` 只在确实想要整个分享时才用。**
+
+### 纯数字文件名的季号判定（ffprobe 实证法）
+
+合集里常见 `01.mkv`–`09.mkv` 这类无季号命名。**禁止靠数量猜季**，但可以用 ffprobe 实测取证：
+
+```bash
+bdpan download "<云端路径>" ./probe.mkv     # 取头部即可，几分钟后 kill
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_name,width,height \
+  -show_entries format=duration,bit_rate -of default=nw=1 probe.mkv
+```
+
+判据示例（本次 S04）：时长 3786s（63 分钟）——第三季每集约 50 分钟，只有第四季才有 63–98 分钟的超长集；配合 9 集数量、父目录标注「第1-4季」、S01/S02/S03 三个子目录已被单独整理走，四条独立证据交叉确认季号。**单一证据不足以定季，至少要两条独立证据。**
+
+生成器已内建：`panlib-run organize-season --numeric`（纯数字名 → manifest v1，季号由调用方在取证后指定）。
+
+### 画质核验：只认 ffprobe，不认文件名和体积
+
+体积大 ≠ 画质高。本次实测：
+
+| 来源 | 分辨率 | 均值 | 码率 |
+|---|---|---|---|
+| 已入库 S03（WEB-DL HDR10） | 3840×2160 | 6.2 GB/集 | 5.9 Mbps |
+| 合集 S04（REMUX） | 3840×**1920** | 12.7 GB/集 | 19.0 Mbps |
+
+两者**同为 2160p**，高度差异是宽银幕裁切（第四季确有 2.00:1 画幅），不是降质。体积和码率的两倍差来自 REMUX 与 WEB-DL 的封装差别。**只用文件名或体积判断画质会得出错误结论，必须 ffprobe 实测 width/height。**
+
+### 结构规范：必须与库内既有约定一致
+
+剧集容器一律 `Name.{series}/Name.Sxx/`（如 `Loki.{series}/Loki.S01/`）。
+
+**`panlib-organize` 两条代码路径的命名规则不一致，是已知陷阱**：
+- `--manifest-file` 路径 → 生成 `Stranger.Things.{series}` ✅ 合规
+- legacy 参数路径（`--target-dir` + `--mode tv`）→ 生成 `--target-dir` 叶子名，如 `Stranger Things` ❌ 不合规
+
+**因此剧集整理一律走 manifest v1**，不要用 legacy 参数路径，否则会建出与库内约定不符的平行容器。
+
+**manifest 编写要点**：`panlib-library list` 返回的 `fsid` 是**字符串**，manifest 的 `fs_id` 必须是**整数**，否则报 `manifest fs_id does not match the discovered source`。`panlib-run organize-season` 已内建该转型（从文件名解析 SxxExx，fsid 自动转整数）。
 
 ## 统一影视命名契约
 
@@ -367,8 +589,16 @@ CLI 根据源路径自动选择归档根：`/我的资源/...` → `/我的资�
   都执行同一条国家判断，不让 Agent 自由翻译。
 - **通用层级**：`类别根 / [分组节点 × 任意层] / 内容节点 / 文件`。分组节点数量不限、无封闭名单，
   判定与建层规则见 B+ 节。
-- **类别根目录**：`movie → Movies`、`tv → TV shows`、`anime → 动漫`、
+- **类别根目录**：`movie → Movies`、`tv → TV shows`、`anime → Animation`、
   `documentary → Documentary`、`webdrama → 网剧`；新增类别必须由配置提供根目录，不能临时猜路径。
+
+### 类别根命名统一（2026-08-30 铭哥定）
+
+历史遗留的 `动漫` 目录名与 `Movies`/`TV shows`/`Documentary` 的英文风格不一致。铭哥要求全部类别根统一用英文，`anime` 类别根改名为 `Animation`（不用 `Anime`——`Anime` 偏日式动画语境，片库里既有欧美 3D 动画又有日系番剧，`Animation` 是行业通用叫法，覆盖两者不产生歧义）。
+
+**执行方式：改名优先于新建**——两个网盘根各自现有的 `动漫` 目录都用 `panlib-container rename` 原地改名为 `Animation`（同一父目录内改名，属于既有的「受限原地改名」能力，不新建平行目录、不产生迁移工作量）。已入库内容默认不追溯重排（工作量与铭哥意愿判断，见下条）；只有新一批要更新画质/规范化的资源才顺带把其容器从旧类别根迁移到新类别根。
+
+**通用原则（2026-08-30 铭哥定，写入本节供所有整理场景引用）**：**能用改名或迁移解决的，不新建**。原地改名（`panlib-container rename`）与跨类别迁移（`panlib-organize` 换 `--target-dir`，源和目标都在同一网盘根内时是普通整理操作，不需要 `panlib-library migrate`）都不产生额外冗余目录；只有目标路径确实不存在且语义上必须是新容器时才新建。判断准则：若一个动作的净效果是「同一份文件换了个位置/名字」，优先选改名或 mv 类操作；只有「内容从无到有」才用 mkdir/新建。
 - **两套网盘根使用同一相对结构**：`/我的资源/<类型目录>/...` 与
   `/apps/bdpan/片库/<类型目录>/...` 的类型目录、作品容器和文件模板完全一致。
 - **内容单元**：`single` 使用 `{内容规范名}.{年份}/`（文件夹**不带 IMDB**）；`episode` 与 `season` 使用

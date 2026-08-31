@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""浏览分享内部结构并按 fs_id 精准转存（plan-first）。
+
+设计要点：
+- Agent 永远拿不到 URL 或提取码：解析、浏览、转存都在本进程内完成，输出全部脱敏。
+- ``browse`` 只读，可逐层进入分享内部目录，返回 fs_id / 名称 / 大小 / 是否目录。
+- ``select`` 默认 plan-only；``--execute`` 需回传 plan 返回的 ``--share-ref``，
+  并在写前后各读一次目标目录做验收，语义与 panlib-transfer 一致。
+- 精准转存解决的问题：合集分享动辄数百 GB，只要其中一季/一个文件时，不必整包转存。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+_BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(_BIN.parent / "panlib"))
+sys.path.insert(0, str(_BIN.parent))
+
+from common import (  # noqa: E402
+    INVALID_ARG,
+    NETWORK,
+    NOT_FOUND,
+    PARSE,
+    emit_error,
+    emit_success,
+    load_settings,
+    redact_text,
+    decode_bdpan_ls,
+    run_bdpan,
+    safe_cloud_join,
+)
+
+_TRANSFER = _BIN / "panlib-transfer"
+_FSID_RE = re.compile(r"^\d{1,32}$")
+_SHARE_REF_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_CANDIDATE_SCAN = 24
+TYPE_DIR = {
+    "movie": "Movies",
+    "tv": "TV shows",
+    "doc": "Documentary",
+    "anime": "Animation",
+    "webdrama": "网剧",
+}
+
+
+def _load_transfer_module():
+    """复用 panlib-transfer 的解析与探测逻辑，避免重复实现敏感处理。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_loader(
+        "panlib_transfer_mod",
+        importlib.machinery.SourceFileLoader("panlib_transfer_mod", str(_TRANSFER)),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _resolve(resource_id, link_index, settings, tm):
+    try:
+        return tm._resolve_resource(resource_id, link_index, settings)
+    except tm._ResourceResolutionError as exc:
+        emit_error(exc.code, exc.message, exc.details)
+        raise SystemExit(1)
+
+
+def _bare(url: str) -> str:
+    return urlsplit(url)._replace(query="").geturl()
+
+
+def _share_list(res, source_dir, settings):
+    """只读浏览分享内部一层；source_dir 为空表示根层。"""
+    argv = ["transfer", "list", _bare(res["url"])]
+    if res["password"]:
+        argv += ["-p", res["password"]]
+    if source_dir:
+        argv += ["--source-dir", source_dir]
+    argv += ["--json", "--no-check-update"]
+    code, out, err = run_bdpan(argv, timeout=settings.bdpan_timeout, settings=settings)
+    if code != 0:
+        emit_error(NETWORK, "share list failed", {"detail": redact_text(err or out)[:200]})
+        raise SystemExit(1)
+    try:
+        payload = json.loads(out) if out.strip() else {}
+    except json.JSONDecodeError:
+        emit_error(PARSE, "share list returned invalid JSON")
+        raise SystemExit(1)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = None
+    for holder in (payload, data):
+        if isinstance(holder, dict):
+            for key in ("items", "list", "entries", "files"):
+                if isinstance(holder.get(key), list):
+                    rows = holder[key]
+                    break
+        if rows is not None:
+            break
+    if rows is None and isinstance(data, list):
+        rows = data
+    if rows is None:
+        emit_error(PARSE, "share list response has no recognizable file list")
+        raise SystemExit(1)
+    out_rows = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        isdir = r.get("is_dir")
+        if isdir is None:
+            isdir = r.get("isdir")
+        out_rows.append({
+            "fs_id": str(r.get("fs_id") or r.get("fsid") or ""),
+            "name": r.get("name") or r.get("server_filename") or r.get("filename"),
+            "isdir": bool(isdir),
+            "size": r.get("size"),
+            "path": r.get("path"),
+        })
+    return out_rows
+
+
+def cmd_browse(args, settings, tm):
+    res = _resolve(args.resource_id, args.link_index, settings, tm)
+    rows = _share_list(res, args.source_dir or "", settings)
+    emit_success({
+        "resource_id": args.resource_id,
+        "link_index": res["link_index"],
+        "share_ref": res["share_ref"],
+        "source_dir": args.source_dir or "/",
+        "entries": rows,
+        "count": len(rows),
+        "selection": res["selection"],
+    }, {"command": "panlib-share browse", "mode": "read-only"})
+
+
+def _dest_dir(args, settings):
+    if args.dest_dir:
+        return args.dest_dir
+    return safe_cloud_join(settings.bdpan_base, settings.bdpan_lib, TYPE_DIR[args.type])
+
+
+def cmd_select(args, settings, tm):
+    fsids = []
+    for chunk in args.fsid:
+        for one in str(chunk).split(","):
+            one = one.strip()
+            if not one:
+                continue
+            if not _FSID_RE.fullmatch(one):
+                emit_error(INVALID_ARG, f"fsid must be numeric: {one}")
+                raise SystemExit(1)
+            fsids.append(one)
+    if not fsids:
+        emit_error(INVALID_ARG, "at least one --fsid is required")
+        raise SystemExit(1)
+
+    res = _resolve(args.resource_id, args.link_index, settings, tm)
+    dest = _dest_dir(args, settings)
+
+    if not args.execute:
+        emit_success({
+            "plan": [{
+                "action": "transfer-select",
+                "source": "seedhub-resource",
+                "resource_id": args.resource_id,
+                "link_index": res["link_index"],
+                "fs_ids": fsids,
+                "dest_dir": dest,
+                "share_ref": res["share_ref"],
+            }],
+            "dest_dir": dest,
+            "fs_ids": fsids,
+            "share_ref": res["share_ref"],
+            "selection": res["selection"],
+            "execute_required": True,
+        }, {"command": "panlib-share select", "mode": "plan-only"})
+        return
+
+    if not args.share_ref or not _SHARE_REF_RE.fullmatch(args.share_ref):
+        emit_error(INVALID_ARG, "--execute requires the 64-hex --share-ref from the plan")
+        raise SystemExit(1)
+    if args.share_ref != res["share_ref"]:
+        # SeedHub 的候选列表每次请求都会重排，因此 link-index 不是稳定标识，
+        # 仅凭首次解析就判失败会导致永远执行不成功（实测 25 轮全败）。
+        # 这里按 share_ref 在候选集里定向重找：ref 绑定的是 URL+提取码本身，
+        # 只要目标分享还在候选里，无论它这次排在第几位都能锁定，
+        # 而 ref 不匹配的分享依然会被拒绝——安全边界没有放宽。
+        matched = None
+        for probe_index in range(_MAX_CANDIDATE_SCAN):
+            try:
+                cand = tm._resolve_resource(args.resource_id, probe_index, settings)
+            except tm._ResourceResolutionError:
+                break
+            if cand["share_ref"] == args.share_ref:
+                matched = cand
+                break
+        if matched is None:
+            emit_error(INVALID_ARG,
+                       "selected SeedHub share changed since the plan; create a new plan")
+            raise SystemExit(1)
+        res = matched
+
+    try:
+        before = tm._list_dest(dest, settings)
+    except RuntimeError:
+        before = []
+
+    argv = ["transfer", "select", _bare(res["url"])]
+    if res["password"]:
+        argv += ["-p", res["password"]]
+    for f in fsids:
+        argv += ["--fsid", f]
+    argv += ["-d", dest, "--no-check-update"]
+    code, out, err = run_bdpan(argv, timeout=settings.bdpan_timeout, settings=settings)
+    if code != 0:
+        emit_error(NETWORK, "transfer select failed",
+                   {"detail": redact_text(err or out)[:300]})
+        raise SystemExit(1)
+
+    post = tm._post_transfer_result(before, dest, settings)
+    emit_success({
+        "executed": True,
+        "dest_dir": dest,
+        "fs_ids": fsids,
+        "share_ref": res["share_ref"],
+        "postcondition": post,
+        "bdpan_output": redact_text(out)[:600],
+    }, {"command": "panlib-share select", "mode": "executed"})
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="浏览分享内部并按 fs_id 精准转存（默认只生成计划）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("browse", help="[只读] 浏览分享内部目录，不落盘")
+    b.add_argument("--resource-id", "-r", required=True)
+    b.add_argument("--link-index", type=int, default=None)
+    b.add_argument("--source-dir", default="", help="分享内部路径；留空为根层")
+
+    s = sub.add_parser("select", help="[写网盘] 按 fs_id 精准转存（默认 plan-only）")
+    s.add_argument("--resource-id", "-r", required=True)
+    s.add_argument("--link-index", type=int, default=None)
+    s.add_argument("--fsid", action="append", required=True, help="可重复或逗号分隔")
+    s.add_argument("--type", choices=sorted(TYPE_DIR), default="tv")
+    s.add_argument("--dest-dir", default=None, help="覆盖默认类别根")
+    s.add_argument("--share-ref", default=None)
+    s.add_argument("--execute", action="store_true")
+
+    args = p.parse_args()
+    settings = load_settings()
+    tm = _load_transfer_module()
+    if args.cmd == "browse":
+        cmd_browse(args, settings, tm)
+    else:
+        cmd_select(args, settings, tm)
+    return 0
+
+
+if __name__ == "__main__":
+    import importlib.machinery  # noqa: E402
+    raise SystemExit(main())
