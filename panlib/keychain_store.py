@@ -153,6 +153,18 @@ class MacOSKeychain:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("credential must not be empty")
         secret = token.strip()
+        # NOTE (2026-08-30, real-world incident): interactive ``-w`` with the
+        # value fed over stdin silently truncates at 128 bytes on macOS —
+        # confirmed by direct reproduction (a 178-byte JSON payload came back
+        # as exactly 128 bytes with no error, no non-zero exit). Both the MCP
+        # OAuth payload and the bdpan access+refresh token pair regularly
+        # exceed 128 bytes, so the interactive path was silently corrupting
+        # every write. Passing the value as a trailing argv token has no such
+        # limit (verified up to 500 bytes) and is the officially documented
+        # `security add-generic-password -w <password>` form. The value is
+        # visible in `ps` for the lifetime of this short-lived subprocess to
+        # any process running as the same local user — acceptable for a
+        # single-user agent host where the alternative was silent data loss.
         result = self._invoke(
             [
                 "add-generic-password",
@@ -162,11 +174,8 @@ class MacOSKeychain:
                 "-s",
                 self.service,
                 "-w",
-            ],
-            # ``security add-generic-password -w`` prompts for the new value
-            # twice.  Feed both hidden prompts over stdin while keeping the
-            # value out of argv, logs and project files.
-            secret_input=f"{secret}\n{secret}",
+                secret,
+            ]
         )
         if result.returncode != 0:
             raise CredentialError("macOS Keychain write failed")
