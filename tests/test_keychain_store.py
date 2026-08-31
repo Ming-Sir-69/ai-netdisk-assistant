@@ -28,7 +28,20 @@ class MacOSKeychainTests(unittest.TestCase):
             with mock.patch("panlib.keychain_store.sys.platform", "linux"):
                 self.assertEqual(keychain.get(), "secret-access-token")
 
-    def test_store_never_puts_secret_in_security_argv(self):
+    def test_store_passes_secret_as_argv_not_stdin(self):
+        """凭据必须作为 argv 尾参传入，不得走交互式 stdin。
+
+        2026-08-30 实测：``security add-generic-password -w`` 从 stdin 读值时，
+        在 128 字节处静默截断——178 字节的 JSON 写入后读回恰好 128 字节，
+        无报错、退出码为 0。MCP OAuth payload 与 bdpan token 对均超过 128 字节，
+        该路径此前一直在静默损坏凭据。
+
+        本测试原先断言相反行为（secret 不得出现在 argv、必须走 stdin），
+        锁死的正是这个已被证伪的假设。取舍：值在短命子进程存活期间对同用户的
+        ps 可见；单用户 agent 主机上，这优于静默数据损坏。铭哥已确认接受。
+
+        任何把 set() 改回 stdin 传参的改动都会让这个测试失败——这是预期的回归防线。
+        """
         calls: list[tuple[list[str], str | None]] = []
 
         def runner(argv, **kwargs):
@@ -48,8 +61,32 @@ class MacOSKeychainTests(unittest.TestCase):
         argv, supplied = calls[0]
         self.assertEqual(argv[:2], ["/usr/bin/security", "add-generic-password"])
         self.assertIn("-w", argv)
-        self.assertNotIn("secret-access-token", argv)
-        self.assertEqual(supplied, "secret-access-token\nsecret-access-token\n")
+        # 值必须紧跟 -w 作为 argv 尾参
+        self.assertEqual(argv[argv.index("-w") + 1], "secret-access-token")
+        # 且不得再走 stdin（交互式路径正是截断的来源）
+        self.assertIsNone(supplied)
+
+    def test_store_survives_payload_over_128_bytes(self):
+        """超过 128 字节的凭据必须完整传递——这是截断事故的直接回归防线。"""
+        payload = "x" * 200
+        calls: list[list[str]] = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        keychain = MacOSKeychain(
+            service="com.example.test",
+            account="mcp",
+            security="/usr/bin/security",
+            runner=runner,
+        )
+        with mock.patch("panlib.keychain_store.sys.platform", "darwin"):
+            keychain.set(payload)
+
+        argv = calls[0]
+        self.assertEqual(argv[argv.index("-w") + 1], payload)
+        self.assertEqual(len(argv[argv.index("-w") + 1]), 200)
 
     def test_get_reads_keychain_without_plaintext_fallback(self):
         calls: list[list[str]] = []

@@ -185,7 +185,7 @@ MCP（简化模式，30 天硬限，无 refresh_token）与 bdpan（授权码模
 **统一入口脚本**：`scripts/webbridge_reauth.py`（新增，2026-08-30）：
 - `--check`：仅在 MCP/bdpan 任一方剩余天数 < 5 天时触发对应续期，否则原样跳过。
 - `--force-mcp` / `--force-bdpan`：无视剩余天数强制续期一次，用于验证或紧急处理。
-- 内部流程：`navigate` 到官方 OAuth 授权页 → `snapshot` 读取页面（MCP 读重定向 URL 里的 `access_token`/`expires_in`/`scope`；bdpan 读页面正文里的一次性授权码）→ 写回 Keychain（MCP）或调用 `bdpan login --set-code`（bdpan）→ 写后用 `auth-status`/`whoami` 验证。
+- 内部流程：`navigate` 到官方 OAuth 授权页 → `snapshot` 读取页面（MCP 读重定向 URL 里的 `access_token`/`expires_in`/`scope`；bdpan 读页面正文里的一次性授权码）→ 写回 Keychain（MCP）或经 `scripts/login.sh` 回填授权码（bdpan；脚本内部完成，Agent 不直调 bdpan）→ 写后用 `auth-status`/`whoami` 验证。
 - 每次尝试（成功或失败）都追加一行到 `runtime/reauth_journal.jsonl`，字段含 `target`、`error_code`（失败时）、`next_action`、`status`（成功时），复用仓库既有台账规范，不新造格式。
 
 **cron 化**：已建 Hermes cron job「网盘MCP+bdpan凭证自动续期」，`0 10 */5 * *`（每 5 天一次，30 天窗口留足冗余），`deliver=local` 静默运行，只有真正续期失败且临近过期时才提醒用户；正常续期成功或本次因插件未连接而跳过都不打扰。用户新开一台机器或重建 cron 时，照此 schedule 与 prompt 重建即可，不必每次重新设计。
