@@ -200,6 +200,14 @@ def _forced_credential_file(path: str) -> bool:
         return True
     if name.endswith((".pem", ".key", ".p12", ".pfx")):
         return True
+    # 源码文件按内容判定，不按文件名。一个处理授权流程的脚本必然叫
+    # *auth*.py，但它承载的是逻辑而非凭据本身——凭据仍由下方的内容规则
+    # （token/cookie/BDUSS/分享链接等正则）逐行扫描拦截。
+    # 实测误报：scripts/webbridge_reauth.py（"auth" 后接 "." 命中末尾分隔符），
+    # 而同目录同性质的 authorize_mcp_macos.py（"auth" 后接字母）却不命中——
+    # 同类文件命运取决于后一个字符，这本身说明按名字判定源码是不可靠的。
+    if name.endswith((".py", ".sh", ".bash", ".zsh", ".ts", ".js", ".go", ".rs")):
+        return False
     return bool(_FORCED_CREDENTIAL_NAME_RE.search(name))
 
 
