@@ -27,7 +27,39 @@ ROOTS = {
 }
 EP_RE = re.compile(r"^(?P<t>.+)\.S(?P<s>\d{2})E(?P<e>\d{2})\.\{imdb-(?P<i>tt\d+|none)\}"
                    r"\.(?P<q>\d+p)\.(?P<x>mkv|mp4|ts|ass|srt|ssa|sub|sup|vtt|idx)$")
+MOVIE_RE = re.compile(r"^(?P<t>.+)\.(?P<y>\d{4})\.\{imdb-(?P<i>tt\d+|none)\}"
+                      r"\.(?P<q>\d+p)(?:\.(?P<lang>zh-Hans|zh-Hant|en|eng|chi))?"
+                      r"\.(?P<x>mkv|mp4|ts|ass|srt|ssa|sub|sup|vtt|idx)$")
 VIDEO_EXT = {"mkv", "mp4", "ts"}
+
+
+def movie_report(container_path: str):
+    """验收电影内容节点；电影不应被当成 season 目录处理。"""
+    entries = cloud_list(container_path)
+    if entries is None:
+        return {"readable": False, "files": 0, "videos": 0, "subtitles": 0,
+                "qualities": [], "size_gb": 0, "compliant": False,
+                "issues": [{"name": container_path, "issue": "目录读取失败，内容未知"}]}
+    vids, subs, bad, quals = [], [], [], set()
+    for e in entries:
+        if e.get("isdir"):
+            bad.append({"name": e["name"], "issue": "电影内容节点内不应有子目录"})
+            continue
+        m = MOVIE_RE.match(e["name"])
+        if not m:
+            bad.append({"name": e["name"], "issue": "文件名不符合电影规范模板"})
+            continue
+        if m.group("x") in VIDEO_EXT:
+            vids.append(e); quals.add(m.group("q"))
+        else:
+            subs.append(e)
+    size = sum(e.get("size", 0) for e in vids) / 1024 ** 3
+    if not vids:
+        bad.append({"name": container_path, "issue": "未找到规范主视频文件"})
+    return {"readable": True, "files": len(entries), "videos": len(vids),
+            "subtitles": len(subs), "qualities": sorted(quals),
+            "quality_source": "filename", "size_gb": round(size, 1),
+            "compliant": not bad, "issues": bad}
 
 
 def cloud_list(path: str):
@@ -106,21 +138,29 @@ def cmd_find(a) -> int:
         return 2
 
     out, unreadable = [], []
-    for c in hits:
-        subs = cloud_list(c["path"])
-        if subs is None:
-            unreadable.append(c["name"])
-            continue
-        for s in [x for x in subs if x.get("isdir")]:
-            m = re.search(r"S(\d{1,2})$", s["name"])
-            if a.season and (not m or int(m.group(1)) != int(a.season)):
-                continue
-            rep = season_report(s["path"])
+    if a.type == "movie":
+        for c in hits:
+            rep = movie_report(c["path"])
             if not rep.get("readable", True):
-                unreadable.append(s["name"])
+                unreadable.append(c["name"])
+            else:
+                out.append({"container": c["name"], "path": c["path"], **rep})
+    else:
+        for c in hits:
+            subs = cloud_list(c["path"])
+            if subs is None:
+                unreadable.append(c["name"])
                 continue
-            out.append({"container": c["name"], "season_dir": s["name"],
-                        "path": s["path"], **rep})
+            for s in [x for x in subs if x.get("isdir")]:
+                m = re.search(r"S(\d{1,2})$", s["name"])
+                if a.season and (not m or int(m.group(1)) != int(a.season)):
+                    continue
+                rep = season_report(s["path"])
+                if not rep.get("readable", True):
+                    unreadable.append(s["name"])
+                    continue
+                out.append({"container": c["name"], "season_dir": s["name"],
+                            "path": s["path"], **rep})
 
     if unreadable:
         emit_error(NOT_FOUND, "BLOCKED：部分目录读取失败，本次检查无结论",
@@ -139,13 +179,20 @@ def cmd_find(a) -> int:
         status, action = "CONTINUE", "片库没有该内容，进入获取流程"
         reasons.append("no_container")
     else:
-        gaps = [n for s in out for n in s["missing_episodes"]]
-        noncompliant = [s["season_dir"] for s in out if not s["compliant"]]
-        quals = sorted({q for s in out for q in s["qualities"]})
-        mixed = [s["season_dir"] for s in out
-                 if s.get("quality_mixed_within_season")]
-        short = [s["season_dir"] for s in out
-                 if want_eps and s["episodes"] < want_eps]
+        if a.type == "movie":
+            noncompliant = [x["container"] for x in out if not x["compliant"]]
+            quals = sorted({q for x in out for q in x["qualities"]})
+            mixed = []
+            gaps = []
+            short = []
+        else:
+            gaps = [n for s in out for n in s["missing_episodes"]]
+            noncompliant = [s["season_dir"] for s in out if not s["compliant"]]
+            quals = sorted({q for s in out for q in s["qualities"]})
+            mixed = [s["season_dir"] for s in out
+                     if s.get("quality_mixed_within_season")]
+            short = [s["season_dir"] for s in out
+                     if want_eps and s["episodes"] < want_eps]
         qual_bad = bool(want_q) and any(q != want_q for q in quals)
         if gaps:
             reasons.append(f"missing_episodes={sorted(set(gaps))}")
@@ -190,16 +237,25 @@ def cmd_verify(a) -> int:
         emit_error(NOT_FOUND, f"片库中未找到匹配容器: {a.title}", {"root": root})
         return 1
     report, all_ok, unreadable = [], True, []
-    for c in hits:
-        subs = cloud_list(c["path"])
-        if subs is None:
-            unreadable.append(c["name"]); continue
-        for s in [x for x in subs if x.get("isdir")]:
-            rep = season_report(s["path"])
+    if a.type == "movie":
+        for c in hits:
+            rep = movie_report(c["path"])
             if not rep.get("readable", True):
-                unreadable.append(s["name"]); continue
+                unreadable.append(c["name"])
+                continue
             all_ok &= rep["compliant"]
-            report.append({"container": c["name"], "season": s["name"], **rep})
+            report.append({"container": c["name"], "path": c["path"], **rep})
+    else:
+        for c in hits:
+            subs = cloud_list(c["path"])
+            if subs is None:
+                unreadable.append(c["name"]); continue
+            for s in [x for x in subs if x.get("isdir")]:
+                rep = season_report(s["path"])
+                if not rep.get("readable", True):
+                    unreadable.append(s["name"]); continue
+                all_ok &= rep["compliant"]
+                report.append({"container": c["name"], "season": s["name"], **rep})
     if unreadable:
         emit_error(NOT_FOUND, "部分目录读取失败，验收无结论",
                    {"status": "BLOCKED", "unreadable": unreadable,

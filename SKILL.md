@@ -23,7 +23,9 @@ cd <仓库根> && .venv/bin/python bin/panlib-plan list
 | 用户说 | task |
 |---|---|
 | 找/下/存某剧某季 | `acquire-season` |
-| 画质不一致、想换更清晰的 | `upgrade-quality` |
+| 找/存某部电影 | `acquire-movie` |
+| 画质不一致、想换更清晰的剧集 | `upgrade-quality` |
+| 画质不一致、想换更清晰的电影 | 先走 `panlib-lib ... --type movie`；电影升级配方待补，不能套用剧集配方 |
 | 整理网盘里已有的乱结构 | `organize-existing` |
 | 反复失败、报"资源失效" | `diagnose-failure` |
 
@@ -528,10 +530,11 @@ CLI 根据源路径自动选择归档根：`/我的资源/...` → `/我的资�
 合集里常见 `01.mkv`–`09.mkv` 这类无季号命名。**禁止靠数量猜季**，但可以用 ffprobe 实测取证：
 
 ```bash
-bdpan download "<云端路径>" ./probe.mkv     # 取头部即可，几分钟后 kill
+# 远端抽样画质探测尚未封装为安全算子，当前不可直接下载；升级配方会返回 BLOCKED。
+.venv/bin/python bin/panlib-plan show --task upgrade-quality --title "<剧名>"
 ffprobe -v error -select_streams v:0 \
   -show_entries stream=codec_name,width,height \
-  -show_entries format=duration,bit_rate -of default=nw=1 probe.mkv
+  -show_entries format=duration,bit_rate -of default=nw=1 "<本地样本文件>"
 ```
 
 判据示例（本次 S04）：时长 3786s（63 分钟）——第三季每集约 50 分钟，只有第四季才有 63–98 分钟的超长集；配合 9 集数量、父目录标注「第1-4季」、S01/S02/S03 三个子目录已被单独整理走，四条独立证据交叉确认季号。**单一证据不足以定季，至少要两条独立证据。**
@@ -623,7 +626,7 @@ ffprobe -v error -select_streams v:0 \
   “漏写了”在文件名上可区分，这批文件也不会被反复标记为待整理。
   **身份未确认的文件不改名**——既不写 `none` 也不猜编号，原地保留并进异常清单等人工裁决。
   这类文件不按人物/演员聚合建目录，一律按普通单体电影 `名.年` 容器管理。
-  〔实现待补：`is_normalized_*` 判定函数当前只认 `{imdb-tt…}`，需扩展为同时接受 `{imdb-none}`。〕
+  该规则已由 `is_normalized_movie_filename()` / `is_normalized_episode_filename()` 实现并覆盖 `{imdb-none}`。
 
 ## 内容类型与收录范围（2026-08-15 铭哥定）
 
@@ -694,7 +697,7 @@ ffprobe -v error -select_streams v:0 \
    - **moov 后置的 MP4 读不出**（报 `moov atom not found`）。此时**朴素“头 + 尾拼接”无效**——
      实测拼接后仍报同一错误，因为字节偏移错乱。**正确算法是稀疏重建**：把文件头与文件尾各自写在
      它们在原文件中的真实绝对偏移上、中间留空，ffprobe 即可正常读出（已实测成功）。
-   - **但当前没有可用的取尾通道**：`bdpan download` 只有 `<remote> <local>` 两个参数，
+   - **但当前没有可用的取尾通道**：现有网盘下载接口只有普通的远端路径到本地参数，
      无任何 Range/分段能力；MCP `file_meta` 不返回 `dlink`（`dlink=1` 等入参实测无效）。
      因此稀疏重建暂不可实施，moov 后置的 MP4 一律标 `unknown` 进异常队列，**不得盲猜**。
 3. **云端 API 元数据**：bdpan `ls` 无分辨率字段。MCP `file_meta` **已于 2026-08-15 打通**——
