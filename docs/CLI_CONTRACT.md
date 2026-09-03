@@ -36,6 +36,12 @@
 | `panlib-master query` | `--title`, `--year` | 是 | 无 |
 | `panlib-master record` | `--title`, `--year`, `--source`, `--evidence` 或 `--no-evidence` | 否 | 追加本地台账（不触网盘） |
 | `panlib-master verdict` | `--title`, `--year` | 是 | 无 |
+| `panlib-plan` | `list` / `show --task` | 是 | 无（纯规划，不做 I/O） |
+| `panlib-lib` | `find` / `verify`（可选 `--type movie`） | 是 | 无 |
+| `panlib-share` | `browse` / `select` | 默认 | `select --execute` |
+| `panlib-run` | `probe`/`selfcheck`（只读）；`transfer-select`/`organize-season`/`archive`/`sweep-empty`（写网盘） | 默认 | 写类子命令内建重试 |
+| `panlib-audit` | `--path` 片库根，可选 `--severity` | 是 | 无 |
+| `panlib-container` | `rename --source --new-name` | 默认 | `--execute --plan-ref` |
 
 `panlib-master` 是**母版发行史判定**算子，回答「这部片子官方到底发行过多高分辨率」，
 用于在升级画质前排除软件超分的假 4K。它**自己不联网**：证据检索由 Agent 层用

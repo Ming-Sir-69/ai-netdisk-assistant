@@ -30,6 +30,12 @@ primitives   panlib-transfer / panlib-organize / panlib-library / panlib-contain
 | `panlib-master` | `query` | 只读 | `NEEDS_QUERY` / `CACHED` | 0 |
 | `panlib-master` | `record` | 只写本地台账 | 记一条证据（或确认无证据） | 0 / 1 |
 | `panlib-master` | `verdict` | 只读 | `NATIVE_CAP_2K` / `NATIVE_CAP_4K` / `UNKNOWN_CONSERVATIVE` / `CONFLICTING_EVIDENCE` / `NOT_QUERIED` | 0 / 0 / 0 / 1 / 1 |
+| `panlib-audit` | `--path` | 只读 | findings 清单（含 unreadable_directory） | 0 / 1 |
+| `panlib-search` | `--keyword` | 只读 | results 列表 | 0 / 1 |
+| `panlib-imdb` | `--title --year` | 只读 | imdb_id | 0 / 1 |
+| `panlib-offlinedl` | `add` | **写网盘** | 默认 plan-only，`--execute` 才提交 | 0 / 1 |
+| `panlib-offlinedl` | `status` / `who` | 只读 | 任务状态 / 登录态 | 0 / 1 |
+| `panlib-container` | `rename` | **写网盘** | 同父目录改名，写后验收 | 0 / 1 |
 | `panlib-share` | `browse` | 只读 | 返回 entries | 0 |
 | `panlib-share` | `select` | **写网盘** | 默认 plan-only，`--execute` 才写 | 0 / 1 |
 | `panlib-run` | `probe` | 只读 | healthy 与否 | 0 / 1 |

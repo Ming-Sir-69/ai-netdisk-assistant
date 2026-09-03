@@ -25,7 +25,9 @@ cd <仓库根> && .venv/bin/python bin/panlib-plan list
 | 找/下/存某剧某季 | `acquire-season` |
 | 找/存某部电影 | `acquire-movie` |
 | 画质不一致、想换更清晰的剧集 | `upgrade-quality` |
-| 画质不一致、想换更清晰的电影 | 先走 `panlib-lib ... --type movie`；电影升级配方待补，不能套用剧集配方 |
+| 画质不一致、想换更清晰的电影 | `upgrade-quality-movie` |
+| 分享反复失效、想用磁力存 | `acquire-by-magnet` |
+| 全库体检、清理空壳目录 | `audit-library` |
 | 整理网盘里已有的乱结构 | `organize-existing` |
 | 反复失败、报"资源失效" | `diagnose-failure` |
 

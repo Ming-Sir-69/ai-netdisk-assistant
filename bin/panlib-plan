@@ -116,6 +116,16 @@ RECIPES: dict[str, dict] = {
                 "on_fail": "多候选时按年份/类型裁决；仍不确定则停止",
             },
             {
+                "why": "★查母版发行史，定下本片的画质天花板——"
+                       "老片/文艺片常在 2K 完成终剪，此后所有'4K'都是升频。"
+                       "先知道天花板，才能在下一步识破虚标候选",
+                "cmd": f'{PY} bin/panlib-master query --title "{{title}}" --year <YYYY>'
+                       f'  # 按返回 sources 用 web_search/web_extract 取证 → record → verdict',
+                "expect": "拿到 NATIVE_CAP_2K / NATIVE_CAP_4K，作为下一步选版本的上限",
+                "on_fail": "UNKNOWN_CONSERVATIVE 时按现有最好版本入库、不强追高分辨率；"
+                           "CONFLICTING_EVIDENCE 交用户裁决",
+            },
+            {
                 "why": "生成转存计划；分享解析和凭据留在 CLI 内",
                 "cmd": f'{PY} bin/panlib-transfer --resource-id <resource_id> --type movie --title-en "{{title}}" --title-zh "<中文名>" --production-country "<国家>" --imdb-id <tt...> --year <YYYY>',
                 "expect": "meta.mode=plan-only、share_status=valid、plan 中有 share_ref",
@@ -205,6 +215,140 @@ RECIPES: dict[str, dict] = {
                 "cmd": f'{PY} bin/panlib-lib verify --title "{{title}}"',
                 "expect": "全部季清晰度一致、compliant=true",
                 "on_fail": "按 issues 修复；残留旧命名文件用 panlib-container rename 补改名",
+            },
+        ],
+    },
+    "upgrade-quality-movie": {
+        "summary": "把已入库电影替换为更高画质版本（电影专用，不套用剧集配方）",
+        "critical": "SKILL.md 长期写着「电影升级配方待补」，模型遇到电影升级只能自行拼凑"
+                    "或误套剧集流程——这正是待补状态本身造成的风险。本配方补上该缺口。"
+                    "第 2 步是硬门槛：母版天花板是 2K 时，网上所有 2160p 都是 upscale，"
+                    "整个升级任务的正确结果是「不升级」，而不是找一个更大的文件。",
+        "steps": [
+            {
+                "why": "确认库内现状与当前清晰度（电影用 --type movie，季目录逻辑对电影无效）",
+                "cmd": f'{PY} bin/panlib-lib verify --title "{{title}}" --type movie',
+                "expect": "看到当前 videos 与 qualities，确认确实偏低",
+                "on_fail": "BLOCKED 时先排查授权/网络，不要据此判定内容不存在",
+            },
+            {
+                "why": "★母版天花板判定——决定这次升级是否根本不该做",
+                "cmd": f'{PY} bin/panlib-master query --title "{{title}}" --year <YYYY>'
+                       f'  # 按 sources 取证 → record → verdict',
+                "expect": "NATIVE_CAP_4K 才继续第 3 步",
+                "on_fail": "NATIVE_CAP_2K → 停止升级，如实告知用户「官方无更高母版，"
+                           "网上 2160p 均为超分」；UNKNOWN_CONSERVATIVE → 不主动升级；"
+                           "CONFLICTING_EVIDENCE → 交用户裁决",
+            },
+            {
+                "why": "浏览分享内部找真实高画质版本；候选列表的 quality 标签会虚标",
+                "cmd": f'{PY} bin/panlib-share browse -r <resource_id> --source-dir "<逐层深入>"',
+                "expect": "在最深一层看到真实视频文件名，且不含 Upscaled/AI Enhanced 字样",
+                "on_fail": "只有虚标或超分版本时停止升级，不要将就",
+            },
+            {
+                "why": "精准转存新版到隔离区，不直接落 Movies 根",
+                "cmd": f'{PY} bin/panlib-run transfer-select -r <resource_id> '
+                       f'--fsid <ids> --dest-dir "/apps/bdpan/片库/Movies/_待整理_{{title_slug}}"',
+                "expect": "executed=true",
+                "on_fail": "panlib-run 已内建重试",
+            },
+            {
+                "why": "归档旧版（不删除，留人工确认）",
+                "cmd": f'{PY} bin/panlib-run archive --source "/apps/bdpan/片库/Movies/{{title_slug}}.<YYYY>" '
+                       f'--new-name "{{title_slug}}.<YYYY>_<旧清晰度>_旧版_待删除"',
+                "expect": "status=verified",
+                "on_fail": "冲突则换 new-name 后重试",
+            },
+            {
+                "why": "用电影模板整理新版进规范容器",
+                "cmd": f'{PY} bin/panlib-organize --source-dir "<隔离区>" '
+                       f'--target-dir "/apps/bdpan/片库/Movies/{{title_slug}}.<YYYY>" '
+                       f'--title-en "{{title}}" --title-zh "<中文名>" --production-country "<国家>" '
+                       f'--imdb-id <tt...> --year <YYYY> --quality 2160p --mode movie',
+                "expect": "执行后 source_dir 为空",
+                "on_fail": "重新读取现场并生成新计划，不猜测回滚",
+            },
+            {
+                "why": "归档空壳隔离区，保持根目录干净",
+                "cmd": f'{PY} bin/panlib-run archive --source "<隔离区>" --new-name "<名>_已整理_待删除"',
+                "expect": "status=verified",
+                "on_fail": "源非空说明整理未完成，回上一步",
+            },
+            {
+                "why": "验收",
+                "cmd": f'{PY} bin/panlib-lib verify --title "{{title}}" --type movie',
+                "expect": "all_compliant=true 且 qualities 已为目标清晰度",
+                "on_fail": "按 issues 修复；残留旧命名用 panlib-container rename 补改名",
+            },
+        ],
+    },
+    "acquire-by-magnet": {
+        "summary": "百度分享坏死时，改走磁力云端离线下载入库（SKILL 所称「路线 A」）",
+        "critical": "SKILL.md 把磁力称为「路线 A 首选」，但此前没有任何配方引用 "
+                    "panlib-offlinedl——声称的首选路线对模型不可达，等于不存在。"
+                    "换通道只在对应层失败时才有意义：分享坏死是「源」的问题，"
+                    "换 QR/换解析都取的是同一条死链接，只有换磁力才真正换了源。",
+        "steps": [
+            {
+                "why": "先确认确实是分享坏死，而不是我们把资源站打限流了——"
+                       "限流下的失败会把好资源误判成坏资源",
+                "cmd": f'{PY} bin/panlib-run probe -r <resource_id> --rounds 5',
+                "expect": "5 轮全部 unverified/13001 才判定坏死；有 1 次 valid 就回正常通道",
+                "on_fail": "先冷却 ≥5 分钟再复测，不要连打",
+            },
+            {
+                "why": "换通道前再查一次片库——实测有内容早已随合集入库，"
+                       "白跑 37 轮转存的教训就出在这里",
+                "cmd": f'{PY} bin/panlib-lib find --title "{{title}}" --want-quality <2160p|1080p>',
+                "expect": "status=DONE 则无需获取，直接结束",
+                "on_fail": "CONTINUE 才继续走磁力",
+            },
+            {
+                "why": "提交磁力到百度云端离线队列（零本地流量）；"
+                       "默认 plan-only，tracker 由 CLI 自动补全，调用方不必记这件事",
+                "cmd": f'{PY} bin/panlib-offlinedl add --link "<magnet:?xt=...>"',
+                "expect": "返回 plan，含自动注入的公共 tracker",
+                "on_fail": "链接格式不合法则先核对；不要手工拼 tracker",
+            },
+            {
+                "why": "确认无冲突后执行并等待云端完成（热门资源常 ≤1 分钟）",
+                "cmd": f'{PY} bin/panlib-offlinedl add --link "<magnet:?xt=...>" --execute --wait 600',
+                "expect": "任务状态为「下载成功」",
+                "on_fail": "冷种/死种导致云端离线失败时，才考虑本地下载再上传（路线 B，有流量成本）",
+            },
+            {
+                "why": "落地后按常规整理进规范容器",
+                "cmd": f'{PY} bin/panlib-plan show --task organize-existing',
+                "expect": "按该配方逐步整理与归档",
+                "on_fail": "源目录为空说明离线下载未真正落盘，回上一步核对",
+            },
+        ],
+    },
+    "audit-library": {
+        "summary": "全库一致性审计与空壳清理（只读扫描 + 可恢复归档）",
+        "critical": "panlib-audit / panlib-run sweep-empty 都是实测用过、真解决过问题的算子，"
+                    "但此前不在任何配方里，模型只能靠「碰巧记得」才会用到它们。"
+                    "审计只读、清理只归档——本配方全程不新增任何删除能力。",
+        "steps": [
+            {
+                "why": "只读扫描全库，把偏差连同「现状/应为」列成清单，先看见再决定",
+                "cmd": f'{PY} bin/panlib-audit --path "/apps/bdpan/片库"',
+                "expect": "返回 findings 清单；unreadable_directory 会显式列出，"
+                          "「没检查到」与「检查过且合规」必须区分",
+                "on_fail": "读取失败时不要把结果当成「全库干净」",
+            },
+            {
+                "why": "空目录先核验内容是否已在规范容器里存在，再决定归档还是重新获取",
+                "cmd": f'{PY} bin/panlib-run sweep-empty',
+                "expect": "status=DONE；needs_acquire 为空",
+                "on_fail": "needs_acquire 里的条目走 acquire-movie / acquire-season 获取后重跑",
+            },
+            {
+                "why": "命名不合规但内容正确的，用受限原地改名修正（同父目录、不移动、不覆盖）",
+                "cmd": f'{PY} bin/panlib-container rename --source "<路径>" --new-name "<规范名>"',
+                "expect": "写后验收通过",
+                "on_fail": "bdpan 因路径校验拒绝时该算子会自动改走 MCP，不要手工绕开",
             },
         ],
     },
