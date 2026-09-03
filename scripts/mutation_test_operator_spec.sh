@@ -21,8 +21,15 @@ SKILL=SKILL.md
 BAK=$(mktemp -d)
 cp "$PLAN" "$BAK/plan"
 cp "$SKILL" "$BAK/skill"
+cp bin/panlib-mcp-bridge "$BAK/bridge0"
+cp .github/workflows/ci.yml "$BAK/ci0"
 
-restore() { cp "$BAK/plan" "$PLAN"; cp "$BAK/skill" "$SKILL"; }
+restore() {
+  cp "$BAK/plan" "$PLAN"
+  cp "$BAK/skill" "$SKILL"
+  cp "$BAK/bridge0" bin/panlib-mcp-bridge
+  cp "$BAK/ci0" .github/workflows/ci.yml
+}
 trap restore EXIT
 
 fails=0
@@ -63,6 +70,27 @@ p.write_text(p.read_text(encoding='utf-8').replace('\`audit-library\`', '\`REMOV
 "
 check "路由表缺项" RED
 restore
+
+echo "[变异4] 拿掉 mcp-bridge 的 --help（重演「不能自证是故意还是坏了」）"
+cp bin/panlib-mcp-bridge "$BAK/bridge"
+python3 -c "
+import pathlib
+p = pathlib.Path('bin/panlib-mcp-bridge')
+t = p.read_text(encoding='utf-8')
+p.write_text(t.replace('    if any(a in (\"-h\", \"--help\") for a in sys.argv[1:]):', '    if False:'), encoding='utf-8')
+"
+check "算子无法自证" RED
+cp "$BAK/bridge" bin/panlib-mcp-bridge
+
+echo "[变异5] CI 退回硬编码清单（重演「新增算子静默不受检查」）"
+cp .github/workflows/ci.yml "$BAK/ci"
+python3 -c "
+import pathlib
+p = pathlib.Path('.github/workflows/ci.yml')
+p.write_text(p.read_text(encoding='utf-8').replace('for cli in bin/panlib-*', 'for cli in bin/panlib-imdb'), encoding='utf-8')
+"
+check "CI 硬编码清单" RED
+cp "$BAK/ci" .github/workflows/ci.yml
 
 echo "[还原]"
 check "还原后" GREEN

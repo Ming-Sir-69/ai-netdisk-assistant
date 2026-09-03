@@ -40,10 +40,27 @@ jobs:
       - name: Check every CLI help path
         run: |
           set -eu
-          ./bin/panlib-doctor --help >/dev/null
-          for cli in bin/panlib-extract bin/panlib-imdb bin/panlib-organize bin/panlib-search bin/panlib-transfer bin/panlib-verify; do
-            .venv/bin/python "$cli" --help >/dev/null
+          # 自动发现，不维护硬编码清单——此前那份清单漏掉了 10 个算子
+          # （audit/container/lib/library/master/offlinedl/plan/run/sandbox/share），
+          # 新增算子默认不受检查，且失效方式是静默的：没人会收到通知。
+          # 按 shebang 分派解释器（doctor 是 bash，其余是 Python），新算子自动纳入。
+          failed=0
+          for cli in bin/panlib-*; do
+            [ -f "$cli" ] || continue
+            if head -1 "$cli" | grep -q bash; then
+              runner="bash"
+            else
+              runner=".venv/bin/python"
+            fi
+            if ! $runner "$cli" --help >/dev/null 2>&1; then
+              echo "FAIL: $cli --help (runner=$runner)"
+              failed=$((failed + 1))
+            fi
           done
+          [ "$failed" -eq 0 ] || { echo "$failed 个 CLI 的 --help 不可用"; exit 1; }
+
+      - name: Verify the mutation test still proves the operator spec has teeth
+        run: bash scripts/mutation_test_operator_spec.sh
 
       - name: Run the whole-tree privacy guard
         run: ./scripts/privacy-guard --whole-tree

@@ -54,6 +54,24 @@ BLOCKED 走它会让 `return 2` 永不生效，脚本化调用把失败读成成
 `error.code` 与 `error.details.status`。新增算子时不要再写 `return 2` 并假设它
 会传出去。
 
+## 解释器分派：按 shebang，不按印象（2026-09-03 实测教训）
+
+`bin/` 下**不全是 Python**：`panlib-doctor` 是 bash 脚本，其余是 Python。
+用 `.venv/bin/python` 去跑 bash 脚本会得到 `SyntaxError: unmatched ')'`——
+这是**检查方式错了**，不是那个算子坏了。实测中我据此误报过一次"它的 --help 坏了"。
+
+正确做法（`tests/test_operator_spec.py::ExecutabilityTests` 已固化）：
+读首行 shebang，含 `bash` 就用 bash 跑，否则用项目解释器。
+
+**每个算子都必须响应 `--help`，包括不面向 Agent 的内部子进程。**
+`panlib-mcp-bridge` 是 stdin JSON 协议、本不需要命令行入口，但"没有 --help"
+无法自证是**故意如此**还是**坏了**——调用方每次都要重新判断一遍。现已给它
+一个说明自身定位的 `--help`，把这条隐性知识变成它自己会讲的话。
+
+CI 的 help 巡检**必须自动发现** `bin/panlib-*`，不得维护硬编码清单：
+此前那份清单漏掉了 10 个算子（audit/container/lib/library/master/offlinedl/
+plan/run/sandbox/share），且失效方式是静默的——新增算子不受检查、也没人收到通知。
+
 ## 为什么不拆成更多文件
 
 `panlib-run` 同时含只读与写网盘子命令，看似该拆。但实测：子命令间共享的只是

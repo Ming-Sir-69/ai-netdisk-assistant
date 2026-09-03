@@ -27,7 +27,22 @@ def _error(code: str, message: str, details=None) -> int:
     return 1
 
 
+USAGE = """panlib-mcp-bridge —— panlib JSON 请求 → 官方百度 MCP SSE 的桥接层。
+
+这是**内部子进程**，不是给 Agent 或人使用的命令行入口：它从 stdin 读一个
+JSON 请求 {"tool": "...", "arguments": {...}}，把结果写到 stdout。
+请通过 bin/panlib-library 调用，不要直接运行本文件。
+
+之所以仍然实现 --help：一个"没有 --help"的可执行文件无法自证它是故意如此，
+还是坏了。CI 的 help 巡检会把两者一律判为失败，此前只能靠人记住"这个不用查"——
+而这正是本仓库反复吃亏的那类隐性知识。现在它自己说得清楚。
+"""
+
+
 def main() -> int:
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(USAGE)
+        return 0
     try:
         request = json.loads(sys.stdin.read())
         if not isinstance(request, dict) or not isinstance(request.get("tool"), str):

@@ -51,8 +51,8 @@ VENV_PY = ROOT / ".venv" / "bin" / "python"
 #   都不会报警**。豁免的语义只能是"这个算子本来就不该出现在配方里"，
 #   绝不能是"它已经接好了"——后者属于断言，必须由测试验证，不是由清单声明。
 NOT_AGENT_FACING = {
-    "panlib-doctor": "安装状态机专用，由 SKILL 的安装流程直接调用，不属于业务配方",
-    "panlib-mcp-bridge": "panlib-library 的内部子进程，不是给 Agent 的入口",
+    "panlib-doctor": "安装状态机专用（bash 脚本），由 SKILL 安装流程直接调用，不属于业务配方",
+    "panlib-mcp-bridge": "panlib-library 的内部子进程，从 stdin 读 JSON，不是给 Agent 的入口",
     "panlib-extract": "SKILL 明确写着「Agent 不调用」，仅作人工诊断兼容入口",
     "panlib-verify": "同上，人工诊断兼容入口",
     "panlib-sandbox": "真机沙箱演练入口，仅在改动高风险代码时由人工使用",
@@ -224,6 +224,57 @@ class HaltingSemanticsTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(p.stdout)["error"]["details"]["status"],
                 "CONFLICTING_EVIDENCE")
+
+
+class ExecutabilityTests(unittest.TestCase):
+    """不变量 6：每个算子都必须能自证「我是什么、怎么用」。
+
+    2026-09-03 实测：我曾用 python 去跑 bash 写的 panlib-doctor，得到
+    SyntaxError，据此报告"它的 --help 坏了"——**结论是错的，错在检查方式**。
+    真正的缺陷有两个，都比"help 坏了"更严重：
+      1. CI 的 help 巡检用硬编码清单，漏掉了 8 个算子，新增算子默认不受检查；
+      2. panlib-mcp-bridge 确实没有 --help，但它无法自证这是故意的还是坏了。
+
+    一个不能自证的可执行文件，会持续消耗每一个后来者的判断力。
+    """
+
+    def _runner_for(self, path: Path) -> list[str]:
+        """按 shebang 分派解释器——不能靠扩展名或印象猜。"""
+        first = path.read_text(encoding="utf-8", errors="ignore").splitlines()[:1]
+        shebang = first[0] if first else ""
+        return ["bash"] if "bash" in shebang else [str(VENV_PY)]
+
+    def test_every_operator_answers_help_with_its_own_interpreter(self):
+        broken = []
+        for p in sorted(BIN.glob("panlib-*")):
+            if not p.is_file():
+                continue
+            proc = subprocess.run(self._runner_for(p) + [str(p), "--help"],
+                                  cwd=ROOT, capture_output=True, text=True, timeout=120)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                broken.append(f"{p.name}(exit={proc.returncode})")
+        self.assertEqual(broken, [],
+                         "以下算子无法响应 --help，调用方无从判断它是坏了还是"
+                         f"故意没有入口：{broken}")
+
+    def test_every_operator_is_executable_and_has_a_shebang(self):
+        bad = []
+        for p in sorted(BIN.glob("panlib-*")):
+            if not p.is_file():
+                continue
+            head = p.read_text(encoding="utf-8", errors="ignore")[:2]
+            if head != "#!":
+                bad.append(f"{p.name}(无 shebang)")
+        self.assertEqual(bad, [], f"算子缺少 shebang，解释器分派会出错: {bad}")
+
+    def test_ci_help_check_is_auto_discovered_not_a_hardcoded_list(self):
+        """CI 必须遍历 bin/panlib-*，而不是维护一份会过期的清单。
+
+        硬编码清单的失效方式是静默的：新增算子不会被检查，也不会有人收到通知。
+        """
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("for cli in bin/panlib-*", ci,
+                      "CI 的 help 巡检必须自动发现算子；硬编码清单会静默过期")
 
 
 class DocumentationConsistencyTests(unittest.TestCase):

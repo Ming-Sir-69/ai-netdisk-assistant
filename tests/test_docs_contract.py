@@ -96,7 +96,13 @@ class PublicDocumentationContractTests(unittest.TestCase):
             r'python-version:\s*["\']3\.13["\']',
         )
         ci = self.read(".github/workflows/ci.yml")
-        self.assertIn('.venv/bin/python "$cli" --help', ci)
+        # 断言的是「CI 检查了每个 CLI 的 --help」这个意图，而不是某一种写法。
+        # 原断言锁死了硬编码清单的字面量 `.venv/bin/python "$cli" --help`，
+        # 结果 2026-09-03 把巡检改成自动发现（修掉「漏检 10 个算子」的真实缺陷）时，
+        # 这条测试反而拦住了正确的修复——**测试锁实现细节就会阻碍改进**。
+        self.assertIn("for cli in bin/panlib-*", ci,
+                      "CI 的 help 巡检必须自动发现算子，不得维护硬编码清单")
+        self.assertIn("--help", ci)
         self.assertIn("github.com/zricethezav/gitleaks/v8@v8.24.2", ci)
         self.assertNotIn("github.com/gitleaks/gitleaks/v8", ci)
         self.assertIn("--config .gitleaks.toml", ci)
