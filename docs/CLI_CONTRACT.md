@@ -33,6 +33,16 @@
 | `panlib-library meta` | `--path` 或 `--fsid` | 是 | 无 |
 | `panlib-library archive` | `--source`, 可选 `--archive-dir`/`--new-name` | 是 | `--execute --plan-ref` |
 | `panlib-library migrate` | `--source`, `--target-dir`, `--new-name` | 是 | `--execute --plan-ref` |
+| `panlib-master query` | `--title`, `--year` | 是 | 无 |
+| `panlib-master record` | `--title`, `--year`, `--source`, `--evidence` 或 `--no-evidence` | 否 | 追加本地台账（不触网盘） |
+| `panlib-master verdict` | `--title`, `--year` | 是 | 无 |
+
+`panlib-master` 是**母版发行史判定**算子，回答「这部片子官方到底发行过多高分辨率」，
+用于在升级画质前排除软件超分的假 4K。它**自己不联网**：证据检索由 Agent 层用
+`web_search`/`web_extract` 执行，本 CLI 只给检索指引、记录证据句、给出判定。
+台账写在 `runtime/master_lookup.jsonl`，可用 `PANLIB_MASTER_LEDGER` 重定向（测试用）。
+同一片名 24 小时内已有记录直接复用，避免重复检索。
+证据冲突时返回 `CONFLICTING_EVIDENCE` 并非零退出，**不自动取最大值**。
 
 `--fixture-dir` 是测试专用的显式离线 seam，在正常 Agent 调用中不使用。`--episode` 与 `--dry-run` 仅保留旧调用兼容性，已从公开 help 隐藏；TV 季集号从源文件名解析。
 

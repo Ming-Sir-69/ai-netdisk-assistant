@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""panlib-master - 母版发行史调查：判断一部作品是否存在真实原生高分辨率版本。
+
+存在的理由（2026-09-02，《爱在三部曲》案例）：升级画质前不查证发行历史，
+只能靠"撞见候选描述自相矛盾"才发现问题——这是运气，不是方法。实测教训：
+- SeedHub 候选列表的 quality 标签来自描述文字模糊匹配，不是实测结果；
+- 网络"2160p"资源常见是 Upscaled（软件超分），标题会诚实写明，但内容本身
+  不构成真实画质提升；
+- 判断一部片子该不该追更高分辨率，必须先知道它官方发行史上到底到过多高
+  （即"数字中间片"DI 分辨率），而这个信息没有结构化数据源（Wikidata 没有
+  对应字段），只能从评测类文章的自然语言证据句里提取。
+
+架构边界（刻意如此，不是遗漏）：本命令自己不联网、不做通用网页搜索。
+证据检索必须由 Agent 层执行 web_search/web_extract（Hermes 工具，本仓库
+子进程没有等价能力，也不该新增一套脆弱的搜索引擎爬虫），本命令只负责：
+  1. `query`：给出本次要检索的证据源清单和每条要找的关键词模式（只读，
+     引导 Agent 该查哪几处、怎么判断证据是否成立，不替 Agent 搜索）；
+  2. `record`：Agent 把检索到的证据句追加进台账（antibudget: has_evidence
+     决定这条记录是否可信采信）；
+  3. `verdict`：读台账，给出三态判定 + 判据来源，供 upgrade-quality 配方
+     调用。**同一片名/年份 24 小时内已有记录直接复用，不重新触发检索**——
+     这是解决"反复搜索、结果不可靠、浪费额外时间"的关键机制。
+
+判据（写入 SKILL.md 的规则，这里是其可执行落地）：
+  DI 分辨率 <= 2K（"2K digital transfer"/"2K restoration"/"2K DI" 等证据）
+    → verdict=NATIVE_CAP_2K：网络上任何声称更高分辨率的资源默认视为
+      upscale，不追求，除非有独立证据证明是真实更高分辨率的重新扫描。
+  DI 分辨率 >= 4K（"4K restoration"/"4K digital intermediate"/"UHD scan"）
+    → verdict=NATIVE_CAP_4K：值得寻找对应的原生高分辨率版本；候选描述
+      含 "Upscaled"/"AI Enhanced"/"倍线"等字样的仍要排除。
+  查过但没有任何来源提到过分辨率相关字样 → verdict=UNKNOWN_CONSERVATIVE：
+    保守按"未确认存在更高版本"处理，不主动升级，除非用户明确接受风险。
+  尚未检索（无记录）→ verdict=NOT_QUERIED：先走 `query` 子命令。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "panlib"))
+from common import SKILL_ROOT, emit_error, emit_success, INVALID_ARG, NOT_FOUND  # noqa: E402
+
+LEDGER_PATH = Path(
+    os.environ.get("PANLIB_MASTER_LEDGER")
+    or SKILL_ROOT / "runtime" / "master_lookup.jsonl"
+)
+CACHE_TTL = timedelta(hours=24)
+
+# 固定的证据源清单，按可靠性排序。每个源给出"该怎么查、命中什么关键词才算数"，
+# Agent 照此顺序执行 web_search/web_extract，不必每次重新设计检索策略——
+# 这正是"避免反复搜索、结果不可靠"的核心：把检索策略也确定性地定下来。
+EVIDENCE_SOURCES = [
+    {
+        "id": "dvdbeaver",
+        "query_template": 'site:dvdbeaver.com "{title}" blu-ray',
+        "what": "碟评站点，正文常见明确写出母版分辨率的句子",
+        "keyword_patterns": [
+            r"\b\d[Kk]\s*(?:digital\s+)?(?:transfer|restoration|intermediate|scan|DI)\b",
+            r"\brestored\s+in\s+\d[Kk]\b",
+            r"\bnew\s+\d[Kk]\s+scan\b",
+        ],
+    },
+    {
+        "id": "bluray_com",
+        "query_template": '"{title}" blu-ray.com resolution UHD OR "Ultra HD"',
+        "what": "碟商发行数据库，Resolution/Video 字段直接列出分辨率",
+        "keyword_patterns": [
+            r"\bResolution:\s*\d{3,4}p\b",
+            r"\b(?:2160p|1080p|720p)\b.{0,40}\b(?:codec|resolution)\b",
+        ],
+    },
+    {
+        "id": "wikipedia",
+        "query_template": '"{title}" wikipedia home media OR restoration OR remaster',
+        "what": "词条 Home media/Release 章节，覆盖率不稳，仅作辅助佐证",
+        "keyword_patterns": [
+            r"\b\d[Kk]\s*(?:restoration|remaster|transfer)\b",
+        ],
+    },
+]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _norm_key(title: str, year: str) -> str:
+    return f"{title.strip().lower()}::{year}"
+
+
+# 「这份高分辨率是算出来的，不是拍出来的」的标记词。命中后，同一句里出现的
+# 更高数字一律不能当作原生母版证据——实测最常见的真实措辞恰恰是
+# "4K UHD upscaled from the original 2K digital intermediate"：句子里同时有
+# 4K 和 2K，天真地取最大值会得出与事实相反的结论。
+UPSCALE_MARKERS = (
+    "upscal",       # upscaled / upscaling
+    "upconvert",
+    "upres",        # upresed / uprezzed
+    "uprez",
+    "ai enhanced",
+    "ai-enhanced",
+    "倍线",
+    "超分",
+)
+
+
+def parse_native_cap(evidence: str) -> tuple[str | None, bool]:
+    """从证据句提取「原生母版分辨率上限」，返回 (cap, 是否命中 upscale 标记)。
+
+    真实措辞里分辨率有两种写法，必须都认，否则会漏判：
+    - `2K` / `4K`：母版/DI 语境的常见写法；
+    - `1080p` / `2160p`：碟商 Resolution 字段的写法，按 1080p≈2K、2160p≈4K
+      归一到同一量纲后再比较。
+
+    规则（刻意保守，宁可低估不可高估）：
+    - 句中出现 upscale 类标记时取**最小**的那个数——更高的那个是算法放大的
+      结果，最小的才是真实母版。实测反例：
+      "4K UHD upscaled from the original 2K digital intermediate"；
+    - 否则取最大的那个数（多个数字通常是"旧 2K 转制被新 4K 修复取代"这类
+      递进描述，上限确实是高的那个）。
+
+    没有任何可识别的分辨率数字时返回 (None, ...)，由调用方按"无证据"处理——
+    **不猜**。
+    """
+    nums = [int(m) for m in re.findall(r"\b(\d)[Kk]\b", evidence)]
+    # 1080p→2K、2160p→4K、720p→1K：向上取整到最接近的 K 档，与上面同量纲。
+    for p in re.findall(r"\b(\d{3,4})p\b", evidence):
+        nums.append(max(1, round(int(p) / 540)))
+    if not nums:
+        return None, False
+    lowered = evidence.lower()
+    upscaled = any(marker in lowered for marker in UPSCALE_MARKERS)
+    return (f"{min(nums)}K" if upscaled else f"{max(nums)}K"), upscaled
+
+
+def _read_ledger() -> list[dict[str, Any]]:
+    if not LEDGER_PATH.exists():
+        return []
+    out = []
+    for line in LEDGER_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # 单行损坏不拖垮整个台账读取
+    return out
+
+
+def _append_ledger(event: dict[str, Any]) -> None:
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _latest_records(title: str, year: str) -> list[dict[str, Any]]:
+    key = _norm_key(title, year)
+    return [e for e in _read_ledger() if e.get("key") == key]
+
+
+def cmd_query(a) -> int:
+    """只读：给出本次该查哪些源、每个源怎么判断证据成立。不联网、不猜测。"""
+    key = _norm_key(a.title, a.year)
+    cached = _latest_records(a.title, a.year)
+    if cached:
+        last = cached[-1]
+        ts = datetime.fromisoformat(last["ts"])
+        if datetime.now(timezone.utc) - ts < CACHE_TTL:
+            emit_success({
+                "status": "CACHED",
+                "next_action": f"24 小时内已查过，直接运行 panlib-master verdict --title \"{a.title}\" --year {a.year}，不必重新检索",
+                "cached_record": last,
+            }, {"command": "panlib-master query", "mode": "read-only"})
+            return 0
+
+    emit_success({
+        "status": "NEEDS_QUERY",
+        "key": key,
+        "sources": EVIDENCE_SOURCES,
+        "instructions": (
+            "按 sources 顺序逐个执行 web_search(query_template 代入 title)，"
+            "对返回结果用 web_extract 读正文，用 keyword_patterns 判断是否命中证据句。"
+            "命中就摘录原句，逐条调用 panlib-master record 记录；全部查完（无论有没有命中）"
+            "都要调用一次 panlib-master record --no-evidence 标记'已查过'，"
+            "否则下次会被当成 NOT_QUERIED 重新触发检索。"
+        ),
+    }, {"command": "panlib-master query", "mode": "read-only"})
+    return 0
+
+
+def cmd_record(a) -> int:
+    """写台账：记录一条检索结果（命中证据或确认无证据）。"""
+    if not a.no_evidence and not a.evidence:
+        emit_error(INVALID_ARG, "必须提供 --evidence 或显式 --no-evidence",
+                   {"next_action": "命中证据句就传 --evidence \"<原句>\"；确认该源查过但没有就传 --no-evidence"})
+        return 2
+
+    resolution = None
+    upscale_flag = False
+    if a.evidence:
+        resolution, upscale_flag = parse_native_cap(a.evidence)
+
+    event = {
+        "key": _norm_key(a.title, a.year),
+        "title": a.title, "year": a.year,
+        "source": a.source, "ts": _now(),
+        "has_evidence": bool(a.evidence),
+        "evidence_text": a.evidence or None,
+        "resolution_hint": resolution,
+        "upscale_marker": upscale_flag,
+    }
+    _append_ledger(event)
+    emit_success({"recorded": True, "event": event},
+                 {"command": "panlib-master record", "mode": "executed"})
+    return 0
+
+
+def cmd_verdict(a) -> int:
+    """只读：汇总台账，给出三态判定。"""
+    records = _latest_records(a.title, a.year)
+    if not records:
+        emit_error(NOT_FOUND, "尚未检索过，无法判定",
+                   {"status": "NOT_QUERIED",
+                    "next_action": f'先运行 panlib-master query --title "{a.title}" --year {a.year}'})
+        return 1
+
+    with_evidence = [r for r in records if r.get("has_evidence")]
+
+    def cap_of(rec: dict[str, Any]) -> int | None:
+        hint = (rec.get("resolution_hint") or "").rstrip("Kk")
+        return int(hint) if hint.isdigit() else None
+
+    caps = {r["source"]: cap_of(r) for r in with_evidence if cap_of(r) is not None}
+    common = {
+        "title": a.title, "year": a.year,
+        "native_caps_by_source": caps,
+        "evidence": with_evidence,
+        "sources_checked": sorted({r["source"] for r in records}),
+        "checked_at": records[-1]["ts"],
+    }
+
+    if caps and len(set(caps.values())) > 1:
+        # 证据源互相打架不是可以取最大值糊弄过去的事：其中一方必然是错的，
+        # 而选错方向的代价是「白下 80GB 假 4K」或「错过真实原生版本」。
+        # 停机交人裁决，比自作主张更便宜。
+        # 必须走 emit_error：emit_success 硬编码 exit 0，BLOCKED 走它会让
+        # 脚本化调用把「需要人裁决」读成「判定成功」。
+        emit_error(INVALID_ARG, "多个证据源给出互相冲突的母版分辨率，不做自动判定", {
+            "status": "CONFLICTING_EVIDENCE",
+            "next_action": ("逐条读 evidence 原句人工裁决：注意区分'原生扫描'与"
+                            "'从低分辨率 DI 升频'，两者都会被写成 4K。"
+                            "裁决后用 record 补一条更明确的证据句再重跑 verdict。"),
+            **common,
+        })
+        return 2
+
+    if not caps:
+        verdict = "UNKNOWN_CONSERVATIVE"
+        action = "已检索但未发现分辨率证据，保守按未确认处理，不主动升级"
+    elif max(caps.values()) >= 4:
+        verdict = "NATIVE_CAP_4K"
+        action = ("确认存在 4K 及以上原生母版证据，值得寻找对应版本；"
+                  "候选描述含 Upscaled/AI Enhanced/倍线等字样的仍要排除")
+    else:
+        verdict = "NATIVE_CAP_2K"
+        action = "官方母版上限为 2K，网络任何更高分辨率资源默认视为 upscale，不追求"
+
+    emit_success({"status": verdict, "next_action": action, **common},
+                 {"command": "panlib-master verdict", "mode": "read-only"})
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="母版发行史调查：判断一部作品是否值得追更高分辨率版本。\n"
+                    "本命令不联网——检索由 Agent 层执行 web_search/web_extract，"
+                    "本命令只负责给出检索指引、记录证据、给出三态判定。",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("query", help="[只读] 给出本次该查哪些源；24小时内有缓存则直接提示复用")
+    q.add_argument("--title", required=True)
+    q.add_argument("--year", required=True)
+
+    r = sub.add_parser("record", help="[只写台账] 记录一条检索结果")
+    r.add_argument("--title", required=True)
+    r.add_argument("--year", required=True)
+    r.add_argument("--source", required=True, choices=[s["id"] for s in EVIDENCE_SOURCES])
+    r.add_argument("--evidence", default=None, help="命中的证据原句")
+    r.add_argument("--no-evidence", action="store_true", help="该源已查过，确认没有证据")
+
+    v = sub.add_parser("verdict", help="[只读] 汇总台账给出三态判定")
+    v.add_argument("--title", required=True)
+    v.add_argument("--year", required=True)
+
+    a = p.parse_args()
+    return {"query": cmd_query, "record": cmd_record, "verdict": cmd_verdict}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -37,7 +37,8 @@ MAX_MANIFEST_BYTES = 1_048_576
 CATEGORY_DIRS = {
     "movie": "Movies",
     "tv": "TV shows",
-    "anime": "动漫",
+    "anime": "Animation",  # 2026-08-30 铭哥定：旧名"动漫"已原地改名为 Animation，
+    # 云端两个网盘根下的目录都已改完；这里若不同步会让审计和整理全部错认路径。
     "documentary": "Documentary",
     "webdrama": "网剧",
 }

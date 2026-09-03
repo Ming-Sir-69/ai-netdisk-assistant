@@ -48,7 +48,9 @@ TYPE_DIR = {
     "movie": "Movies",
     "tv": "TV shows",
     "doc": "Documentary",
-    "anime": "动漫",
+    "anime": "Animation",  # 2026-08-30 铭哥定：与 panlib/media_manifest.py 的
+    # CATEGORY_DIRS["anime"] 同步；两处各自维护是历史遗留，改名时曾漏改这份，
+    # 导致本命令若转存动漫资源会拼接出不存在的旧目录名。
     "webdrama": "网剧",
 }
 _SHARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")

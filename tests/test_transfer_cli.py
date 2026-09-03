@@ -386,7 +386,11 @@ class TransferCliTests(unittest.TestCase):
         self.assertNotIn("mkdir", [item[0] for item in calls])
 
     def test_anime_and_webdrama_use_distinct_category_directories(self):
-        for resource_type, expected in (("anime", "动漫"), ("webdrama", "网剧")):
+        # anime 目标目录名 2026-08-30 由"动漫"改为 Animation（铭哥定，见
+        # panlib/media_manifest.py::CATEGORY_DIRS 的注释）；两处各自维护一份
+        # 目录名映射，本测试曾在改名后继续断言旧值，未能拦住 bin/panlib-transfer
+        # 里的漂移（TYPE_DIR 仍写着"动漫"），直到全库审计间接暴露出来。
+        for resource_type, expected in (("anime", "Animation"), ("webdrama", "网剧")):
             with self.subTest(resource_type=resource_type):
                 args = self.base_args()
                 args[args.index("--type") + 1] = resource_type

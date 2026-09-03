@@ -25,18 +25,28 @@ primitives   panlib-transfer / panlib-organize / panlib-library / panlib-contain
 | 算子 | 子命令 | 副作用 | 停机语义 | 退出码 |
 |---|---|---|---|---|
 | `panlib-plan` | `list` / `show --task` | 只读 | 纯规划，不做 I/O | 0 |
-| `panlib-lib` | `find` | 只读 | `DONE` / `CONTINUE` / `BLOCKED` | 0 / 0 / 2 |
-| `panlib-lib` | `verify` | 只读 | 同上 | 0 / 1 / 2 |
+| `panlib-lib` | `find` | 只读 | `DONE` / `CONTINUE` / `BLOCKED` | 0 / 0 / 1 |
+| `panlib-lib` | `verify` | 只读 | 同上 | 0 / 1 / 1 |
+| `panlib-master` | `query` | 只读 | `NEEDS_QUERY` / `CACHED` | 0 |
+| `panlib-master` | `record` | 只写本地台账 | 记一条证据（或确认无证据） | 0 / 1 |
+| `panlib-master` | `verdict` | 只读 | `NATIVE_CAP_2K` / `NATIVE_CAP_4K` / `UNKNOWN_CONSERVATIVE` / `CONFLICTING_EVIDENCE` / `NOT_QUERIED` | 0 / 0 / 0 / 1 / 1 |
 | `panlib-share` | `browse` | 只读 | 返回 entries | 0 |
 | `panlib-share` | `select` | **写网盘** | 默认 plan-only，`--execute` 才写 | 0 / 1 |
 | `panlib-run` | `probe` | 只读 | healthy 与否 | 0 / 1 |
 | `panlib-run` | `selfcheck` | 只读 | 算子齐备 | 0 / 1 |
-| `panlib-run` | `transfer-select` | **写网盘** | 数量齐 = DONE | 0 / 1 / 2 |
-| `panlib-run` | `organize-season` | **写网盘** | 源目录清空 = DONE | 0 / 1 / 2 |
+| `panlib-run` | `transfer-select` | **写网盘** | 数量齐 = DONE | 0 / 1 |
+| `panlib-run` | `organize-season` | **写网盘** | 源目录清空 = DONE | 0 / 1 |
 | `panlib-run` | `archive` | **写网盘** | verified（不删除） | 0 / 1 |
 
 **BLOCKED 一律非零退出**，且必须走 `emit_error`——`emit_success` 硬编码 exit 0，
 BLOCKED 走它会让 `return 2` 永不生效，脚本化调用把失败读成成功。
+
+**注意 `emit_error` 硬编码 `SystemExit(1)`**（2026-09-03 实测确认）：函数体里
+写的 `return 2` 是**死代码**，永远不会生效——`emit_error` 在 return 之前就退出了。
+本表此前记的 `2` 与实际行为不符，已按实测改为 `1`。调用方**只能判断
+「是否为 0」，不能依赖具体的非零值区分错误类型**；要区分请读 stdout JSON 里的
+`error.code` 与 `error.details.status`。新增算子时不要再写 `return 2` 并假设它
+会传出去。
 
 ## 为什么不拆成更多文件
 

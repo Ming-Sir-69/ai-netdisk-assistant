@@ -143,7 +143,10 @@ RECIPES: dict[str, dict] = {
     },
     "upgrade-quality": {
         "summary": "把已入库某剧某季替换为更高画质版本（剧集专用）",
-        "critical": "仅适用于剧集；电影必须走独立的电影升级流程。先 ffprobe 实测确认新版确实更好——体积和文件名都会骗人。",
+        "critical": "仅适用于剧集；电影必须走独立的电影升级流程。"
+                    "第 2 步不可跳过：不先查母版发行史，就无法区分"
+                    "「真实原生高分辨率」和「软件超分的假 4K」——"
+                    "实测《爱在三部曲》两部片官方母版只到 2K，网上所有 2160p 都是 upscale。",
         "steps": [
             {
                 "why": "看清库内现状，确认要升级的季和当前清晰度",
@@ -152,9 +155,22 @@ RECIPES: dict[str, dict] = {
                 "on_fail": "路径不存在则先确认片名",
             },
             {
+                "why": "★先查母版发行史，再决定值不值得升级——"
+                       "官方从未发行过高分辨率版本时，网上的 2160p 全是 upscale，"
+                       "追下去是纯浪费。24 小时内查过会直接复用，不重复检索",
+                "cmd": f'{PY} bin/panlib-master query --title "{{title}}" --year <YYYY>'
+                       f'  # NEEDS_QUERY 时按返回的 sources 用 web_search/web_extract 取证，'
+                       f'再逐条 {PY} bin/panlib-master record 记录，最后跑 verdict',
+                "expect": "verdict 返回 NATIVE_CAP_4K 才继续；NATIVE_CAP_2K "
+                          "则停止升级并如实告知用户「官方无更高母版」",
+                "on_fail": "UNKNOWN_CONSERVATIVE 按保守处理、不主动升级；"
+                           "CONFLICTING_EVIDENCE 交用户裁决，不要自行取最大值",
+            },
+            {
                 "why": "★browse 找更高画质版本——它通常和低画质版在同一分享的同级目录",
                 "cmd": f'{PY} bin/panlib-share browse -r <resource_id> --source-dir "<逐层深入>"',
-                "expect": "找到 2160p/4K/HDR/DV 字样的目录或文件",
+                "expect": "找到 2160p/4K/HDR/DV 字样的目录或文件；"
+                          "候选标签会虚标，必须看到最深一层的真实文件名",
                 "on_fail": "该分享确无更高版本，换 resource_id 重试",
             },
             {

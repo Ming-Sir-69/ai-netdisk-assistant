@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 PY = str(REPO / ".venv/bin/python")
 sys.path.insert(0, str(REPO / "panlib"))
 from common import emit_success, emit_error, NOT_FOUND  # noqa: E402
+from naming import is_group_folder  # noqa: E402
 
 ROOTS = {
     "tv": "/apps/bdpan/片库/TV shows",
@@ -78,14 +79,37 @@ def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", s.lower())
 
 
-def find_containers(root: str, title: str):
-    """返回 (containers, readable)。readable=False 表示根目录读取失败，
-    此时"没找到"是无信息的，绝不能当作"不存在"。"""
+def find_containers(root: str, title: str, _depth: int = 0):
+    """返回 (containers, readable)。readable=False 表示读取失败（本级或递归中任一层），
+    此时"没找到"是无信息的，绝不能当作"不存在"。
+
+    递归穿透分组节点（`.{series}` 后缀目录，如系列/合集容器）向下找内容节点，
+    不止匹配片库根目录的直接子项。实测教训：`Before Trilogy.{series}/` 下的三部
+    电影完整存在，但旧版只比对根目录直接子项名字，`find --title "Before Sunrise"`
+    永远返回 no_container——因为片名不会出现在系列容器名里。这不是极端情况，
+    是"系列分组"这个层级结构的基本用法（B+ 节：漫威/DC/任意 franchise 都这样建）。
+    深度上限 6 层：naming.py 的分组深度设计上不设上限，但实际片库不会深到那里，
+    这里是纯防御（防云端异常结构导致无限递归），不是业务约束。
+    """
+    if _depth >= 6:
+        return [], True
     entries = cloud_list(root)
     if entries is None:
         return [], False
     key = norm(title)
-    return [e for e in entries if e.get("isdir") and key and key in norm(e["name"])], True
+    if not key:
+        return [], True
+
+    direct = [e for e in entries if e.get("isdir") and key in norm(e["name"])]
+    nested: list[dict] = []
+    for e in entries:
+        if not e.get("isdir") or not is_group_folder(e["name"]):
+            continue
+        sub_hits, sub_readable = find_containers(e["path"], title, _depth + 1)
+        if not sub_readable:
+            return [], False  # 分组内任一层读不到，整体判定为不可读，不能拼出半截结果
+        nested.extend(sub_hits)
+    return direct + nested, True
 
 
 def season_report(season_path: str):

@@ -264,9 +264,107 @@ def cmd_archive(a) -> int:
     return 1
 
 
+def _archive_one(source: str, new_name: str, max_rounds: int, interval: int) -> dict:
+    """`cmd_archive` 的可复用内核：归档一个目录，返回结构化结果而非直接 emit。
+    供 sweep-empty 批量调用；单独调用仍走 cmd_archive 的 CLI 包装。"""
+    for i in range(1, max_rounds + 1):
+        _, plan = sh(["bin/panlib-library", "archive", "--source", source,
+                      "--new-name", new_name], timeout=180)
+        pr = re.search(r"\b([0-9a-f]{64})\b", plan)
+        if not pr:
+            time.sleep(interval); continue
+        _, out = sh(["bin/panlib-library", "archive", "--source", source,
+                     "--new-name", new_name, "--plan-ref", pr.group(1),
+                     "--execute"], timeout=300)
+        if '"status": "verified"' in out:
+            return {"archived": True, "rounds_used": i, "source": source, "new_name": new_name}
+        time.sleep(interval)
+    return {"archived": False, "source": source, "new_name": new_name,
+            "reason": "archive 未能在重试内完成"}
+
+
+# ---------------------------------------------------------------- sweep-empty
+def cmd_sweep_empty(a) -> int:
+    """空目录处理：不是"看到空目录就删"，而是先证明内容有没有着落，再决定动作。
+
+    铭哥原话（2026-09-02）："先去翻一下我本地有没有这几个资源，不管在哪个
+    文件夹。如果有，就把现在的删掉；如果没有，就先找。" —— 因为工作流的硬
+    边界是不删除只归档（AGENTS.md/SKILL.md/README.md 三处一致，网盘 API 也
+    从未实现真正删除），"删掉"落地为"自动归档到 _已归档_待删除，不再逐次
+    确认"；"先找"落地为返回 needs_acquire 让路由器接手 acquire-season/movie。
+
+    候选片名由调用方给出，不由本命令从目录名自动解析。原因：本仓库命名契约
+    是"中国制作用中文正式名，非中国制作用英文正式名"（B++ 节），而云端未整理
+    的空壳目录名往往是转存时的原始命名，语种不定、噪音 token 不定；猜测候选
+    本身就是一次不可控的判断，猜错会把"已存在"误判成"需要获取"，比不做还
+    危险。--map 是一份 {云端路径: [候选片名, ...]} 的 JSON；每个候选依次
+    调用 panlib-lib find --type movie，任一候选命中 DONE 即视为"已找到"。
+
+    对每个空目录：
+      1. 对 map 中给出的每个候选片名调用 panlib-lib find（三态判定，不是布尔）
+      2. 任一候选 status=DONE → 视为"已找到"，自动归档空壳（不再询问）
+      3. 全部候选都非 DONE → 不猜测、不归档，原样报告，交还给路由器
+    """
+    try:
+        mapping: dict = json.loads(a.map) if a.map else {}
+    except Exception:
+        emit_error(INVALID_ARG, "--map 不是合法 JSON", {"received": a.map[:200] if a.map else ""})
+        return 2
+    if not mapping:
+        emit_error(INVALID_ARG, "未提供待处理的空目录及候选片名",
+                   {"next_action": "先跑 panlib-audit 拿到 empty_container 清单，"
+                                   "为每个路径给出中文/英文候选片名后再调用本命令"})
+        return 2
+
+    archived, needs_acquire, skipped = [], [], []
+    for path, candidates in mapping.items():
+        if not candidates:
+            skipped.append({"path": path, "reason": "未提供候选片名，人工确认"})
+            continue
+
+        matched, tried = None, []
+        for guess in candidates:
+            _, find_out = sh(["bin/panlib-lib", "find", "--title", guess, "--type", "movie"], timeout=180)
+            try:
+                found = json.loads(find_out[find_out.index("{"):])["data"]
+            except Exception:
+                tried.append({"guess": guess, "error": "find 输出解析失败"})
+                continue
+            tried.append({"guess": guess, "status": found.get("status")})
+            if found.get("status") == "DONE":
+                matched = guess
+                break
+
+        if matched:
+            leaf = path.rstrip("/").rsplit("/", 1)[-1]
+            new_name = f"{leaf}_已整理_待删除"
+            result = _archive_one(path, new_name, a.max_rounds, a.interval)
+            (archived if result.get("archived") else skipped).append(
+                {"path": path, "matched_title": matched, **result})
+        else:
+            needs_acquire.append({"path": path, "tried": tried})
+
+    ok = not skipped
+    payload = {
+        "status": "DONE" if ok and not needs_acquire else "CONTINUE",
+        "archived": archived, "needs_acquire": needs_acquire, "skipped": skipped,
+        "next_action": (
+            "全部空目录已确认有着落并归档" if ok and not needs_acquire else
+            "needs_acquire 中的条目请走 panlib-plan show --task acquire-movie/acquire-season 获取，"
+            "获取入库后重跑本命令即可自动归档空壳"
+        ),
+    }
+    if ok:
+        emit_success(payload, {"command": "panlib-run sweep-empty", "mode": "executed"})
+        return 0
+    emit_error(INVALID_ARG, "部分空目录未能自动判定，需人工确认", payload)
+    return 1
+
+
 def cmd_selfcheck(a) -> int:
     """自检：确认三个高层算子齐备可用。新机器或换模型后先跑一次。"""
     need = ["panlib-plan", "panlib-run", "panlib-lib", "panlib-share",
+            "panlib-master",
             "panlib-transfer", "panlib-organize", "panlib-library"]
     rows, ok_all = [], True
     for n in need:
@@ -328,6 +426,11 @@ def main() -> int:
     ar.add_argument("--new-name", required=True)
     ar.add_argument("--max-rounds", type=int, default=5)
 
+    se = sub.add_parser("sweep-empty", help="[写网盘] 空目录先判存在再归档，绝不猜测（不新增删除能力）")
+    se.add_argument("--map", required=True,
+                    help='JSON 对象 {云端绝对路径: [候选片名, ...]}；候选由调用方给出，不自动解析目录名')
+    se.add_argument("--max-rounds", type=int, default=5)
+
     sub.add_parser("selfcheck", help="[只读] 自检：确认算子齐备（换机器/换模型后先跑）")
 
     a = p.parse_args()
@@ -337,7 +440,7 @@ def main() -> int:
     a.interval = getattr(a, "interval", 8) or 8
     return {"probe": cmd_probe, "transfer-select": cmd_transfer_select,
             "organize-season": cmd_organize_season, "archive": cmd_archive,
-            "selfcheck": cmd_selfcheck}[a.cmd](a)
+            "sweep-empty": cmd_sweep_empty, "selfcheck": cmd_selfcheck}[a.cmd](a)
 
 
 if __name__ == "__main__":
