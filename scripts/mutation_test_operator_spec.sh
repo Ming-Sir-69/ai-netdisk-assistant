@@ -53,73 +53,72 @@ check() {
   fi
 }
 
+# 文本替换一律走 Python，不用 sed —— `sed -i ''` 是 macOS 语法，GNU sed 会把
+# 那个空字符串当成文件名（实测 CI 报 `sed: can't read s|…|…|g`），于是变异
+# 根本没生效、规格保持绿色，脚本却把"没拦住"判成失败。本地全绿、CI 全红，
+# 正是本轮反复强调的那种平台差异，必须用可移植写法根除。
+sub() {  # sub <文件> <原文> <替换> [count]
+  SUB_FILE="$1" SUB_OLD="$2" SUB_NEW="$3" SUB_COUNT="${4:-0}" python3 -c '
+import os, pathlib
+p = pathlib.Path(os.environ["SUB_FILE"])
+old, new = os.environ["SUB_OLD"], os.environ["SUB_NEW"]
+count = int(os.environ["SUB_COUNT"])
+text = p.read_text(encoding="utf-8")
+if old not in text:
+    raise SystemExit(f"变异目标未找到，脚本已过期: {old!r} in {p}")
+p.write_text(text.replace(old, new, count) if count else text.replace(old, new),
+             encoding="utf-8")
+'
+}
+
 echo "[基线]"
 check "未变异" GREEN
 
 echo "[变异1] 摘掉 panlib-master 的全部引用（重演「写了没接线」）"
-sed -i '' 's|bin/panlib-master|bin/panlib-NOTHING|g' "$PLAN"
+sub "$PLAN" "bin/panlib-master" "bin/panlib-NOTHING"
 check "算子不可达" RED
 restore
 
 echo "[变异2] 配方引用不存在的子命令（重演 panlib-audit scan 那个 bug）"
-sed -i '' 's|bin/panlib-audit --path|bin/panlib-audit scan --path|' "$PLAN"
+sub "$PLAN" "bin/panlib-audit --path" "bin/panlib-audit scan --path" 1
 check "配方腐烂" RED
 restore
 
 echo "[变异3] SKILL 路由表漏掉一个配方"
-python3 -c "
-import pathlib
-p = pathlib.Path('$SKILL')
-p.write_text(p.read_text(encoding='utf-8').replace('\`audit-library\`', '\`REMOVED\`', 1), encoding='utf-8')
-"
+sub "$SKILL" '`audit-library`' '`REMOVED`' 1
 check "路由表缺项" RED
 restore
 
 echo "[变异4] 拿掉 mcp-bridge 的 --help（重演「不能自证是故意还是坏了」）"
-cp bin/panlib-mcp-bridge "$BAK/bridge"
-python3 -c "
-import pathlib
-p = pathlib.Path('bin/panlib-mcp-bridge')
-t = p.read_text(encoding='utf-8')
-p.write_text(t.replace('    if any(a in (\"-h\", \"--help\") for a in sys.argv[1:]):', '    if False:'), encoding='utf-8')
-"
+sub bin/panlib-mcp-bridge '    if any(a in ("-h", "--help") for a in sys.argv[1:]):' '    if False:' 1
 check "算子无法自证" RED
-cp "$BAK/bridge" bin/panlib-mcp-bridge
+restore
 
 echo "[变异5] CI 退回硬编码清单（重演「新增算子静默不受检查」）"
-cp .github/workflows/ci.yml "$BAK/ci"
-python3 -c "
-import pathlib
-p = pathlib.Path('.github/workflows/ci.yml')
-p.write_text(p.read_text(encoding='utf-8').replace('for cli in bin/panlib-*', 'for cli in bin/panlib-imdb'), encoding='utf-8')
-"
+sub .github/workflows/ci.yml 'for cli in bin/panlib-*' 'for cli in bin/panlib-imdb' 1
 check "CI 硬编码清单" RED
-cp "$BAK/ci" .github/workflows/ci.yml
+restore
 
 echo "[变异6] 类别根映射漂移（重演「动漫→Animation 漏改一份」）"
-cp bin/panlib-transfer "$BAK/transfer"
-python3 -c "
-import pathlib
-p = pathlib.Path('bin/panlib-transfer')
-t = p.read_text(encoding='utf-8')
-p.write_text(t.replace('\"anime\": \"Animation\"', '\"anime\": \"动漫\"', 1), encoding='utf-8')
-"
+sub bin/panlib-transfer '"anime": "Animation"' '"anime": "动漫"' 1
 check "映射副本漂移" RED
-cp "$BAK/transfer" bin/panlib-transfer
+restore
 
 echo "[变异7] 复活 emit_error 后的死代码 return 2"
-cp bin/panlib-lib "$BAK/lib"
-python3 -c "
-import pathlib, re
-p = pathlib.Path('bin/panlib-lib')
-lines = p.read_text(encoding='utf-8').splitlines(keepends=True)
-for i, l in enumerate(lines):
-    if re.match(r'^\s*return 1\s*$', l) and 'emit_error' in ''.join(lines[max(0,i-10):i]):
-        lines[i] = l.replace('return 1', 'return 2'); break
-p.write_text(''.join(lines), encoding='utf-8')
-"
+MUT_FILE=bin/panlib-lib python3 -c '
+import os, pathlib, re
+p = pathlib.Path(os.environ["MUT_FILE"])
+lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+for i, line in enumerate(lines):
+    if re.match(r"^\s*return 1\s*$", line) and "emit_error" in "".join(lines[max(0, i - 10):i]):
+        lines[i] = line.replace("return 1", "return 2")
+        break
+else:
+    raise SystemExit("变异目标未找到，脚本已过期：没有 emit_error 后的 return 1")
+p.write_text("".join(lines), encoding="utf-8")
+'
 check "死代码 return 2" RED
-cp "$BAK/lib" bin/panlib-lib
+restore
 
 echo "[还原]"
 check "还原后" GREEN
