@@ -109,7 +109,7 @@ def cmd_transfer_select(a) -> int:
                             "landed": None, "rounds_used": i,
                             "next_action": "先用 panlib-library list 确认目标目录，"
                                            "再决定是否补转；不要直接重跑转存"})
-                return 2
+                return 1
             files = [e for e in got if not e.get("isdir")]
             complete = len(files) >= want
             emit_success({
@@ -177,7 +177,7 @@ def cmd_organize_season(a) -> int:
                 emit_error(NETWORK, "连续 4 轮无法读取源目录",
                            {"status": "BLOCKED", "rounds_detail": rounds,
                             "next_action": "排查授权/网络后重跑本命令"})
-                return 2
+                return 1
             time.sleep(a.interval); continue
         left = [e for e in entries if not e.get("isdir")]
         if not left:
@@ -189,7 +189,7 @@ def cmd_organize_season(a) -> int:
                            {"status": "BLOCKED", "source_dir": a.source_dir,
                             "next_action": "用 panlib-library list 确认该路径确实存在且为空；"
                                            "若内容尚未转存，先执行 transfer-select"})
-                return 2
+                return 1
             emit_success({
                 "status": "DONE", "done": True, "rounds_used": i,
                 "source_dir": a.source_dir,
@@ -211,7 +211,7 @@ def cmd_organize_season(a) -> int:
                         "remaining_names": [e["name"] for e in left][:10],
                         "rounds_detail": rounds,
                         "next_action": "已迁移文件不会丢失；排查后可重跑本命令继续"})
-            return 2
+            return 1
 
         n = build_manifest(left, a.season, a.title_en, a.imdb_id,
                            a.quality, a.numeric, tmp)
@@ -220,7 +220,7 @@ def cmd_organize_season(a) -> int:
                        {"status": "BLOCKED",
                         "remaining": [e["name"] for e in left][:20],
                         "next_action": "纯数字命名请加 --numeric；季号存疑时先 ffprobe 实证"})
-            return 2
+            return 1
         _, plan = sh(["bin/panlib-organize", "--source-dir", a.source_dir,
                       "--manifest-file", str(tmp)], timeout=300)
         pr = re.search(r'"plan_ref": "([0-9a-f]{64})"', plan)
@@ -309,12 +309,12 @@ def cmd_sweep_empty(a) -> int:
         mapping: dict = json.loads(a.map) if a.map else {}
     except Exception:
         emit_error(INVALID_ARG, "--map 不是合法 JSON", {"received": a.map[:200] if a.map else ""})
-        return 2
+        return 1
     if not mapping:
         emit_error(INVALID_ARG, "未提供待处理的空目录及候选片名",
                    {"next_action": "先跑 panlib-audit 拿到 empty_container 清单，"
                                    "为每个路径给出中文/英文候选片名后再调用本命令"})
-        return 2
+        return 1
 
     archived, needs_acquire, skipped = [], [], []
     for path, candidates in mapping.items():

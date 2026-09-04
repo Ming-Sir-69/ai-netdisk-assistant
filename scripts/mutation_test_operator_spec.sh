@@ -23,12 +23,16 @@ cp "$PLAN" "$BAK/plan"
 cp "$SKILL" "$BAK/skill"
 cp bin/panlib-mcp-bridge "$BAK/bridge0"
 cp .github/workflows/ci.yml "$BAK/ci0"
+cp bin/panlib-transfer "$BAK/transfer0"
+cp bin/panlib-lib "$BAK/lib0"
 
 restore() {
   cp "$BAK/plan" "$PLAN"
   cp "$BAK/skill" "$SKILL"
   cp "$BAK/bridge0" bin/panlib-mcp-bridge
   cp "$BAK/ci0" .github/workflows/ci.yml
+  cp "$BAK/transfer0" bin/panlib-transfer
+  cp "$BAK/lib0" bin/panlib-lib
 }
 trap restore EXIT
 
@@ -91,6 +95,31 @@ p.write_text(p.read_text(encoding='utf-8').replace('for cli in bin/panlib-*', 'f
 "
 check "CI 硬编码清单" RED
 cp "$BAK/ci" .github/workflows/ci.yml
+
+echo "[变异6] 类别根映射漂移（重演「动漫→Animation 漏改一份」）"
+cp bin/panlib-transfer "$BAK/transfer"
+python3 -c "
+import pathlib
+p = pathlib.Path('bin/panlib-transfer')
+t = p.read_text(encoding='utf-8')
+p.write_text(t.replace('\"anime\": \"Animation\"', '\"anime\": \"动漫\"', 1), encoding='utf-8')
+"
+check "映射副本漂移" RED
+cp "$BAK/transfer" bin/panlib-transfer
+
+echo "[变异7] 复活 emit_error 后的死代码 return 2"
+cp bin/panlib-lib "$BAK/lib"
+python3 -c "
+import pathlib, re
+p = pathlib.Path('bin/panlib-lib')
+lines = p.read_text(encoding='utf-8').splitlines(keepends=True)
+for i, l in enumerate(lines):
+    if re.match(r'^\s*return 1\s*$', l) and 'emit_error' in ''.join(lines[max(0,i-10):i]):
+        lines[i] = l.replace('return 1', 'return 2'); break
+p.write_text(''.join(lines), encoding='utf-8')
+"
+check "死代码 return 2" RED
+cp "$BAK/lib" bin/panlib-lib
 
 echo "[还原]"
 check "还原后" GREEN

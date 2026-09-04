@@ -267,6 +267,27 @@ class ExecutabilityTests(unittest.TestCase):
                 bad.append(f"{p.name}(无 shebang)")
         self.assertEqual(bad, [], f"算子缺少 shebang，解释器分派会出错: {bad}")
 
+    def test_no_operator_writes_an_unreachable_return_2_after_emit_error(self):
+        """`emit_error` 之后的 `return 2` 是死代码，会持续误导读代码的人。
+
+        2026-09-03 清理了 13 处（master 2 / run 7 / lib 4）。文档改对了但代码
+        留着旧写法，等于文档和代码互相矛盾——后来者只会信代码。
+        """
+        offenders = []
+        for p in sorted(BIN.glob("panlib-*")):
+            if not p.is_file():
+                continue
+            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            for i, line in enumerate(lines):
+                if re.match(r"^\s*return 2\s*$", line):
+                    window = "\n".join(lines[max(0, i - 10):i])
+                    if "emit_error" in window:
+                        offenders.append(f"{p.name}:{i + 1}")
+        self.assertEqual(
+            offenders, [],
+            "emit_error 硬编码 SystemExit(1)，其后的 return 2 永不可达；"
+            f"请改为 return 1 以免误导：{offenders}")
+
     def test_ci_help_check_is_auto_discovered_not_a_hardcoded_list(self):
         """CI 必须遍历 bin/panlib-*，而不是维护一份会过期的清单。
 
@@ -275,6 +296,61 @@ class ExecutabilityTests(unittest.TestCase):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("for cli in bin/panlib-*", ci,
                       "CI 的 help 巡检必须自动发现算子；硬编码清单会静默过期")
+
+
+class SingleSourceOfTruthTests(unittest.TestCase):
+    """不变量 7：同一份映射不得有多个各自维护的副本。
+
+    实测教训（SKILL.md 已记载）：类别根 `动漫` → `Animation` 改名时，代码里
+    有两份独立字典——`panlib/media_manifest.py::CATEGORY_DIRS` 与
+    `bin/panlib-transfer::TYPE_DIR`——只改了前者。后果分两层：审计层误报（只读、
+    无害），但 transfer 会向一个**不存在的旧路径**写入。这条漏洞潜伏三天，
+    直到一次全库只读扫描才暴露。
+
+    2026-09-03 复查发现副本已增至三份（又多了 `bin/panlib-share::TYPE_DIR`）。
+    当前三份的值恰好一致，但"恰好一致"不是保障——**下一次改名仍然会漏改**。
+
+    彻底的修法是让副本 import 真源；在那之前，这条测试至少让漂移无法静默发生。
+    """
+
+    SOURCE = ("panlib/media_manifest.py", "CATEGORY_DIRS")
+    COPIES = (("bin/panlib-transfer", "TYPE_DIR"),
+              ("bin/panlib-share", "TYPE_DIR"))
+
+    # 副本用 `doc` 作为 CLI 短参数名，真源用 `documentary` 作为业务类别名。
+    # 这是两套命名空间的有意差异，不是漂移——但两边指向的目录必须相同。
+    ALIASES = {"doc": "documentary"}
+
+    def _mapping(self, rel: str, name: str) -> dict[str, str]:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        m = re.search(name + r"\s*=\s*\{(.*?)\n\}", text, re.S)
+        if m is None:
+            self.fail(f"{rel} 里找不到 {name}")
+        return dict(re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', m.group(1)))
+
+    def test_every_category_dir_copy_agrees_with_the_single_source(self):
+        source = self._mapping(*self.SOURCE)
+        for rel, name in self.COPIES:
+            copy = self._mapping(rel, name)
+            for key, value in copy.items():
+                canonical = self.ALIASES.get(key, key)
+                self.assertIn(canonical, source,
+                              f"{rel}::{name} 有真源不认识的类别 {key!r}")
+                self.assertEqual(
+                    value, source[canonical],
+                    f"{rel}::{name}[{key!r}] = {value!r}，"
+                    f"但真源 {self.SOURCE[0]} 说是 {source[canonical]!r}——"
+                    f"类别根映射发生漂移，写操作会拼出不存在的路径")
+
+    def test_copies_cover_every_category_the_source_declares(self):
+        """副本漏掉一个类别 = 该类别的资源无法通过这个算子处理。"""
+        source = self._mapping(*self.SOURCE)
+        for rel, name in self.COPIES:
+            copy = self._mapping(rel, name)
+            covered = {self.ALIASES.get(k, k) for k in copy}
+            missing = sorted(set(source) - covered)
+            self.assertEqual(missing, [],
+                             f"{rel}::{name} 未覆盖类别 {missing}")
 
 
 class DocumentationConsistencyTests(unittest.TestCase):

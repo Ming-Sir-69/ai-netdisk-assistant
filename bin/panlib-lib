@@ -159,7 +159,7 @@ def cmd_find(a) -> int:
                     "reasons": ["library_unreadable"],
                     "next_action": "先排查授权/网络；不要据此判定内容不存在，"
                                    "更不要重新获取"})
-        return 2
+        return 1
 
     out, unreadable = [], []
     if a.type == "movie":
@@ -192,7 +192,7 @@ def cmd_find(a) -> int:
                     "reasons": [f"unreadable_paths={unreadable}"],
                     "partial_seasons": [s["season_dir"] for s in out],
                     "next_action": "排查后重跑；不要基于残缺读数做获取决策"})
-        return 2
+        return 1
 
     # 三态停机判定：found=true 只说明"有"，不等于"够"。
     # 混淆这两者会漏判残缺入库和画质不达标——这是本命令存在的主要理由。
@@ -256,7 +256,7 @@ def cmd_verify(a) -> int:
         emit_error(NOT_FOUND, f"片库根不可读: {root}",
                    {"status": "BLOCKED",
                     "next_action": "排查授权/网络后重跑；本次验收无结论"})
-        return 2
+        return 1
     if not hits:
         emit_error(NOT_FOUND, f"片库中未找到匹配容器: {a.title}", {"root": root})
         return 1
@@ -284,7 +284,7 @@ def cmd_verify(a) -> int:
         emit_error(NOT_FOUND, "部分目录读取失败，验收无结论",
                    {"status": "BLOCKED", "unreadable": unreadable,
                     "next_action": "排查后重跑，不要据此宣称合规"})
-        return 2
+        return 1
     quals = sorted({q for r in report for q in r["qualities"]})
     mixed = [r["season"] for r in report if r.get("quality_mixed_within_season")]
     emit_success({

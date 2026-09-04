@@ -200,7 +200,7 @@ def cmd_record(a) -> int:
     if not a.no_evidence and not a.evidence:
         emit_error(INVALID_ARG, "必须提供 --evidence 或显式 --no-evidence",
                    {"next_action": "命中证据句就传 --evidence \"<原句>\"；确认该源查过但没有就传 --no-evidence"})
-        return 2
+        return 1
 
     resolution = None
     upscale_flag = False
@@ -259,7 +259,7 @@ def cmd_verdict(a) -> int:
                             "裁决后用 record 补一条更明确的证据句再重跑 verdict。"),
             **common,
         })
-        return 2
+        return 1
 
     if not caps:
         verdict = "UNKNOWN_CONSERVATIVE"
