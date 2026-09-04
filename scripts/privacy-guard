@@ -68,7 +68,12 @@ _EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?im)\b(?P<label>bduss|cookie|authorization|api[_-]?key|access[_-]?token|"
     r"refresh[_-]?token|client[_-]?secret|secret|password|passwd|private[_-]?key)\b"
-    r"[ \t]*(?:=|:)[ \t]*(?P<value>[^\r\n]+)"
+    # 允许 label 与分隔符之间出现引号，以覆盖 JSON/JSONL 的 "access_token": "…"。
+    # 原正则只认 `label=value` / `label: value`，JSON 里的右引号把两者隔开，
+    # 导致 {"access_token": "ya29...."} 完全不被扫描——实测确认（2026-09-03）。
+    # 这在此前不致命，因为 *auth*.jsonl 会被文件名规则兜住；但一旦按内容判定
+    # 台账文件（修掉那条误报），这个洞就变成真实漏报。两处必须一起改。
+    r"[\"']?[ \t]*(?:=|:)[ \t]*(?P<value>[^\r\n]+)"
 )
 _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN (?:[A-Z]+ )?(?:ENCRYPTED )?PRIVATE KEY-----"
@@ -160,10 +165,16 @@ def _email_findings(text: str, path: str) -> Iterator[Finding]:
 
 def _credential_findings(text: str, path: str) -> Iterator[Finding]:
     for match in _SECRET_ASSIGNMENT_RE.finditer(text):
-        raw_value = match.group("value").strip().strip("\"'`;,)")
+        # 两端都要剥引号和结构符号。JSON/JSONL 里值的右侧是 `"}` 或 `",`，
+        # 若只按原样 strip，候选会保留 `"` 和 `}`，随后被下面的"含括号/引号即跳过"
+        # 规则误当作代码片段放行——实测 {"access_token": "ya29...."} 因此完全漏报
+        # （2026-09-03）。此前不致命是因为 *auth*.jsonl 被文件名规则兜住；
+        # 一旦台账改为按内容判定，这个洞就变成真实漏报，必须两处一起修。
+        raw_value = match.group("value").strip().strip("\"'`;,)}]")
         # Header schemes are labels, not the credential itself.
         raw_value = re.sub(r"^(?:bearer|basic|digest)\s+", "", raw_value, flags=re.IGNORECASE)
         candidate = raw_value.split()[0] if raw_value else ""
+        candidate = candidate.strip("\"'`;,)}]")
         if len(candidate) < 16 or _placeholder_value(candidate):
             continue
         if candidate.startswith(("+", "_")) or any(char in candidate for char in "(){}[]\\\"'"):
@@ -173,6 +184,26 @@ def _credential_findings(text: str, path: str) -> Iterator[Finding]:
         # Require a token-looking value, avoiding prose such as
         # ``Authorization: see the documentation``.
         if not re.search(r"[A-Za-z0-9]", candidate):
+            continue
+        # 值是**源码里的标识符引用**（未加引号的变量名）而非字面量凭据时跳过。
+        # 放宽正则以覆盖 JSON 的 `"password": "…"` 后，源码里的
+        # `"password": effective_password,` 也开始命中——它引用的是一个变量，
+        # 真密码从不出现在源码里（实测 bin/panlib-transfer:321，2026-09-03）。
+        #
+        # ★ 三个条件缺一不可，每一条都对应一次实测到的回归：
+        #   1. 未被引号包裹——只看标识符形态会放走 `api_key = "sk_live_999…"`；
+        #   2. 是干净标识符；
+        #   3. **看起来像人写的名字，而不是随机串**——`BDUSS=A_A_…_ZZZZ` 这类
+        #      裸赋值的真 token 也是合法标识符，改动前会被拦、放宽后漏了。
+        #      判据取"是否由 2–4 个长度合理的小写/驼峰词片段组成"：
+        #      变量名如 effective_password / stored_token 命中，
+        #      随机串因片段过多、过短或全大写而不命中。
+        quoted = bool(re.match(r"^\s*[\"'`]", match.group("value")))
+        looks_like_a_name = bool(
+            re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z][a-z0-9]*){1,3}", candidate)
+            or re.fullmatch(r"[a-z][a-zA-Z0-9]*", candidate)
+        )
+        if (not quoted) and looks_like_a_name:
             continue
         yield Finding("credential", path)
         return
@@ -207,6 +238,23 @@ def _forced_credential_file(path: str) -> bool:
     # 而同目录同性质的 authorize_mcp_macos.py（"auth" 后接字母）却不命中——
     # 同类文件命运取决于后一个字符，这本身说明按名字判定源码是不可靠的。
     if name.endswith((".py", ".sh", ".bash", ".zsh", ".ts", ".js", ".go", ".rs")):
+        return False
+    # 结构化**台账/日志**按内容判定，不按文件名——但仅限名字确实像台账的。
+    # 实测误报（2026-09-03）：runtime/reauth_journal.jsonl 因名字里的 "auth_"
+    # 被判为凭据文件，但其字段只有 ts/target/error_code/next_action，
+    # 内容规则一条都不命中——SKILL.md 明确规定该台账**禁止**记录 Token、
+    # Cookie、分享链接或账号正文，它记的是"这次续期成功没有、下一步做什么"。
+    # 危害不在这一条误报，而在于它让 `privacy-guard --whole-tree` 在本地恒红：
+    # CI 是干净 checkout、扫不到 runtime/（已 gitignore）所以恒绿，
+    # **本地红 + CI 绿会训练人忽略真实告警**，比漏报一次更危险。
+    #
+    # ★ 边界必须收窄到"名字像台账"，不能豁免所有 .json/.jsonl：
+    #   否则 credentials.json / token.json 这类**真凭据文件**会被一起放行
+    #   （实测：第一版豁免写成按后缀，立刻打穿了既有的 forced-credential-file 用例）。
+    #   凭据若真写进台账，仍由下方内容规则逐行拦截，边界没有放宽。
+    if name.endswith((".jsonl", ".ndjson", ".log")) or re.search(
+        r"(?:journal|ledger|audit|history|events?)[._-]", name
+    ):
         return False
     return bool(_FORCED_CREDENTIAL_NAME_RE.search(name))
 

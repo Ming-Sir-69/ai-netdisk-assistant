@@ -155,6 +155,119 @@ class PrivacyGuardTests(unittest.TestCase):
                     self.assertIn(filename, output)
                     self.assertNotIn(secret, output)
 
+    def test_journal_files_are_judged_by_content_not_by_name(self):
+        """凭证台账不能仅因文件名含 auth/token 就被判为凭据文件。
+
+        实测缺陷（2026-09-03）：`runtime/reauth_journal.jsonl` 只记
+        ts/target/error_code/next_action，却因名字里的 `auth_` 被判
+        forced-credential-file。它已被 gitignore，所以 CI 的干净 checkout
+        扫不到、恒绿，而本地 `--whole-tree` 恒红——**本地红 + CI 绿会训练人
+        忽略真实告警**，比漏报一次更危险。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            name = "reauth_journal.jsonl"
+            (root / name).write_text(
+                '{"ts": "2026-08-30T15:44:53Z", "target": "mcp", '
+                '"error_code": "WEBBRIDGE_EXTENSION_NOT_CONNECTED", '
+                '"next_action": "start_webbridge_or_reconnect_extension"}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(git(root, "add", "--", name).returncode, 0)
+            scan = self.run_guard(root, "--staged")
+            self.assertEqual(scan.returncode, 0, scan.stdout + scan.stderr)
+
+    def test_real_credential_filenames_are_still_blocked_by_name(self):
+        """台账豁免必须收窄——第一版按后缀豁免，把真凭据文件一起放行了。
+
+        `credentials.json` / `token.json` 这类文件本身就是凭据容器，
+        无论内容如何都必须按名字拦截。
+        """
+        for name in ("credentials.json", "token.json", "secret.json"):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    init_repo(root)
+                    (root / name).write_text('{"account": "fixture"}\n', encoding="utf-8")
+                    self.assertEqual(git(root, "add", "--", name).returncode, 0)
+                    scan = self.run_guard(root, "--staged")
+                    output = scan.stdout + scan.stderr
+                    self.assertEqual(scan.returncode, 1, output)
+                    self.assertIn("forced-credential-file", output)
+
+    def test_credentials_inside_a_journal_are_still_caught_by_content(self):
+        """放行台账不等于放宽安全边界：真凭据写进台账仍必须被拦。
+
+        配套修复：值两侧的 `"` `}` 此前没被剥掉，候选串因"含引号/括号"
+        被当作代码片段跳过，导致 JSON 形态的 access_token / BDUSS **完全漏报**。
+        这个洞此前被文件名规则掩盖，一旦按内容判定台账就会暴露——两处必须同修。
+        """
+        cases = {
+            "access_token": '{"ts": "x", "access_token": '
+                            '"ya29.' + "A" * 32 + '"}\n',
+            "BDUSS": '{"ts": "x", "BDUSS": "' + "b" * 40 + '"}\n',
+            "refresh_token": '{"ts": "x", "refresh_token": "1//0' + "c" * 32 + '"}\n',
+        }
+        for label, content in cases.items():
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    init_repo(root)
+                    name = "reauth_journal.jsonl"
+                    (root / name).write_text(content, encoding="utf-8")
+                    self.assertEqual(git(root, "add", "--", name).returncode, 0)
+                    scan = self.run_guard(root, "--staged")
+                    output = scan.stdout + scan.stderr
+                    self.assertEqual(scan.returncode, 1, output)
+                    self.assertIn("credential", output)
+
+    def test_identifier_references_in_source_are_not_credentials(self):
+        """源码里 `"password": effective_password,` 引用的是变量，不是密码。
+
+        这是放宽正则以覆盖 JSON 形态后引入的误报（实测 bin/panlib-transfer:321）。
+        仓库内已跟踪的源码触发误报会直接让 CI 变红，必须精确区分。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            name = "resolver.py"
+            (root / name).write_text(
+                "def build(effective_password):\n"
+                "    return {\n"
+                '        "password": effective_password,\n'
+                '        "access_token": stored_token,\n'
+                "    }\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(git(root, "add", "--", name).returncode, 0)
+            scan = self.run_guard(root, "--staged")
+            self.assertEqual(scan.returncode, 0, scan.stdout + scan.stderr)
+
+    def test_literal_secrets_are_still_caught_even_when_identifier_shaped(self):
+        """标识符豁免不得放走真凭据——每条都对应一次实测到的回归。
+
+        `api_key = "sk_live_999…"` 加了引号；`BDUSS=A_A_…_ZZZZ` 是裸赋值但
+        由随机片段构成。两者在放宽过程中都曾被误放行，必须锁死。
+        """
+        cases = {
+            "quoted-underscore-token": 'api_key = "sk_live_' + "9" * 30 + '"\n',
+            "bare-random-underscores": "BDUSS=" + "A_" * 12 + "Z" * 8 + "\n",
+            "json-access-token": '{"access_token": "ya29.' + "A" * 32 + '"}\n',
+        }
+        for label, content in cases.items():
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    init_repo(root)
+                    name = "config.txt"
+                    (root / name).write_text(content, encoding="utf-8")
+                    self.assertEqual(git(root, "add", "--", name).returncode, 0)
+                    scan = self.run_guard(root, "--staged")
+                    output = scan.stdout + scan.stderr
+                    self.assertEqual(scan.returncode, 1, output)
+                    self.assertIn("credential", output)
+
     def test_staged_scan_rejects_oversized_binary_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
