@@ -1,35 +1,35 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="readme-assets/header-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="readme-assets/header-light.svg">
-  <img alt="AI 网盘助手 · ✦ EricMingle69" src="readme-assets/header-light.svg" width="100%">
+  <img alt="AI Netdisk Assistant · ✦ EricMingle69" src="readme-assets/header-light.svg" width="100%">
 </picture>
 
 <p align="center">
   <a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · <a href="PERSONAL-NOTICE.md">✦ EricMingle69</a>
 </p>
 
-> 把下面这句话发给 Codex：
+> Send this exact installation request to Codex:
 >
 > Codex帮我安装这个工作流然后开始整理网盘资源 https://github.com/Ming-Sir-69/ai-netdisk-assistant
 
-# AI 网盘助手
+# AI Netdisk Assistant
 
-把影视搜索、候选比较、百度网盘转存与规范命名串成 Agent 可调用的工作流。
-只想找资源时保持只读；需要更新片库时按明确对象生成计划并回读验收。
+An Agent workflow for media search, candidate comparison, Baidu Netdisk transfers and consistent naming.
+Resource discovery stays read-only; library updates use a defined target, a plan and read-back verification.
 
-## 首次接入
+## First setup
 
-推荐从 macOS 开始：准备 Python 3.13+、百度官方 `bdpan` 与相应授权。
-默认凭据存于 macOS Keychain；Windows/Linux 需接入 `external-command` 安全凭据代理，仓库不提供明文回退。
+Start with macOS: prepare Python 3.13+, Baidu's official `bdpan` tool and the necessary authorization.
+Credentials default to macOS Keychain. Windows/Linux require an `external-command` secure credential agent; there is no plaintext fallback.
 
-在仓库根目录检查环境：
+Check the environment from the repository root:
 
 ```sh
 ./scripts/bootstrap.sh
 ```
 
-默认只做本地检查。缺少固定依赖时可用 `./scripts/bootstrap.sh --install-deps` 安装。
-百度授权通过 `./scripts/login.sh` 由本人完成；MCP 授权状态通过项目解释器核对：
+The default performs local checks. Install missing pinned dependencies with `./scripts/bootstrap.sh --install-deps` when needed.
+Complete Baidu authorization personally through `./scripts/login.sh`; check MCP authorization with the project interpreter:
 
 ```sh
 .venv/bin/python bin/panlib-library auth-status
@@ -37,36 +37,36 @@
 ./scripts/preflight.sh
 ```
 
-`doctor` 和 `preflight` 都返回 `ready` 后再进入业务流程；缺失或过期授权按脚本引导处理。
+Enter a media workflow only when both `doctor` and `preflight` report `ready`; follow their instructions for missing or expired authorization.
 
-## 用一句话选择范围
+## Choose the scope in one sentence
 
-| 请求 | 行为 |
+| Request | Behavior |
 | --- | --- |
-| 找某部电影资源 | 搜索、比较与验证候选，不写网盘 |
-| 更新某部影视 | 定位旧资源、转存、整理、同根归档与回读 |
-| 整理指定目录 | 整理已有资源，不搜索或转存 |
-| 归档指定目录 | 同根移动到待删除区，不删除 |
+| Find a film | Search, compare and verify candidates without writing to the drive |
+| Update a media item | Locate existing resources, transfer, organize, archive within the same root and verify |
+| Organize a specified directory | Organize existing media without search or transfer |
+| Archive a specified directory | Move within the same root to a pending-deletion area, without deleting |
 
-## 能力边界
+## Capability boundaries
 
-- SeedHub 提供搜索；百度分享转存及 Apps 内整理由 wrappers 完成。
-- 官方百度 MCP 负责全盘目录/元数据读取、同根归档与受限媒体迁移；写入权限不等于任意全盘移动。
-- 整理只接收主视频与外挂字幕；图片、海报、NFO 和阅读说明不进入媒体容器。
-- 冲突、歧义或 `partial`/`unverified` 会停止；不覆盖、不删除、不自动重试写入。
-- 离线下载文案与 `bin/panlib-offlinedl` 入口存在差异，其支持范围需核对，不作为快速开始功能。
+- SeedHub supplies search; wrappers handle Baidu share transfers and organization within Apps.
+- The official Baidu MCP handles drive-wide directory/metadata reads, same-root archiving and restricted media migration; this does not permit arbitrary drive-wide moves.
+- Organization accepts main videos and external subtitles; images, posters, NFO files and reading notes stay outside media containers.
+- Conflicts, ambiguity and `partial`/`unverified` stop the workflow; writes are not overwritten, deleted or retried automatically.
+- Offline-download wording conflicts with the `bin/panlib-offlinedl` entry; verify its support scope before use rather than treating it as a quickstart feature.
 
-## 继续阅读
+## Further reading
 
-[SKILL.md](SKILL.md)定义工作流与权限；[CLI 契约](docs/CLI_CONTRACT.md)列出参数和状态；[架构](docs/ARCHITECTURE.md)、[贡献指南](CONTRIBUTING.md)与[安全策略](SECURITY.md)供维护者使用。
+[SKILL.md](SKILL.md) defines workflow and permissions. [The CLI contract](docs/CLI_CONTRACT.md) covers parameters and states; [architecture](docs/ARCHITECTURE.md), [contributing](CONTRIBUTING.md) and [security](SECURITY.md) cover maintenance.
 
-## 来源与许可
+## Sources and license
 
-[MIT License](LICENSE)：Copyright (c) 2026 Eric Mingle。
-CaliCastle/seedhub-cli 等组件保留各自归属和许可，详见[第三方声明](THIRD_PARTY_NOTICES.md)；软件许可不授予影视内容的复制或分享权。
+[MIT License](LICENSE): Copyright (c) 2026 Eric Mingle.
+CaliCastle/seedhub-cli and other components retain their attribution and licenses in [third-party notices](THIRD_PARTY_NOTICES.md); the software license does not grant rights to copy or share media content.
 
 <details>
-<summary>完整使用契约与验证记录（中文原文）</summary>
+<summary>Detailed usage contract and verification record (canonical Chinese)</summary>
 
 <!-- BEGIN PRESERVED DOCUMENTATION CONTRACT -->
 # AI 网盘助手
@@ -407,5 +407,5 @@ legacy hierarchical plan，再按正常 postcondition 验收。
 
 ---
 
-文档维护：**✦ EricMingle69** · [Ming-Sir-69](https://github.com/Ming-Sir-69)  
-[个人标识、许可与权限说明](PERSONAL-NOTICE.md) · 明暗页眉随 GitHub 主题自动切换。
+Documentation maintained by **✦ EricMingle69** · [Ming-Sir-69](https://github.com/Ming-Sir-69)  
+[Personal identity, licensing and permissions](PERSONAL-NOTICE.md) · The header follows your GitHub theme.
