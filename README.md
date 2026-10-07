@@ -5,6 +5,29 @@
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+## 先了解，再开始
+
+这是面向 Agent 的百度网盘影视资源工作流，适合想通过对话查找影视、转存资源、规范片库目录，以及维护确定性 CLI 的用户。它把资源搜索、候选比较、计划生成和执行验收串成可追踪的流程；日常使用可以从一句自然语言请求开始。
+
+**首次使用建议从 macOS 开始**：需要 Python 3.13+、百度官方 `bdpan` 工具及相应授权。默认凭证后端是 macOS Keychain；Windows/Linux 需要自行接入文档约定的安全凭证代理，其实机兼容性仍待验证。
+
+| 你想做什么 | 从这里开始 |
+| --- | --- |
+| 让 Codex 安装并带你使用 | [最简单的使用方式](#最简单的使用方式) |
+| 自己安装、检查依赖与授权 | [安装与初始化](#安装与初始化)；本地已有仓库时复用原目录 |
+| 先找资源，暂不写入网盘 | [使用模式](#使用类)中的“找资源” |
+| 更新、整理或归档指定资源 | [安全工作流](#安全工作流)与[通道能力矩阵](#通道能力矩阵唯一权限判定) |
+| 理解目录、命名与命令参数 | [命名契约](#统一影视命名契约) · [CLI 契约](docs/CLI_CONTRACT.md) |
+| 改进文档或代码 | [贡献指南](CONTRIBUTING.md) · [架构说明](docs/ARCHITECTURE.md) |
+
+从仓库根目录运行 `./scripts/bootstrap.sh` 可以检查本地环境，默认不联网安装依赖；完整的安装、登录与门禁步骤见下文。`doctor` 与 `preflight` 实际报告就绪后再进入业务流程。
+
+**使用边界**：搜索源目前围绕 SeedHub，网盘写入围绕百度网盘；整理仅接收主视频与外挂字幕。写操作可能部分完成，遇到冲突或验收失败会停止，具体路径权限与归档规则见下文。离线下载的支持范围仍需确认：仓库包含 `bin/panlib-offlinedl`，但正文尚写“不支持磁力链接下载”，因此此入口暂不列入快速开始。
+
+下文“验证状态”保留既有版本的历史记录，外部服务可用性与当前机器是否就绪仍需实际检查。欢迎通过 [Issues](https://github.com/Ming-Sir-69/ai-netdisk-assistant/issues) 反馈可复现的问题、文档缺口或改进建议；敏感信息按[安全策略](SECURITY.md)处理。
+
+仓库维护：[Ming-Sir-69](https://github.com/Ming-Sir-69)。项目采用 [MIT License](LICENSE)；许可证中的原版权署名，以及[第三方许可声明](THIRD_PARTY_NOTICES.md)中的上游归属继续保留。
+
 ## 最简单的使用方式
 
 把下面这句话发给 Codex：
